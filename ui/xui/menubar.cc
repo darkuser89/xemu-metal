@@ -41,6 +41,45 @@ bool g_capture_renderdoc_frame = false;
 #define SHORTCUT_MENU_TEXT(c) "Ctrl+" #c
 #endif
 
+#ifdef XEMU_NATIVE_METAL4_UI
+static void DrawBackendSelector(void)
+{
+    static const struct {
+        CONFIG_DISPLAY_RENDERER value;
+        const char *label;
+    } choices[] = {
+        { CONFIG_DISPLAY_RENDERER_NULL, "Null" },
+        { CONFIG_DISPLAY_RENDERER_OPENGL, "OpenGL" },
+#ifdef CONFIG_VULKAN
+        { CONFIG_DISPLAY_RENDERER_VULKAN, "Vulkan" },
+#endif
+        { CONFIG_DISPLAY_RENDERER_METAL4, "Metal 4" },
+    };
+    const char *preview = "Unknown";
+    for (const auto &choice : choices) {
+        if (g_config.display.renderer == choice.value) {
+            preview = choice.label;
+            break;
+        }
+    }
+    if (ImGui::BeginCombo("Backend", preview)) {
+        for (const auto &choice : choices) {
+            bool selected = g_config.display.renderer == choice.value;
+            if (ImGui::Selectable(choice.label, selected)) {
+                g_config.display.renderer = choice.value;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if ((g_config.display.renderer == CONFIG_DISPLAY_RENDERER_METAL4) !=
+        xemu_hud_uses_metal4()) {
+        ImGui::TextDisabled("Restart required");
+    }
+}
+#endif
 void ProcessKeyboardShortcuts(void)
 {
     if (IsShortcutKeyPressed(ImGuiKey_E)) {
@@ -175,6 +214,9 @@ void ShowMainMenu()
                 }
             }
 
+#ifdef XEMU_NATIVE_METAL4_UI
+            DrawBackendSelector();
+#else
             ImGui::Combo("Backend", &g_config.display.renderer,
                  "Null\0"
                  "OpenGL\0"
@@ -182,6 +224,7 @@ void ShowMainMenu()
                  "Vulkan\0"
 #endif
                 );
+#endif
 
             int rendering_scale = nv2a_get_surface_scale_factor() - 1;
             if (ImGui::Combo("Int. Resolution Scale", &rendering_scale,

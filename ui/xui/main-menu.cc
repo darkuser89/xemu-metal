@@ -740,14 +740,32 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
-    ChevronCombo("Backend", &g_config.display.renderer,
-                 "Null\0"
-                 "OpenGL\0"
-#ifdef CONFIG_VULKAN
-                 "Vulkan\0"
+    int renderer = g_config.display.renderer;
+    const char *renderer_names[] = { "Null", "OpenGL", "Vulkan", "Metal 4" };
+    if (ImGui::BeginCombo("Backend", renderer_names[renderer])) {
+        for (int candidate = 0; candidate < 4; candidate++) {
+#ifndef CONFIG_VULKAN
+            if (candidate == CONFIG_DISPLAY_RENDERER_VULKAN)
+                continue;
 #endif
-                 ,
-                 "Select desired renderer implementation");
+#ifndef XEMU_NATIVE_METAL4_UI
+            if (candidate == CONFIG_DISPLAY_RENDERER_METAL4)
+                continue;
+#endif
+            if (ImGui::Selectable(renderer_names[candidate],
+                                  candidate == renderer)) {
+                g_config.display.renderer = (CONFIG_DISPLAY_RENDERER)candidate;
+#ifdef XEMU_NATIVE_METAL4_UI
+                if ((candidate == CONFIG_DISPLAY_RENDERER_METAL4) !=
+                    xemu_hud_uses_metal4()) {
+                    xemu_queue_notification(
+                        "Restart xemu to use the selected backend");
+                }
+#endif
+            }
+        }
+        ImGui::EndCombo();
+    }
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"
@@ -1190,14 +1208,27 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     draw_list->PushClipRect(p0, p1, true);
 
     // Snapshot thumbnail
-    GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
+    XemuTexture thumbnail = data->thumbnail ? data->thumbnail : g_icon_tex;
     int thumbnail_width, thumbnail_height;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, thumbnail);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                             &thumbnail_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                             &thumbnail_height);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        uint32_t tw = 1, th = 1;
+        if (!xemu_metal4_ui_texture_size(thumbnail, &tw, &th)) {
+            thumbnail = g_icon_tex;
+            xemu_metal4_ui_texture_size(thumbnail, &tw, &th);
+        }
+        thumbnail_width = tw;
+        thumbnail_height = th;
+    } else
+#endif
+    {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, thumbnail);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                                 &thumbnail_width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                                 &thumbnail_height);
+    }
 
     // Draw black background behind thumbnail
     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
@@ -1617,11 +1648,22 @@ void MainMenuAboutView::Draw()
 
     static const char *sys_info_text = NULL;
     if (sys_info_text == NULL) {
-        const char *gl_shader_version =
-            (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-        const char *gl_version = (const char *)glGetString(GL_VERSION);
-        const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-        const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+        const char *gl_shader_version, *gl_version, *gl_renderer, *gl_vendor;
+#ifdef XEMU_NATIVE_METAL4_UI
+        if (xemu_hud_uses_metal4()) {
+            gl_shader_version = "MSL 4.0";
+            gl_version = "Metal 4";
+            gl_renderer = xemu_metal4_ui_device_name();
+            gl_vendor = "Apple";
+        } else
+#endif
+        {
+            gl_shader_version =
+                (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+            gl_version = (const char *)glGetString(GL_VERSION);
+            gl_renderer = (const char *)glGetString(GL_RENDERER);
+            gl_vendor = (const char *)glGetString(GL_VENDOR);
+        }
         sys_info_text = g_strdup_printf(
             "CPU:          %s\nOS Platform:  %s\nOS Version:   "
             "%s\nManufacturer: %s\n"

@@ -23,6 +23,11 @@ xemu_ss.add(files(
   'widgets.cc',
 ))
 
+if host_os == 'darwin' and cpu == 'aarch64'
+  subdir('metal4')
+  xemu_ss.add(declare_dependency(link_with: xemu_metal4_rendering))
+endif
+
 if host_os == 'windows'
   xemu_ss.add(files('update.cc', 'win32-dxgi-present.cc'))
 endif

@@ -18,6 +18,7 @@
 //
 #include "font-manager.hh"
 #include "viewport-manager.hh"
+#include "ui/xemu-notifications.h"
 
 #include "data/Roboto-Medium.ttf.h"
 #include "data/RobotoCondensed-Regular.ttf.h"
@@ -99,8 +100,18 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
-    ImGui_ImplOpenGL3_DestroyFontsTexture();
-    ImGui_ImplOpenGL3_CreateFontsTexture();
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        xemu_metal4_ui_invalidate_fonts();
+        if (!xemu_metal4_ui_new_frame()) {
+            xemu_queue_error_message(xemu_metal4_ui_error());
+        }
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+    }
 }
 
 void FontManager::Update()

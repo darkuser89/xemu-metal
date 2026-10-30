@@ -74,10 +74,21 @@ void CompatibilityReporter::Draw()
     }
 
     if (ImGui::IsWindowAppearing()) {
-        report.gl_vendor = (const char *)glGetString(GL_VENDOR);
-        report.gl_renderer = (const char *)glGetString(GL_RENDERER);
-        report.gl_version = (const char *)glGetString(GL_VERSION);
-        report.gl_shading_language_version = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+#ifdef XEMU_NATIVE_METAL4_UI
+        if (xemu_hud_uses_metal4()) {
+            report.gl_vendor = "Apple";
+            report.gl_renderer = xemu_metal4_ui_device_name();
+            report.gl_version = "Metal 4";
+            report.gl_shading_language_version = "MSL 4.0";
+        } else
+#endif
+        {
+            report.gl_vendor = (const char *)glGetString(GL_VENDOR);
+            report.gl_renderer = (const char *)glGetString(GL_RENDERER);
+            report.gl_version = (const char *)glGetString(GL_VERSION);
+            report.gl_shading_language_version =
+                (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+        }
         struct xbe *xbe = xemu_get_xbe_info();
         is_xbe_identified = xbe != NULL;
         if (is_xbe_identified) {

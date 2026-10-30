@@ -43,6 +43,11 @@
 #include "system/runstate-action.h"
 #include "system/system.h"
 #include "xui/xemu-hud.h"
+#include <epoxy/gl.h>
+#ifdef XEMU_NATIVE_METAL4_UI
+#include "xui/metal4/frontend.h"
+#include "xemu-notifications.h"
+#endif
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
@@ -115,6 +120,14 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
+#ifdef XEMU_NATIVE_METAL4_UI
+static bool metal_hud_ready;
+static bool use_metal4;
+bool xemu_hud_uses_metal4(void)
+{
+    return use_metal4;
+}
+#endif
 static SDL_GLContext m_context;
 static QemuSemaphore display_init_sem;
 static QemuSemaphore display_shutdown_sem;
@@ -704,6 +717,7 @@ static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
     surface->texture = 0;
 }
 
+
 static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
                                        pixman_format_code_t format)
 {
@@ -826,6 +840,38 @@ static void report_stats(void)
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
  */
+#ifdef XEMU_NATIVE_METAL4_UI
+static void metal_render_frame_pooled(void *opaque)
+{
+    (void)opaque;
+    void *frame = nv2a_copy_metal4_framebuffer();
+    xemu_snapshots_set_metal4_framebuffer(frame);
+    xemu_hud_set_metal4_framebuffer(frame);
+    nv2a_release_metal4_framebuffer(frame);
+    if (!xemu_hud_begin_frame()) {
+        xemu_queue_error_message(xemu_metal4_ui_error());
+        return;
+    }
+    /* Drawable acquisition and presentation must remain outside the BQL. */
+    xemu_main_loop_lock();
+    xemu_hud_update();
+    xemu_main_loop_unlock();
+    xemu_hud_render();
+}
+static void metal_render_frame(struct xemu_console *scon)
+{
+    static bool rendering;
+    if (!SDL_IsMainThread() || !metal_hud_ready ||
+        qatomic_read(&qemu_exiting) || qatomic_xchg(&rendering, true)) {
+        return;
+    }
+    xemu_metal4_ui_with_pool(metal_render_frame_pooled, scon);
+    qatomic_set(&rendering, false);
+#if DEBUG_XEMU_C
+    report_stats();
+#endif
+}
+#endif
 static void gl_render_frame(struct xemu_console *scon)
 {
     static bool rendering;
@@ -918,6 +964,18 @@ static void gl_render_frame(struct xemu_console *scon)
 #endif
 }
 
+static void render_frame(struct xemu_console *scon)
+{
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        metal_render_frame(scon);
+        return;
+    }
+#endif
+    gl_render_frame(scon);
+}
+
+
 static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
     struct xemu_console *scon = (struct xemu_console *)userdata;
@@ -936,9 +994,9 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
             }
         }
 #endif
-        gl_render_frame(scon);
+        render_frame(scon);
     } else if (event->type == SDL_EVENT_WINDOW_EXPOSED) {
-        gl_render_frame(scon);
+        render_frame(scon);
     }
 
     return true; // Ignored
@@ -1029,19 +1087,23 @@ static void display_very_early_init(DisplayOptions *o)
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
-    // Initialize rendering context
-    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    SDL_GL_SetAttribute(
-        SDL_GL_CONTEXT_PROFILE_MASK,
-        SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        // Initialize rendering context
+        SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    }
 
     char *title = g_strdup_printf("xemu | v%s"
 #ifdef XEMU_DEBUG_BUILD
@@ -1083,7 +1145,14 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                   SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        window_flags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE |
+                       SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    }
+#endif
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1103,25 +1172,31 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
-    m_context = SDL_GL_CreateContext(m_window);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        m_context = SDL_GL_CreateContext(m_window);
 
-    if (m_context != NULL && epoxy_gl_version() < 40) {
-        SDL_GL_MakeCurrent(NULL, NULL);
-        SDL_GL_DestroyContext(m_context);
-        m_context = NULL;
-    }
+        if (m_context != NULL && epoxy_gl_version() < 40) {
+            SDL_GL_MakeCurrent(NULL, NULL);
+            SDL_GL_DestroyContext(m_context);
+            m_context = NULL;
+        }
 
-    if (m_context == NULL) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Unable to create OpenGL context",
-            "Unable to create OpenGL context. This usually means the\r\n"
-            "graphics device on this system does not support OpenGL 4.0.\r\n"
-            "\r\n"
-            "xemu cannot continue and will now exit.",
-            m_window);
-        SDL_DestroyWindow(m_window);
-        SDL_Quit();
-        exit(1);
+        if (m_context == NULL) {
+            SDL_ShowSimpleMessageBox(
+                SDL_MESSAGEBOX_ERROR, "Unable to create OpenGL context",
+                "Unable to create OpenGL context. This usually means the\r\n"
+                "graphics device on this system does not support OpenGL "
+                "4.0.\r\n"
+                "\r\n"
+                "xemu cannot continue and will now exit.",
+                m_window);
+            SDL_DestroyWindow(m_window);
+            SDL_Quit();
+            exit(1);
+        }
     }
 
     int width, height, channels = 0;
@@ -1138,21 +1213,37 @@ static void display_very_early_init(DisplayOptions *o)
 
     fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
     fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
-    fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
-    fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
-    fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
-    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
+        fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+        fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
+        fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n",
+                glGetString(GL_SHADING_LANGUAGE_VERSION));
+    }
 
-    // Initialize offscreen rendering context now
+    // Select and initialize the renderer's early host resources.
     nv2a_context_init();
-    SDL_GL_MakeCurrent(NULL, NULL);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        SDL_GL_MakeCurrent(NULL, NULL);
+    }
 }
 
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_XEMU);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        display_opengl = 0;
+        return;
+    }
+#endif
     display_opengl = 1;
-
     SDL_GL_MakeCurrent(m_window, m_context);
     SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
 #ifdef _WIN32
@@ -1162,11 +1253,11 @@ static void display_early_init(DisplayOptions *o)
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
-    .dpy_name                = "xemu-gl",
-    .dpy_gfx_switch          = gl_switch,
-    .dpy_gfx_check_format    = xb_console_gl_check_format,
-    .dpy_mouse_set           = mouse_warp,
-    .dpy_cursor_define       = mouse_define,
+    .dpy_name = "xemu",
+    .dpy_gfx_switch = gl_switch,
+    .dpy_gfx_check_format = xb_console_gl_check_format,
+    .dpy_mouse_set = mouse_warp,
+    .dpy_cursor_define = mouse_define,
 };
 
 static void display_init(DisplayState *ds, DisplayOptions *o)
@@ -1175,7 +1266,12 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_XEMU);
-    SDL_GL_MakeCurrent(m_window, m_context);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        SDL_GL_MakeCurrent(m_window, m_context);
+    }
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
@@ -1210,7 +1306,12 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     scon_list[0].real_window = m_window;
-    scon_list[0].winctx = m_context;
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        scon_list[0].winctx = m_context;
+    }
 
     mouse_mode_notifier.notify = mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
@@ -1231,7 +1332,12 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
-    SDL_GL_MakeCurrent(NULL, NULL);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        SDL_GL_MakeCurrent(NULL, NULL);
+    }
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1245,8 +1351,13 @@ static void display_finalize(void)
 #ifdef _WIN32
     win32_dxgi_present_cleanup();
 #endif
-    SDL_GL_MakeCurrent(NULL, NULL);
-    SDL_GL_DestroyContext(m_context);
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (!xemu_hud_uses_metal4())
+#endif
+    {
+        SDL_GL_MakeCurrent(NULL, NULL);
+        SDL_GL_DestroyContext(m_context);
+    }
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
@@ -1400,6 +1511,9 @@ int main(int argc, char **argv)
         exit(1);
     }
     atexit(xemu_settings_save);
+#ifdef XEMU_NATIVE_METAL4_UI
+    use_metal4 = g_config.display.renderer == CONFIG_DISPLAY_RENDERER_METAL4;
+#endif
 
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {
@@ -1428,6 +1542,15 @@ int main(int argc, char **argv)
     tcg_register_init_ctx();
     qemu_set_current_aio_context(qemu_get_aio_context());
 
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        xemu_main_loop_lock();
+        xemu_hud_init(m_window, NULL);
+        metal_hud_ready = true;
+        xemu_main_loop_unlock();
+    }
+#endif
+
     xemu_main_loop_lock();
     xemu_input_init();
     xemu_main_loop_unlock();
@@ -1435,8 +1558,19 @@ int main(int argc, char **argv)
     struct xemu_console *scon = &scon_list[0];
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
-        gl_render_frame(scon);
+        render_frame(scon);
     }
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        metal_hud_ready = false;
+        xemu_snapshots_set_metal4_framebuffer(NULL);
+        xemu_hud_set_metal4_framebuffer(NULL);
+    } else
+#endif
+    {
+        SDL_GL_MakeCurrent(m_window, m_context);
+    }
+    xemu_hud_cleanup();
     qemu_sem_post(&display_shutdown_sem);
     qemu_thread_join(&thread);
     display_finalize();

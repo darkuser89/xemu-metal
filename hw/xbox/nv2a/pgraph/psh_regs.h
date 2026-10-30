@@ -20,8 +20,10 @@
 #ifndef HW_NV2A_PSH_H
 #define HW_NV2A_PSH_H
 
+#ifndef __METAL_VERSION__
 #include <stdint.h>
 #include <stdbool.h>
+#endif
 
 /*
  * For some background, see the OpenGL extension:

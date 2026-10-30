@@ -26,8 +26,16 @@
 extern "C" {
 #endif
 
+#if defined(__cplusplus) && defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wextern-c-compat"
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
 #include "block/snapshot.h"
-#include <epoxy/gl.h>
+#if defined(__cplusplus) && defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+#include "xui/texture.h"
 
 #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
 #define XEMU_SNAPSHOT_DATA_VERSION 1
@@ -40,7 +48,7 @@ extern const char **g_snapshot_shortcut_index_key_map[];
 typedef struct XemuSnapshotData {
     char *disc_path;
     char *xbe_title_name;
-    GLuint gl_thumbnail;
+    XemuTexture thumbnail;
 } XemuSnapshotData;
 
 // Implemented in xemu-snapshots.c
@@ -56,8 +64,13 @@ bool xemu_snapshots_offset_extra_data(QEMUFile *f);
 void xemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
-void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
+void xemu_snapshots_set_framebuffer_texture(XemuTexture tex, bool flip);
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Borrowed immutable native frame, retained for later thumbnail capture. */
+void xemu_snapshots_set_metal4_framebuffer(void *frame);
+#endif
+XemuTexture xemu_snapshots_load_png_to_texture(void *buf, size_t size);
+void xemu_snapshots_release_texture(XemuTexture texture);
 void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
 
 #ifdef __cplusplus

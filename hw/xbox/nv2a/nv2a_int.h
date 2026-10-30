@@ -52,6 +52,10 @@
 #include "debug.h"
 #include "nv2a_regs.h"
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "pgraph/metal/save-lifecycle.h"
+#endif
+
 #define NV2A_DEVICE(obj) OBJECT_CHECK(NV2AState, (obj), "nv2a")
 
 enum FIFOEngine {
@@ -152,6 +156,10 @@ typedef struct NV2AState {
         uint8_t palette[256*3];
     } puserdac;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    NV2AMetalSaveLifecycle metal4_save;
+#endif
+
 } NV2AState;
 
 typedef struct NV2ABlockInfo {
@@ -163,6 +171,8 @@ typedef struct NV2ABlockInfo {
 extern const NV2ABlockInfo blocktable[NV_NUM_BLOCKS];
 
 void nv2a_update_irq(NV2AState *d);
+void nv2a_lock_fifo(NV2AState *d);
+void nv2a_unlock_fifo(NV2AState *d);
 
 static inline
 void nv2a_reg_log_read(int block, hwaddr addr, unsigned int size, uint64_t val)

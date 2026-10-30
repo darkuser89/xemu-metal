@@ -118,10 +118,19 @@ typedef struct PGRAPHRenderer {
         void (*draw_end)(NV2AState *d);
         void (*flip_stall)(NV2AState *d);
         void (*flush_draw)(NV2AState *d);
+        /* Optional ordered native XF processing before common state mutation.
+         */
+        void (*vertex_state_change)(NV2AState *d);
+        void (*launch_transform_program)(NV2AState *d, unsigned int start);
         void (*get_report)(NV2AState *d, uint32_t parameter);
         void (*image_blit)(NV2AState *d);
         void (*pre_savevm_trigger)(NV2AState *d);
         void (*pre_savevm_wait)(NV2AState *d);
+        /* Optional: drain GPU writes before RAM replacement, then invalidate
+         * host state after device registers have been loaded. */
+        void (*pre_restore_trigger)(NV2AState *d);
+        void (*pre_restore_wait)(NV2AState *d);
+        void (*post_load)(NV2AState *d);
         void (*pre_shutdown_trigger)(NV2AState *d);
         void (*pre_shutdown_wait)(NV2AState *d);
         void (*process_pending)(NV2AState *d);
@@ -131,6 +140,7 @@ typedef struct PGRAPHRenderer {
         void (*set_surface_scale_factor)(NV2AState *d, unsigned int scale);
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
+        void *(*copy_framebuffer)(NV2AState *d);
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;
@@ -201,6 +211,7 @@ typedef struct PGRAPHState {
     bool ltc1_dirty[NV2A_LTC1_COUNT];
 
     float material_alpha;
+    float material_alpha_back;
 
     // should figure out where these are in lighting context
     float light_infinite_half_vector[NV2A_MAX_LIGHTS][3];
@@ -269,17 +280,33 @@ typedef struct PGRAPHState {
         PGRAPHNullState *null_renderer_state;
         PGRAPHGLState *gl_renderer_state;
         PGRAPHVkState *vk_renderer_state;
+        void *metal4_renderer_state;
     };
+    uint32_t metal4_report_snapshot_size;
+    uint8_t *metal4_report_snapshot;
+    uint32_t metal4_vertex_capture_size;
+    uint8_t *metal4_vertex_capture;
+    uint32_t metal4_begin_capture_size;
+    uint8_t *metal4_begin_capture;
+    uint32_t metal4_pending_capture_size;
+    uint8_t *metal4_pending_capture;
 } PGRAPHState;
 
 void pgraph_init(NV2AState *d);
 void pgraph_init_thread(NV2AState *d);
 void pgraph_destroy(PGRAPHState *pg);
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Without BQL, drain/unpublish host requests before stopping the FIFO thread. */
+void pgraph_stop_metal4_host_requests(NV2AState *d);
+#endif
 void pgraph_context_switch(NV2AState *d, unsigned int channel_id);
 void pgraph_process_pending(NV2AState *d);
 void pgraph_process_pending_reports(NV2AState *d);
 void pgraph_pre_savevm_trigger(NV2AState *d);
 void pgraph_pre_savevm_wait(NV2AState *d);
+void pgraph_pre_restore_trigger(NV2AState *d);
+void pgraph_pre_restore_wait(NV2AState *d);
+void pgraph_post_load(NV2AState *d);
 void pgraph_pre_shutdown_trigger(NV2AState *d);
 void pgraph_pre_shutdown_wait(NV2AState *d);
 

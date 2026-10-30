@@ -19,6 +19,9 @@
 #include "ui/xemu-widescreen.h"
 #include "gl-helpers.hh"
 #include "common.hh"
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "metal4/frame-images.h"
+#endif
 #include "data/controller_mask.png.h"
 #include "data/controller_mask_s.png.h"
 #include "data/logo_sdf.png.h"
@@ -34,7 +37,8 @@
 #include "ui/shader/xemu-logo-frag.h"
 
 Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
-GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_icon_tex, g_xmu_tex;
+GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_xmu_tex;
+XemuTexture g_icon_tex;
 
 enum class ShaderType {
     Blit,
@@ -84,6 +88,12 @@ Fbo::Fbo(int width, int height)
     w = width;
     h = height;
 
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        native = new XemuMetal4UI::Fbo(width, height);
+        return;
+    }
+#endif
     // Allocate the texture
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -108,14 +118,34 @@ Fbo::Fbo(int width, int height)
     glBindFramebuffer(GL_FRAMEBUFFER, original);
 }
 
+#ifdef XEMU_NATIVE_METAL4_UI
+Fbo::Fbo(XemuMetal4UI::Fbo *target)
+    : w(target->w), h(target->h), native(target), owns_native(false)
+{
+}
+#endif
+
 Fbo::~Fbo()
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (native) {
+        if (owns_native)
+            delete native;
+        return;
+    }
+#endif
     glDeleteTextures(1, &tex);
     glDeleteFramebuffers(1, &fbo);
 }
 
 void Fbo::Target()
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (native) {
+        native->Target();
+        return;
+    }
+#endif
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
 
@@ -132,6 +162,12 @@ void Fbo::Target()
 
 void Fbo::Restore()
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (native) {
+        native->Restore();
+        return;
+    }
+#endif
     if (!blend) {
         glDisable(GL_BLEND);
     }
@@ -145,6 +181,7 @@ void Fbo::Restore()
 static GLuint InitTexture(unsigned char *data, int width, int height,
                           int channels)
 {
+    (void)channels;
     GLuint tex;
     glGenTextures(1, &tex);
     assert(tex != 0);
@@ -439,6 +476,16 @@ enum tex_item_names {
 
 void InitCustomRendering(void)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::InitCustomRendering();
+        controller_fbo = new Fbo(XemuMetal4UI::controller_fbo);
+        xmu_fbo = new Fbo(XemuMetal4UI::xmu_fbo);
+        logo_fbo = new Fbo(XemuMetal4UI::logo_fbo);
+        g_icon_tex = XemuMetal4UI::g_icon_tex;
+        return;
+    }
+#endif
     glActiveTexture(GL_TEXTURE0);
     g_controller_duke_tex =
         LoadTextureFromMemory(controller_mask_data, controller_mask_size);
@@ -796,6 +843,13 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderController(frame_x, frame_y, primary_color,
+                                       secondary_color, state);
+        return;
+    }
+#endif
     if (strcmp(bound_drivers[state->bound], DRIVER_S) == 0)
         RenderControllerS(frame_x, frame_y, primary_color, secondary_color,
                           state);
@@ -807,6 +861,12 @@ void RenderController(float frame_x, float frame_y, uint32_t primary_color,
 void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderControllerPort(frame_x, frame_y, i, port_color);
+        return;
+    }
+#endif
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -836,6 +896,13 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderXmu(frame_x, frame_y, primary_color,
+                                secondary_color);
+        return;
+    }
+#endif
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -855,6 +922,12 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
 
 void RenderLogo(uint32_t time)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderLogo(time);
+        return;
+    }
+#endif
     uint32_t color = 0x62ca13ff;
 
     g_logo_shader->time = time;
@@ -872,6 +945,13 @@ void RenderLogo(uint32_t time)
 // Scale <src> proportionally to fit in <max>
 void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::ScaleDimensions(src_width, src_height, max_width,
+                                      max_height, out_width, out_height);
+        return;
+    }
+#endif
     float w_ratio = (float)max_width/(float)max_height;
     float t_ratio = (float)src_width/(float)src_height;
 
@@ -884,8 +964,15 @@ void ScaleDimensions(int src_width, int src_height, int max_width, int max_heigh
     }
 }
 
-void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2])
+void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip,
+                       float scale[2])
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderFramebuffer(tex, width, height, flip, scale);
+        return;
+    }
+#endif
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     
@@ -940,8 +1027,14 @@ static float GetDisplayAspectRatio(int width, int height)
     }
 }
 
-void RenderFramebuffer(GLint tex, int width, int height, bool flip)
+void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::RenderFramebuffer(tex, width, height, flip);
+        return;
+    }
+#endif
     int tw, th;
     float scale[2];
 
@@ -975,8 +1068,38 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
     RenderFramebuffer(tex, width, height, flip, scale);
 }
 
-bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width, int max_height)
+bool RenderFramebufferToPng(XemuTexture tex, bool flip,
+                            std::vector<uint8_t> &png, int max_width,
+                            int max_height)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        return XemuMetal4UI::RenderFramebufferToPng(tex, flip, png, max_width,
+                                                    max_height);
+    }
+#endif
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (xemu_metal4_has_capture_frame()) {
+        png.clear();
+        if (max_width < 0 || max_height < 0) {
+            return false;
+        }
+        bool native = g_config.display.ui.aspect_ratio ==
+                      CONFIG_DISPLAY_UI_ASPECT_RATIO_NATIVE;
+        float aspect = native ? 0 : GetDisplayAspectRatio(1, 1);
+        size_t size = 0;
+        void *bytes = xemu_metal4_capture_png(
+            aspect, max_width, max_height,
+            g_config.display.filtering == CONFIG_DISPLAY_FILTERING_LINEAR,
+            &size);
+        if (!bytes) {
+            return false;
+        }
+        png.assign((uint8_t *)bytes, (uint8_t *)bytes + size);
+        free(bytes);
+        return true;
+    }
+#endif
     int width, height;
 
     glActiveTexture(GL_TEXTURE0);
@@ -1009,8 +1132,14 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     return fpng::fpng_encode_image_to_memory(pixels.data(), width, height, 3, png);
 }
 
-void SaveScreenshot(GLuint tex, bool flip)
+void SaveScreenshot(XemuTexture tex, bool flip)
 {
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        XemuMetal4UI::SaveScreenshot(tex, flip);
+        return;
+    }
+#endif
     Error *err = NULL;
     char fname[128];
     std::vector<uint8_t> png;
@@ -1053,4 +1182,18 @@ void SaveScreenshot(GLuint tex, bool flip)
         xemu_queue_notification(msg);
         free(msg);
     }
+}
+
+void CleanupCustomRendering(void)
+{
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        delete controller_fbo;
+        delete xmu_fbo;
+        delete logo_fbo;
+        controller_fbo = xmu_fbo = logo_fbo = nullptr;
+        XemuMetal4UI::CleanupCustomRendering();
+        g_icon_tex = 0;
+    }
+#endif
 }

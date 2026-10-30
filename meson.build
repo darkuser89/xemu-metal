@@ -55,6 +55,9 @@ supported_cpus = ['ppc', 'ppc64', 's390x', 'riscv32', 'riscv64', 'x86', 'x86_64'
   'arm', 'aarch64', 'loongarch64', 'mips64', 'sparc64', 'wasm32']
 
 cpu = host_machine.cpu_family()
+if host_os != 'darwin' or cpu != 'aarch64'
+  error('xemu-metal requires Apple Silicon (arm64) and macOS 26 or newer')
+endif
 
 target_dirs = config_host['TARGET_DIRS'].split()
 
@@ -85,6 +88,26 @@ if host_os == 'darwin' and \
    add_languages('objc', required: true, native: false)
   all_languages += ['objc']
   objc = meson.get_compiler('objc')
+  if cpu == 'aarch64'
+    add_languages('objcpp', required: true, native: false)
+    all_languages += ['objcpp']
+  endif
+endif
+
+metal4_minimum_args = ['-mmacosx-version-min=26.0']
+add_global_arguments(metal4_minimum_args, language: all_languages)
+add_global_link_arguments(metal4_minimum_args, language: all_languages)
+if not cc.compiles('''
+  #include <AvailabilityMacros.h>
+  #if !defined(__APPLE__) || !defined(__aarch64__)
+  #error Apple Silicon is required
+  #endif
+  #if MAC_OS_X_VERSION_MAX_ALLOWED < 260000
+  #error The macOS 26 SDK is required for Metal 4
+  #endif
+  int main(void) { return 0; }
+''', args: metal4_minimum_args, name: 'Apple Silicon and macOS 26 Metal4 SDK')
+  error('A native arm64 compiler with the macOS 26 SDK or newer is required')
 endif
 
 have_rust = add_languages('rust', native: false,
@@ -1899,6 +1922,7 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
 
   opengl = declare_dependency(link_args: opengl_libs, dependencies: epoxy)
 endif
+
 
 gbm = not_found
 if (have_system or have_tools) and (virgl.found() or opengl.found())
@@ -4472,6 +4496,42 @@ foreach target : target_dirs
   target_inc = [include_directories('target' / config_target['TARGET_BASE_ARCH'])]
   if host_os == 'linux'
     target_inc += include_directories('linux-headers', is_system: true)
+  endif
+  if is_variable('nv2a_metal4') and target == 'i386-softmmu'
+    # QEMU-facing native adapter needs the actual guest target definitions.
+    metal4_qemu_args = metal4_objc_args + c_args + [
+      '-Wall', '-Wextra', '-Werror', '-DXBOX=1', '-DCONFIG_DEVICES="i386-softmmu-config-devices.h"',
+    ]
+    metal4_qemu_c_args = c_args + [
+      '-DXBOX=1', '-DCONFIG_DEVICES="i386-softmmu-config-devices.h"',
+    ]
+    metal4_qemu_includes = include_directories(
+      '.', 'include', 'target/i386', 'host/include/aarch64',
+      'host/include/generic', is_system: true,
+    )
+    nv2a_metal4_qemu = static_library('nv2a-metal4-qemu',
+      sources: files('hw/xbox/nv2a/pgraph/metal/surface-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/texture-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/pixel-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/vertex-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/fetch-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/scanout-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/blit-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/reports-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/draw-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/input-checkpoint.m',
+                     'hw/xbox/nv2a/pgraph/metal/pending-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/state-pgraph.m',
+                     'hw/xbox/nv2a/pgraph/metal/renderer.m',
+                     'hw/xbox/nv2a/pgraph/metal/save-lifecycle.c',
+                     'hw/xbox/nv2a/pgraph/metal/vertex-snapshot.c') + genh,
+      c_args: metal4_qemu_c_args + ['-Wall', '-Wextra', '-Werror'],
+      objc_args: metal4_qemu_args,
+      include_directories: metal4_qemu_includes,
+      dependencies: [glib, metal4_frameworks],
+      link_with: nv2a_metal4,
+    )
+    arch_deps += declare_dependency(link_with: nv2a_metal4_qemu)
   endif
   if target.endswith('-softmmu')
     target_type='system'

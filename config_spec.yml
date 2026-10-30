@@ -226,8 +226,8 @@ input:
 display:
   renderer:
     type: enum
-    values: ["NULL", OPENGL, VULKAN]
-    default: OPENGL
+    values: ["NULL", OPENGL, VULKAN, METAL4]
+    default: METAL4
   vulkan:
     validation_layers: bool
     debug_shaders: bool

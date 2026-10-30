@@ -25,6 +25,12 @@ void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram);
 void nv2a_context_init(void);
 int nv2a_get_framebuffer_surface(void);
 void nv2a_release_framebuffer_surface(void);
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Outside BQL. Returns an owned immutable frame, or NULL before renderer init
+ * and after device shutdown. Release remains valid after device teardown. */
+void *nv2a_copy_metal4_framebuffer(void);
+void nv2a_release_metal4_framebuffer(void *frame);
+#endif
 void nv2a_set_surface_scale_factor(unsigned int scale);
 unsigned int nv2a_get_surface_scale_factor(void);
 const uint8_t *nv2a_get_dac_palette(void);

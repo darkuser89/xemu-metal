@@ -18,6 +18,7 @@
 //
 
 #include <SDL3/SDL.h>
+#include "texture.h"
 #include <epoxy/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +63,7 @@ float g_main_menu_height;
 static ImGuiStyle g_base_style;
 static float g_last_scale;
 static int g_vsync;
-static GLuint g_tex;
+static XemuTexture g_tex;
 static bool g_flip_req;
 
 
@@ -133,7 +134,6 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     xemu_monitor_init();
     g_vsync = g_config.display.window.vsync;
 
-    InitCustomRendering();
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -144,8 +144,23 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     io.IniFilename = NULL;
 
     // Setup Platform/Renderer bindings
-    ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
-    ImGui_ImplOpenGL3_Init("#version 150");
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        (void)sdl_gl_context;
+        if (!ImGui_ImplSDL3_InitForMetal(window) ||
+            !xemu_metal4_ui_init(window, g_vsync)) {
+            fprintf(stderr, "Cannot initialize Metal UI: %s\n",
+                    xemu_metal4_ui_error());
+            abort();
+        }
+        InitCustomRendering();
+    } else
+#endif
+    {
+        ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
+        ImGui_ImplOpenGL3_Init("#version 150");
+        InitCustomRendering();
+    }
     ImPlot::CreateContext();
 
 #if defined(_WIN32)
@@ -161,8 +176,17 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
-    ImGui_ImplOpenGL3_Shutdown();
+    CleanupCustomRendering();
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        xemu_metal4_ui_close();
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+    }
     ImGui_ImplSDL3_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 }
 
@@ -183,11 +207,26 @@ void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
     if (mouse) *mouse = io.WantCaptureMouse;
 }
 
-void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
+void xemu_hud_set_framebuffer_texture(XemuTexture tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
 }
+
+#ifdef XEMU_NATIVE_METAL4_UI
+bool xemu_hud_begin_frame(void)
+{
+    return xemu_metal4_ui_begin(0);
+}
+void xemu_hud_set_metal4_framebuffer(void *frame)
+{
+    if (!xemu_metal4_ui_set_frame(frame)) {
+        xemu_queue_error_message(xemu_metal4_ui_error());
+    }
+    g_tex = xemu_metal4_ui_frame_texture();
+    g_flip_req = false;
+}
+#endif
 
 void xemu_hud_update(void)
 {
@@ -209,7 +248,16 @@ void xemu_hud_update(void)
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
     }
 
-    ImGui_ImplOpenGL3_NewFrame();
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        if (!xemu_metal4_ui_new_frame()) {
+            xemu_queue_error_message(xemu_metal4_ui_error());
+        }
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_NewFrame();
+    }
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -325,11 +373,27 @@ void xemu_hud_update(void)
 void xemu_hud_render()
 {
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+#ifdef XEMU_NATIVE_METAL4_UI
+    if (xemu_hud_uses_metal4()) {
+        if (!xemu_metal4_ui_end(ImGui::GetDrawData())) {
+            xemu_queue_error_message(xemu_metal4_ui_error());
+        }
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;
-        SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+#ifdef XEMU_NATIVE_METAL4_UI
+        if (xemu_hud_uses_metal4()) {
+            xemu_metal4_ui_set_vsync(g_vsync);
+        } else
+#endif
+        {
+            SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+        }
     }
 
     if (g_screenshot_pending) {

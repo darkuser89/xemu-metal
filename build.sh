@@ -128,8 +128,7 @@ get_job_count () {
 	fi
 }
 
-job_count="$(get_job_count)" 2>/dev/null
-job_count="${job_count:-${default_job_count}}"
+job_count=""
 debug=""
 opts=""
 platform="$(uname -s)"
@@ -158,6 +157,15 @@ do
         ;;
     esac
 done
+
+if [[ "$platform" != "Darwin" || "$target_arch" != "arm64" ||
+      "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    echo "xemu-metal requires an Apple Silicon Mac; Intel and other platforms are unsupported" >&2
+    exit 1
+fi
+if [[ -z "$job_count" ]]; then
+    job_count="$(get_job_count 2>/dev/null || echo "${default_job_count}")"
+fi
 
 target="qemu-system-i386"
 if test ! -z "$debug"; then
@@ -201,18 +209,11 @@ case "$platform" in # Adjust compilation options based on platform
         ;;
     Darwin)
         echo "Compiling for MacOS for $target_arch..."
-        if [ "$target_arch" == "arm64" ]; then
-            macos_min_ver=14.0
-        elif [ "$target_arch" == "x86_64" ]; then
-            macos_min_ver=12.7.5
-        else
-            echo "Unsupported arch $target_arch"
-            exit 1
-        fi
-
-        sdk="$(most_recent_macosx_sdk_ver ${macos_min_ver})"
-        if [[ -z "${sdk}" ]]; then
-          echo "SDK >= ${macos_min_ver} not found. Install Xcode Command Line Tools"
+        macos_min_ver=26.0
+        sdk="$(xcrun --sdk macosx --show-sdk-path)"
+        sdk_version="$(xcrun --sdk macosx --show-sdk-version)"
+        if [[ ! -d "${sdk}" || "${sdk_version%%.*}" -lt 26 ]]; then
+          echo "SDK >= ${macos_min_ver} required. Install Xcode with Metal 4 support"
           exit 1
         fi
 

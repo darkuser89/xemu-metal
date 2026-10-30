@@ -25,7 +25,7 @@
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.games</string>
   <key>LSMinimumSystemVersion</key>
-  <string>10.6</string>
+  <string>26.0</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>NSHighResolutionCapable</key>

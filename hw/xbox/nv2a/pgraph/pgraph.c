@@ -27,6 +27,10 @@
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "metal/renderer.h"
+#include "metal/vertex-normalize.h"
+#endif
 
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
 #define PG_SET_MASK(reg, mask, value)        \
@@ -38,6 +42,10 @@
 
 
 NV2AState *g_nv2a;
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Host requests outlive the BQL while waiting for FIFO/GPU completion. */
+static GMutex metal4_host_lock;
+#endif
 
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -217,8 +225,6 @@ void pgraph_renderer_register(const PGRAPHRenderer *renderer)
 
 void pgraph_init(NV2AState *d)
 {
-    g_nv2a = d;
-
     PGRAPHState *pg = &d->pgraph;
     qemu_mutex_init(&pg->lock);
     qemu_mutex_init(&pg->renderer_lock);
@@ -232,6 +238,7 @@ void pgraph_init(NV2AState *d)
     pg->draw_time = 0;
 
     pg->material_alpha = 0.0f;
+    pg->material_alpha_back = 0.0f;
     PG_SET_MASK(NV_PGRAPH_CONTROL_3, NV_PGRAPH_CONTROL_3_SHADEMODE,
          NV_PGRAPH_CONTROL_3_SHADEMODE_SMOOTH);
     pg->primitive_mode = PRIM_TYPE_INVALID;
@@ -244,6 +251,13 @@ void pgraph_init(NV2AState *d)
     }
 
     pgraph_clear_dirty_reg_map(pg);
+#if defined(__APPLE__) && defined(__aarch64__)
+    g_mutex_lock(&metal4_host_lock);
+    g_nv2a = d;
+    g_mutex_unlock(&metal4_host_lock);
+#else
+    g_nv2a = d;
+#endif
 }
 
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
@@ -269,6 +283,9 @@ static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
 
 void nv2a_context_init(void)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    pgraph_metal4_register_renderer();
+#endif
     if (!renderers[g_config.display.renderer]) {
         g_config.display.renderer = get_default_renderer();
         fprintf(stderr,
@@ -276,6 +293,11 @@ void nv2a_context_init(void)
                 renderers[g_config.display.renderer]->name);
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_METAL4) {
+        return;
+    }
+#endif
     // FIXME: We need a mechanism for renderer to initialize new GL contexts
     //        on the main thread at run time. For now, just let them all create
     //        what they need.
@@ -322,7 +344,11 @@ static void init_renderer(PGRAPHState *pg)
     }
 
     CONFIG_DISPLAY_RENDERER default_renderer = get_default_renderer();
-    if (default_renderer != g_config.display.renderer) {
+    if (default_renderer != g_config.display.renderer
+#if defined(__APPLE__) && defined(__aarch64__)
+        && g_config.display.renderer != CONFIG_DISPLAY_RENDERER_METAL4
+#endif
+    ) {
         g_config.display.renderer = default_renderer;
         if (attempt_renderer_init(pg)) {
             g_autofree gchar *msg = g_strdup_printf(
@@ -340,18 +366,59 @@ static void init_renderer(PGRAPHState *pg)
 
 void pgraph_init_thread(NV2AState *d)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    qemu_mutex_lock(&d->pgraph.renderer_lock);
+    qemu_mutex_lock(&d->pgraph.lock);
+#endif
     init_renderer(&d->pgraph);
+#if defined(__APPLE__) && defined(__aarch64__)
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_unlock(&d->pgraph.renderer_lock);
+#endif
 }
 
 void pgraph_destroy(PGRAPHState *pg)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
 
-    if (pg->renderer->ops.finalize) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    qemu_mutex_lock(&pg->renderer_lock);
+    qemu_mutex_lock(&pg->lock);
+#endif
+    if (pg->renderer && pg->renderer->ops.finalize) {
        pg->renderer->ops.finalize(d);
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    pg->renderer = NULL;
+    /* Native subsections can also be loaded while a legacy backend is active. */
+    g_free(pg->metal4_report_snapshot);
+    pg->metal4_report_snapshot = NULL;
+    pg->metal4_report_snapshot_size = 0;
+    g_free(pg->metal4_vertex_capture);
+    pg->metal4_vertex_capture = NULL;
+    pg->metal4_vertex_capture_size = 0;
+    g_free(pg->metal4_begin_capture);
+    pg->metal4_begin_capture = NULL;
+    pg->metal4_begin_capture_size = 0;
+    g_free(pg->metal4_pending_capture);
+    pg->metal4_pending_capture = NULL;
+    pg->metal4_pending_capture_size = 0;
+    qemu_mutex_unlock(&pg->lock);
+    qemu_mutex_unlock(&pg->renderer_lock);
+#endif
 
     qemu_mutex_destroy(&pg->lock);
+#if defined(__APPLE__) && defined(__aarch64__)
+    qemu_mutex_destroy(&pg->renderer_lock);
+    qemu_event_destroy(&pg->sync_complete);
+    qemu_event_destroy(&pg->flush_complete);
+    qemu_cond_destroy(&pg->framebuffer_released);
+    qemu_event_destroy(&pg->renderer_switch_complete);
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        g_free(pg->vertex_attributes[i].inline_buffer);
+        pg->vertex_attributes[i].inline_buffer = NULL;
+    }
+#endif
 }
 
 int nv2a_get_framebuffer_surface(void)
@@ -381,8 +448,56 @@ void nv2a_release_framebuffer_surface(void)
     qemu_mutex_unlock(&pg->renderer_lock);
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+void pgraph_stop_metal4_host_requests(NV2AState *d)
+{
+    /* Call without BQL, before stopping the FIFO thread. Taking this lock
+     * waits for any getter/scale request that already captured the device. */
+    g_mutex_lock(&metal4_host_lock);
+    if (g_nv2a == d) {
+        g_nv2a = NULL;
+    }
+    g_mutex_unlock(&metal4_host_lock);
+}
+void *nv2a_copy_metal4_framebuffer(void)
+{
+    g_mutex_lock(&metal4_host_lock);
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        g_mutex_unlock(&metal4_host_lock);
+        return NULL;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    qemu_mutex_lock(&pg->renderer_lock);
+    void *frame = pg->renderer && pg->renderer->ops.copy_framebuffer ?
+                      pg->renderer->ops.copy_framebuffer(d) : NULL;
+    qemu_mutex_unlock(&pg->renderer_lock);
+    g_mutex_unlock(&metal4_host_lock);
+    return frame;
+}
+void nv2a_release_metal4_framebuffer(void *frame)
+{
+    pgraph_metal4_release_framebuffer(frame);
+}
+#endif
+
 void nv2a_set_surface_scale_factor(unsigned int scale)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    bql_unlock();
+    g_mutex_lock(&metal4_host_lock);
+    NV2AState *d = g_nv2a;
+    if (d) {
+        qemu_mutex_lock(&d->pgraph.renderer_lock);
+        if (d->pgraph.renderer &&
+            d->pgraph.renderer->ops.set_surface_scale_factor) {
+            d->pgraph.renderer->ops.set_surface_scale_factor(d, scale);
+        }
+        qemu_mutex_unlock(&d->pgraph.renderer_lock);
+    }
+    g_mutex_unlock(&metal4_host_lock);
+    bql_lock();
+#else
     NV2AState *d = g_nv2a;
 
     bql_unlock();
@@ -392,10 +507,28 @@ void nv2a_set_surface_scale_factor(unsigned int scale)
     }
     qemu_mutex_unlock(&d->pgraph.renderer_lock);
     bql_lock();
+#endif
 }
 
 unsigned int nv2a_get_surface_scale_factor(void)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    unsigned int scale = 1;
+    bql_unlock();
+    g_mutex_lock(&metal4_host_lock);
+    NV2AState *d = g_nv2a;
+    if (d) {
+        qemu_mutex_lock(&d->pgraph.renderer_lock);
+        if (d->pgraph.renderer &&
+            d->pgraph.renderer->ops.get_surface_scale_factor) {
+            scale = d->pgraph.renderer->ops.get_surface_scale_factor(d);
+        }
+        qemu_mutex_unlock(&d->pgraph.renderer_lock);
+    }
+    g_mutex_unlock(&metal4_host_lock);
+    bql_lock();
+    return scale;
+#else
     NV2AState *d = g_nv2a;
     int s = 1;
 
@@ -408,6 +541,7 @@ unsigned int nv2a_get_surface_scale_factor(void)
     bql_lock();
 
     return s;
+#endif
 }
 
 #define METHOD_ADDR(gclass, name) \
@@ -1101,6 +1235,14 @@ DEF_METHOD(NV097, SET_COLOR_MATERIAL)
              (parameter >> 4) & 3);
     PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_SPECULAR,
              (parameter >> 6) & 3);
+    PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_BACK_EMISSION,
+             (parameter >> 8) & 3);
+    PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_BACK_AMBIENT,
+             (parameter >> 10) & 3);
+    PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_BACK_DIFFUSE,
+             (parameter >> 12) & 3);
+    PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_BACK_SPECULAR,
+             (parameter >> 14) & 3);
 }
 
 DEF_METHOD(NV097, SET_FOG_MODE)
@@ -1644,6 +1786,32 @@ DEF_METHOD(NV097, SET_MATERIAL_ALPHA)
     pg->material_alpha = *(float*)&parameter;
 }
 
+DEF_METHOD_INC(NV097, SET_BACK_SCENE_AMBIENT_COLOR)
+{
+    unsigned slot = (method - NV097_SET_BACK_SCENE_AMBIENT_COLOR) / 4;
+    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BR_AMB][slot] = parameter;
+    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BR_AMB] = true;
+}
+
+DEF_METHOD_INC(NV097, SET_BACK_MATERIAL_EMISSION)
+{
+    unsigned slot = (method - NV097_SET_BACK_MATERIAL_EMISSION) / 4;
+    pg->ltctxa[NV_IGRAPH_XF_LTCTXA_BCM_COL][slot] = parameter;
+    pg->ltctxa_dirty[NV_IGRAPH_XF_LTCTXA_BCM_COL] = true;
+}
+
+DEF_METHOD(NV097, SET_BACK_MATERIAL_ALPHA)
+{
+    memcpy(&pg->material_alpha_back, &parameter, sizeof(parameter));
+}
+
+DEF_METHOD(NV097, SET_LIGHT_TWO_SIDE_ENABLE)
+{
+    PG_SET_MASK(NV_PGRAPH_SETUPRASTER, NV_PGRAPH_SETUPRASTER_TWO_SIDE,
+                parameter);
+    PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_TWO_SIDE, parameter);
+}
+
 DEF_METHOD(NV097, SET_SPECULAR_ENABLE)
 {
     PG_SET_MASK(NV_PGRAPH_CSV0_C, NV_PGRAPH_CSV0_C_SPECULAR_ENABLE, parameter);
@@ -1992,8 +2160,15 @@ DEF_METHOD_INC(NV097, SET_VIEWPORT_SCALE)
     pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPSCL] = true;
 }
 
+static void pgraph_vertex_state_change(NV2AState *d)
+{
+    if (d->pgraph.renderer && d->pgraph.renderer->ops.vertex_state_change)
+        d->pgraph.renderer->ops.vertex_state_change(d);
+}
+
 DEF_METHOD_INC(NV097, SET_TRANSFORM_PROGRAM)
 {
+    pgraph_vertex_state_change(d);
     int slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
 
     int program_load = PG_GET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
@@ -2011,6 +2186,7 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_PROGRAM)
 
 DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
 {
+    pgraph_vertex_state_change(d);
     int slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
     int const_load = PG_GET_MASK(NV_PGRAPH_CHEOPS_OFFSET,
                               NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR);
@@ -2172,6 +2348,27 @@ DEF_METHOD(NV097, SET_WEIGHT1F)
     attribute->inline_value[3] = 1.f;
 }
 
+/* Immediate command decoding must use the same IDX bits as Metal fetch.
+ * Leave other renderers on their existing host-float conversion. */
+#if defined(__APPLE__) && defined(__aarch64__)
+static bool pgraph_metal4_vertex_ubyte(PGRAPHState *pg, VertexAttribute *attr,
+                                       uint32_t parameter)
+{
+    if (!pg->renderer ||
+        pg->renderer->type != CONFIG_DISPLAY_RENDERER_METAL4) {
+        return false;
+    }
+    uint32_t bits[4];
+    for (unsigned i = 0; i < 4; i++) {
+        bits[i] = nv2a_metal_ubyte_bits((parameter >> (8 * i)) & 255);
+    }
+    memcpy(attr->inline_value, bits, sizeof(bits));
+    return true;
+}
+#else
+#define pgraph_metal4_vertex_ubyte(pg, attr, parameter) false
+#endif
+
 DEF_METHOD_INC(NV097, SET_NORMAL3S)
 {
     int slot = (method - NV097_SET_NORMAL3S) / 4;
@@ -2179,6 +2376,21 @@ DEF_METHOD_INC(NV097, SET_NORMAL3S)
     VertexAttribute *attribute =
         &pg->vertex_attributes[NV2A_VERTEX_ATTR_NORMAL];
     pgraph_allocate_inline_buffer_vertices(pg, NV2A_VERTEX_ATTR_NORMAL);
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (pg->renderer &&
+        pg->renderer->type == CONFIG_DISPLAY_RENDERER_METAL4) {
+        uint32_t bits[4];
+        memcpy(bits, attribute->inline_value, sizeof(bits));
+        bits[part * 2] = nv2a_metal_nshort_bits((int16_t)parameter);
+        if (!part) {
+            bits[1] = nv2a_metal_nshort_bits((int16_t)(parameter >> 16));
+            bits[2] = 0;
+            bits[3] = 0x3f800000;
+        }
+        memcpy(attribute->inline_value, bits, sizeof(bits));
+        return;
+    }
+#endif
     int16_t val = parameter & 0xFFFF;
     attribute->inline_value[part * 2 + 0] = MAX(-1.0f, (float)val / 32767.0f);
     val = parameter >> 16;
@@ -2384,10 +2596,12 @@ DEF_METHOD_INC(NV097, SET_TEXCOORD3_2F)
     do {                                                                   \
         VertexAttribute *attribute = &pg->vertex_attributes[(attr_index)]; \
         pgraph_allocate_inline_buffer_vertices(pg, (attr_index));          \
-        attribute->inline_value[0] = (parameter & 0xFF) / 255.0f;          \
-        attribute->inline_value[1] = ((parameter >> 8) & 0xFF) / 255.0f;   \
-        attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0f;  \
-        attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0f;  \
+        if (!pgraph_metal4_vertex_ubyte(pg, attribute, parameter)) {        \
+            attribute->inline_value[0] = (parameter & 0xFF) / 255.0f;          \
+            attribute->inline_value[1] = ((parameter >> 8) & 0xFF) / 255.0f;   \
+            attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0f;  \
+            attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0f;  \
+        }                                                                  \
     } while (0)
 
 DEF_METHOD_INC(NV097, SET_DIFFUSE_COLOR4UB)
@@ -2665,6 +2879,17 @@ static void pgraph_expand_draw_arrays(NV2AState *d)
      * triggered if a set of BEGIN+DA+END triplets is followed by the
      * BEGIN+DA+ARRAY_ELEMENT+... chain that caused this expansion. */
     if (pg->draw_arrays_length > 1) {
+        /* The last range belongs to the still-open Begin and is expanded
+         * below. Flushing it here would draw its complete primitives twice. */
+        pg->draw_arrays_length--;
+        pg->draw_arrays_min_start = UINT32_MAX;
+        pg->draw_arrays_max_count = 0;
+        for (unsigned int i = 0; i < pg->draw_arrays_length; i++) {
+            uint32_t first = pg->draw_arrays_start[i];
+            uint32_t end = first + pg->draw_arrays_count[i];
+            pg->draw_arrays_min_start = MIN(pg->draw_arrays_min_start, first);
+            pg->draw_arrays_max_count = MAX(pg->draw_arrays_max_count, end);
+        }
         d->pgraph.renderer->ops.flush_draw(d);
         pgraph_reset_inline_buffers(pg);
     }
@@ -2715,6 +2940,23 @@ DEF_METHOD(NV097, DRAW_ARRAYS)
     int32_t start = GET_MASK(parameter, NV097_DRAW_ARRAYS_START_INDEX);
     int32_t count = GET_MASK(parameter, NV097_DRAW_ARRAYS_COUNT) + 1;
 
+    if (!pg->draw_arrays_prevent_connect && pg->draw_arrays_length > 0) {
+        unsigned int last_start =
+            pg->draw_arrays_start[pg->draw_arrays_length - 1];
+        int32_t *last_count =
+            &pg->draw_arrays_count[pg->draw_arrays_length - 1];
+        if (start == (last_start + *last_count)) {
+            *last_count += count;
+            pg->draw_arrays_max_count =
+                MAX(pg->draw_arrays_max_count, start + count);
+            return;
+        }
+
+        /* An address gap does not end the current primitive stream. Expand
+         * the open range so it can continue with noncontiguous indices. */
+        pgraph_expand_draw_arrays(d);
+    }
+
     if (pg->inline_elements_length) {
         /* FIXME: HW throws an exception if the start index is > 0xFFFF. This
          * would prevent this assert from firing for any reasonable choice of
@@ -2734,18 +2976,6 @@ DEF_METHOD(NV097, DRAW_ARRAYS)
     pg->draw_arrays_max_count = MAX(pg->draw_arrays_max_count, start + count);
 
     assert(pg->draw_arrays_length < ARRAY_SIZE(pg->draw_arrays_start));
-
-    /* Attempt to connect contiguous primitives */
-    if (!pg->draw_arrays_prevent_connect && pg->draw_arrays_length > 0) {
-        unsigned int last_start =
-            pg->draw_arrays_start[pg->draw_arrays_length - 1];
-        int32_t *last_count =
-            &pg->draw_arrays_count[pg->draw_arrays_length - 1];
-        if (start == (last_start + *last_count)) {
-            *last_count += count;
-            return;
-        }
-    }
 
     pg->draw_arrays_start[pg->draw_arrays_length] = start;
     pg->draw_arrays_count[pg->draw_arrays_length] = count;
@@ -2814,10 +3044,12 @@ DEF_METHOD_INC(NV097, SET_VERTEX_DATA4UB)
     int slot = (method - NV097_SET_VERTEX_DATA4UB) / 4;
     VertexAttribute *attribute = &pg->vertex_attributes[slot];
     pgraph_allocate_inline_buffer_vertices(pg, slot);
-    attribute->inline_value[0] = (parameter & 0xFF) / 255.0;
-    attribute->inline_value[1] = ((parameter >> 8) & 0xFF) / 255.0;
-    attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0;
-    attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0;
+    if (!pgraph_metal4_vertex_ubyte(pg, attribute, parameter)) {
+        attribute->inline_value[0] = (parameter & 0xFF) / 255.0;
+        attribute->inline_value[1] = ((parameter >> 8) & 0xFF) / 255.0;
+        attribute->inline_value[2] = ((parameter >> 16) & 0xFF) / 255.0;
+        attribute->inline_value[3] = ((parameter >> 24) & 0xFF) / 255.0;
+    }
     if (slot == 0) {
         pgraph_finish_inline_buffer_vertex(pg);
     }
@@ -2984,6 +3216,10 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_DATA)
 
 DEF_METHOD(NV097, LAUNCH_TRANSFORM_PROGRAM)
 {
+    if (pg->renderer->ops.launch_transform_program) {
+        pg->renderer->ops.launch_transform_program(d, parameter);
+        return;
+    }
     unsigned int program_start = parameter;
     assert(program_start < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH);
     Nv2aVshProgram program;
@@ -3005,6 +3241,7 @@ DEF_METHOD(NV097, LAUNCH_TRANSFORM_PROGRAM)
 
 DEF_METHOD(NV097, SET_TRANSFORM_EXECUTION_MODE)
 {
+    pgraph_vertex_state_change(d);
     PG_SET_MASK(NV_PGRAPH_CSV0_D, NV_PGRAPH_CSV0_D_MODE,
              GET_MASK(parameter,
                       NV097_SET_TRANSFORM_EXECUTION_MODE_MODE));
@@ -3015,6 +3252,7 @@ DEF_METHOD(NV097, SET_TRANSFORM_EXECUTION_MODE)
 
 DEF_METHOD(NV097, SET_TRANSFORM_PROGRAM_CXT_WRITE_EN)
 {
+    pgraph_vertex_state_change(d);
     pg->enable_vertex_program_write = parameter;
 }
 
@@ -3027,6 +3265,7 @@ DEF_METHOD(NV097, SET_TRANSFORM_PROGRAM_LOAD)
 
 DEF_METHOD(NV097, SET_TRANSFORM_PROGRAM_START)
 {
+    pgraph_vertex_state_change(d);
     assert(parameter < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH);
     PG_SET_MASK(NV_PGRAPH_CSV0_C,
              NV_PGRAPH_CSV0_C_CHEOPS_PROGRAM_START, parameter);
@@ -3177,12 +3416,25 @@ void pgraph_process_pending(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     pg->renderer->ops.process_pending(d);
 
-    if (g_config.display.renderer != pg->renderer->type &&
+    bool same_frontend = true;
+#if defined(__APPLE__) && defined(__aarch64__)
+    same_frontend = (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_METAL4) ==
+                    (pg->renderer->type == CONFIG_DISPLAY_RENDERER_METAL4);
+#endif
+    if (same_frontend && g_config.display.renderer != pg->renderer->type &&
         pg->renderer_switch_phase == PGRAPH_RENDERER_SWITCH_PHASE_IDLE) {
         pg->renderer_switch_phase = PGRAPH_RENDERER_SWITCH_PHASE_STARTED;
         qemu_event_reset(&pg->renderer_switch_complete);
         async_safe_run_on_cpu(qemu_get_cpu(0), do_wait_for_renderer_switch,
                               RUN_ON_CPU_HOST_PTR(d));
+    }
+
+    if (!same_frontend &&
+        pg->renderer_switch_phase == PGRAPH_RENDERER_SWITCH_PHASE_CPU_WAITING) {
+        /* A newer selection requires a different SDL presentation session. */
+        pg->renderer_switch_phase = PGRAPH_RENDERER_SWITCH_PHASE_IDLE;
+        qemu_event_set(&pg->renderer_switch_complete);
+        return;
     }
 
     if (pg->renderer_switch_phase == PGRAPH_RENDERER_SWITCH_PHASE_CPU_WAITING) {
@@ -3225,6 +3477,18 @@ void pgraph_process_pending(NV2AState *d)
 void pgraph_process_pending_reports(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (pg->renderer->type == CONFIG_DISPLAY_RENDERER_METAL4) {
+        /* Method callbacks already hold PGRAPH. Only the PFIFO service loop
+         * needs to transfer its lock before invoking the native callback. */
+        qemu_mutex_unlock(&d->pfifo.lock);
+        qemu_mutex_lock(&pg->lock);
+        pg->renderer->ops.process_pending_reports(d);
+        qemu_mutex_unlock(&pg->lock);
+        qemu_mutex_lock(&d->pfifo.lock);
+        return;
+    }
+#endif
     pg->renderer->ops.process_pending_reports(d);
 }
 
@@ -3238,6 +3502,30 @@ void pgraph_pre_savevm_wait(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     pg->renderer->ops.pre_savevm_wait(d);
+}
+
+void pgraph_pre_restore_trigger(NV2AState *d)
+{
+    const PGRAPHRenderer *renderer = d->pgraph.renderer;
+    assert(!renderer->ops.pre_restore_trigger ==
+           !renderer->ops.pre_restore_wait);
+    if (renderer->ops.pre_restore_trigger) {
+        renderer->ops.pre_restore_trigger(d);
+    }
+}
+
+void pgraph_pre_restore_wait(NV2AState *d)
+{
+    if (d->pgraph.renderer->ops.pre_restore_wait) {
+        d->pgraph.renderer->ops.pre_restore_wait(d);
+    }
+}
+
+void pgraph_post_load(NV2AState *d)
+{
+    if (d->pgraph.renderer->ops.post_load) {
+        d->pgraph.renderer->ops.post_load(d);
+    }
 }
 
 void pgraph_pre_shutdown_trigger(NV2AState *d)

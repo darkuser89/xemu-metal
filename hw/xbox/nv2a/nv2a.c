@@ -21,6 +21,9 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
+#include "migration/qemu-file.h"
+#include "hw/xbox/nv2a/pgraph/metal/renderer.h"
+#include "hw/xbox/nv2a/pgraph/metal/vertex-snapshot.h"
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -203,7 +206,14 @@ int nv2a_get_screen_off(void)
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
-    vga->hw_ops->gfx_update(vga);
+#if defined(__APPLE__) && defined(__aarch64__)
+    NV2AState *owner = container_of(vga, NV2AState, vga);
+    if (!owner->pgraph.renderer ||
+        owner->pgraph.renderer->type != CONFIG_DISPLAY_RENDERER_METAL4)
+#endif
+    {
+        vga->hw_ops->gfx_update(vga);
+    }
 
     NV2AState *d = container_of(vga, NV2AState, vga);
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
@@ -269,7 +279,7 @@ static void nv2a_init_vga(NV2AState *d)
     vga_dirty_log_start(vga);
 }
 
-static void nv2a_lock_fifo(NV2AState *d)
+void nv2a_lock_fifo(NV2AState *d)
 {
     qemu_mutex_lock(&d->pfifo.lock);
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
@@ -279,7 +289,7 @@ static void nv2a_lock_fifo(NV2AState *d)
     qemu_mutex_lock(&d->pgraph.lock);
 }
 
-static void nv2a_unlock_fifo(NV2AState *d)
+void nv2a_unlock_fifo(NV2AState *d)
 {
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pgraph.lock);
@@ -364,6 +374,9 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
     qemu_mutex_init(&d->pfifo.lock);
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
+#if defined(__APPLE__) && defined(__aarch64__)
+    nv2a_metal4_save_init(d);
+#endif
 }
 
 static void nv2a_exitfn(PCIDevice *dev)
@@ -371,6 +384,15 @@ static void nv2a_exitfn(PCIDevice *dev)
     NV2AState *d;
     d = NV2A_DEVICE(dev);
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    nv2a_metal4_save_destroy(d);
+    if (d->pgraph.renderer &&
+        d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_METAL4) {
+        bql_unlock();
+        pgraph_stop_metal4_host_requests(d);
+        bql_lock();
+    }
+#endif
     d->exiting = true;
 
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
@@ -391,6 +413,19 @@ static void nv2a_reset_hold(Object *obj, ResetType type)
 static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
 {
     NV2AState *d = opaque;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (state == RUN_STATE_RUNNING || state == RUN_STATE_SUSPENDED ||
+        state == RUN_STATE_RESTORE_VM || state == RUN_STATE_SHUTDOWN) {
+        /* Also covers failures before snapshot setup/post_save was reached. */
+        nv2a_metal4_save_cleanup(d);
+    }
+    if (d->pgraph.renderer &&
+        d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_METAL4 &&
+        (state == RUN_STATE_SAVE_VM || state == RUN_STATE_FINISH_MIGRATE)) {
+        nv2a_metal4_save_prepare(d);
+        return;
+    }
+#endif
     if (state == RUN_STATE_SAVE_VM) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, true);
@@ -403,7 +438,11 @@ static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
     } else if (state == RUN_STATE_RESTORE_VM) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, true);
+        pgraph_pre_restore_trigger(d);
         nv2a_unlock_fifo(d);
+        bql_unlock();
+        pgraph_pre_restore_wait(d);
+        bql_lock();
     } else if (state == RUN_STATE_RUNNING) {
         nv2a_lock_fifo(d);
         qatomic_set(&d->pfifo.halt, false);
@@ -418,9 +457,31 @@ static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
     }
 }
 
+static bool nv2a_pre_save(void *opaque, Error **errp)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    NV2AState *d = opaque;
+    if (d->pgraph.renderer &&
+        d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_METAL4) {
+        return nv2a_metal4_save_pre_save(d, errp);
+    }
+#else
+    (void)opaque;
+    (void)errp;
+#endif
+    return true;
+}
+
 static int nv2a_post_save(void *opaque)
 {
     NV2AState *d = opaque;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (d->pgraph.renderer &&
+        d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_METAL4) {
+        nv2a_metal4_save_release(d);
+        return 0;
+    }
+#endif
     nv2a_unlock_fifo(d);
     return 0;
 }
@@ -429,6 +490,18 @@ static int nv2a_pre_load(void *opaque)
 {
     NV2AState *d = opaque;
     nv2a_lock_fifo(d);
+    g_free(d->pgraph.metal4_report_snapshot);
+    d->pgraph.metal4_report_snapshot = NULL;
+    d->pgraph.metal4_report_snapshot_size = 0;
+    g_free(d->pgraph.metal4_vertex_capture);
+    d->pgraph.metal4_vertex_capture = NULL;
+    d->pgraph.metal4_vertex_capture_size = 0;
+    g_free(d->pgraph.metal4_begin_capture);
+    d->pgraph.metal4_begin_capture = NULL;
+    d->pgraph.metal4_begin_capture_size = 0;
+    g_free(d->pgraph.metal4_pending_capture);
+    d->pgraph.metal4_pending_capture = NULL;
+    d->pgraph.metal4_pending_capture_size = 0;
     return 0;
 }
 
@@ -436,6 +509,7 @@ static int nv2a_post_load(void *opaque, int version_id)
 {
     NV2AState *d = opaque;
     qatomic_set(&d->pgraph.flush_pending, true);
+    pgraph_post_load(d);
     nv2a_unlock_fifo(d);
     return 0;
 }
@@ -450,133 +524,239 @@ const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
     }
 };
 
+static int metal4_report_size_get(QEMUFile *f, void *pv, size_t size,
+                                const VMStateField *field)
+{
+    (void)size;
+    (void)field;
+    uint32_t value = qemu_get_be32(f);
+    if (value > 64u * 1024 * 1024) {
+        return -EINVAL;
+    }
+    *(uint32_t *)pv = value;
+    return 0;
+}
+
+static int metal4_report_size_put(QEMUFile *f, void *pv, size_t size,
+                                const VMStateField *field, JSONWriter *vmdesc)
+{
+    (void)size;
+    (void)field;
+    (void)vmdesc;
+    qemu_put_be32(f, *(uint32_t *)pv);
+    return 0;
+}
+
+static const VMStateInfo vmstate_info_metal4_report_size = {
+    .name = "metal4-report-size",
+    .get = metal4_report_size_get,
+    .put = metal4_report_size_put,
+};
+
+static bool metal4_reports_needed(void *opaque)
+{
+    NV2AState *d = opaque;
+    return d->pgraph.renderer &&
+           d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_METAL4 &&
+           d->pgraph.metal4_report_snapshot_size != 0;
+}
+
+static int metal4_reports_post_load(void *opaque, int version_id)
+{
+    NV2AState *d = opaque;
+    (void)version_id;
+    if (!pgraph_metal4_validate_report_snapshot(
+            d->pgraph.metal4_report_snapshot,
+            d->pgraph.metal4_report_snapshot_size)) {
+        return -EINVAL;
+    }
+    if (d->pgraph.primitive_mode == PRIM_TYPE_INVALID &&
+        ldl_be_p(d->pgraph.metal4_report_snapshot + 20) != UINT32_MAX) {
+        return -EINVAL;
+    }
+    if (ldl_be_p(d->pgraph.metal4_report_snapshot + 4) == 2) {
+        d->pgraph.surface_scale_factor =
+            ldl_be_p(d->pgraph.metal4_report_snapshot + 24);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_nv2a_metal4_reports = {
+    .name = "nv2a/metal4-reports",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = metal4_reports_needed,
+    .post_load = metal4_reports_post_load,
+    .fields = (VMStateField[]) {
+        {
+            .name = "metal4_report_snapshot_size",
+            .size = sizeof(uint32_t),
+            .info = &vmstate_info_metal4_report_size,
+            .flags = VMS_SINGLE,
+            .offset = offsetof(NV2AState, pgraph.metal4_report_snapshot_size),
+        },
+        VMSTATE_VBUFFER_ALLOC_UINT32(pgraph.metal4_report_snapshot, NV2AState,
+                                    0, NULL, pgraph.metal4_report_snapshot_size),
+        VMSTATE_BOOL(pgraph.zpass_pixel_count_enable, NV2AState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_nv2a = {
     .name = "nv2a",
     .version_id = 4,
     .minimum_version_id = 1,
+    .pre_save_errp = nv2a_pre_save,
     .post_save = nv2a_post_save,
     .post_load = nv2a_post_load,
     .pre_load = nv2a_pre_load,
-    .fields = (VMStateField[]) {
-        // FIXME: Split this up into subsections
-        VMSTATE_PCI_DEVICE(parent_obj, NV2AState),
-        VMSTATE_STRUCT(vga, NV2AState, 0, vmstate_vga_common, VGACommonState),
-        VMSTATE_UINT32(pgraph.pending_interrupts, NV2AState),
-        VMSTATE_UINT32(pgraph.enabled_interrupts, NV2AState),
-        VMSTATE_UINT64(pgraph.context_surfaces_2d.object_instance, NV2AState),
-        VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_source, NV2AState),
-        VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_dest, NV2AState),
-        VMSTATE_UINT32(pgraph.context_surfaces_2d.color_format, NV2AState),
-        VMSTATE_UINT32(pgraph.context_surfaces_2d.source_pitch, NV2AState),
-        VMSTATE_UINT32(pgraph.context_surfaces_2d.dest_pitch, NV2AState),
-        VMSTATE_UINT64(pgraph.context_surfaces_2d.source_offset, NV2AState),
-        VMSTATE_UINT64(pgraph.context_surfaces_2d.dest_offset, NV2AState),
-        VMSTATE_UINT64(pgraph.image_blit.object_instance, NV2AState),
-        VMSTATE_UINT64(pgraph.image_blit.context_surfaces, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.operation, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.in_x, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.in_y, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.out_x, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.out_y, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.width, NV2AState),
-        VMSTATE_UINT32(pgraph.image_blit.height, NV2AState),
-        VMSTATE_UINT64(pgraph.kelvin.object_instance, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_color, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_zeta, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_color.draw_dirty, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_zeta.draw_dirty, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_color.buffer_dirty, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_zeta.buffer_dirty, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_color.write_enabled_cache, NV2AState),
-        VMSTATE_BOOL(pgraph.surface_zeta.write_enabled_cache, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_color.pitch, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_zeta.pitch, NV2AState),
-        VMSTATE_UINT64(pgraph.surface_color.offset, NV2AState),
-        VMSTATE_UINT64(pgraph.surface_zeta.offset, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_type, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.z_format, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.color_format, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.zeta_format, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.log_width, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.log_height, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.clip_x, NV2AState),
-        VMSTATE_UINT32_V(pgraph.surface_shape.clip_y, NV2AState, 2),
-        VMSTATE_UINT32(pgraph.surface_shape.clip_width, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.clip_height, NV2AState),
-        VMSTATE_UINT32(pgraph.surface_shape.anti_aliasing, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.z_format, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.color_format, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.zeta_format, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.log_width, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.log_height, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.clip_x, NV2AState),
-        VMSTATE_UINT32_V(pgraph.last_surface_shape.clip_y, NV2AState, 2),
-        VMSTATE_UINT32(pgraph.last_surface_shape.clip_width, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.clip_height, NV2AState),
-        VMSTATE_UINT32(pgraph.last_surface_shape.anti_aliasing, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_a, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_b, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_state, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_notifies, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_semaphore, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_report, NV2AState),
-        VMSTATE_UINT64(pgraph.report_offset, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_vertex_a, NV2AState),
-        VMSTATE_UINT64(pgraph.dma_vertex_b, NV2AState),
-        VMSTATE_UINT32(pgraph.primitive_mode, NV2AState),
-        VMSTATE_UINT32_ARRAY(pgraph.vertex_state_shader_v0, NV2AState, 4),
-        VMSTATE_UINT32_2DARRAY(pgraph.program_data, NV2AState, NV2A_MAX_TRANSFORM_PROGRAM_LENGTH, VSH_TOKEN_SIZE),
-        VMSTATE_UINT32_2DARRAY(pgraph.vsh_constants, NV2AState, NV2A_VERTEXSHADER_CONSTANTS, 4),
-        VMSTATE_BOOL_ARRAY(pgraph.vsh_constants_dirty, NV2AState, NV2A_VERTEXSHADER_CONSTANTS),
-        VMSTATE_UINT32_2DARRAY(pgraph.ltctxa, NV2AState, NV2A_LTCTXA_COUNT, 4),
-        VMSTATE_BOOL_ARRAY(pgraph.ltctxa_dirty, NV2AState, NV2A_LTCTXA_COUNT),
-        VMSTATE_UINT32_2DARRAY(pgraph.ltctxb, NV2AState, NV2A_LTCTXB_COUNT, 4),
-        VMSTATE_BOOL_ARRAY(pgraph.ltctxb_dirty, NV2AState, NV2A_LTCTXB_COUNT),
-        VMSTATE_UINT32_2DARRAY(pgraph.ltc1, NV2AState, NV2A_LTC1_COUNT, 4),
-        VMSTATE_BOOL_ARRAY(pgraph.ltc1_dirty, NV2AState, NV2A_LTC1_COUNT),
-        VMSTATE_STRUCT_ARRAY(pgraph.vertex_attributes, NV2AState, NV2A_VERTEXSHADER_ATTRIBUTES, 1, vmstate_nv2a_pgraph_vertex_attributes, VertexAttribute),
-        VMSTATE_UINT32(pgraph.inline_array_length, NV2AState),
-        VMSTATE_UINT32_SUB_ARRAY(pgraph.inline_array, NV2AState, 0, NV2A_MAX_BATCH_LENGTH_V2),
-        VMSTATE_UINT32_SUB_ARRAY_V(pgraph.inline_array, NV2AState, NV2A_MAX_BATCH_LENGTH_V2, NV2A_MAX_BATCH_LENGTH - NV2A_MAX_BATCH_LENGTH_V2, 3),
-        VMSTATE_UINT32(pgraph.inline_elements_length, NV2AState), // fixme
-        VMSTATE_UINT32_SUB_ARRAY(pgraph.inline_elements, NV2AState, 0, NV2A_MAX_BATCH_LENGTH_V2),
-        VMSTATE_UINT32_SUB_ARRAY_V(pgraph.inline_elements, NV2AState, NV2A_MAX_BATCH_LENGTH_V2, NV2A_MAX_BATCH_LENGTH - NV2A_MAX_BATCH_LENGTH_V2, 3),
-        VMSTATE_UINT32(pgraph.inline_buffer_length, NV2AState), // fixme
-        VMSTATE_UINT32(pgraph.draw_arrays_length, NV2AState),
-        VMSTATE_UINT32(pgraph.draw_arrays_max_count, NV2AState),
-        VMSTATE_INT32_ARRAY(pgraph.draw_arrays_start, NV2AState, 1250),
-        VMSTATE_INT32_ARRAY(pgraph.draw_arrays_count, NV2AState, 1250),
-        VMSTATE_UINT32_ARRAY(pgraph.regs_, NV2AState, 0x2000),
-        VMSTATE_UINT32(pmc.pending_interrupts, NV2AState),
-        VMSTATE_UINT32(pmc.enabled_interrupts, NV2AState),
-        VMSTATE_UINT32(pfifo.pending_interrupts, NV2AState),
-        VMSTATE_UINT32(pfifo.enabled_interrupts, NV2AState),
-        VMSTATE_UINT32_ARRAY(pfifo.regs, NV2AState, 0x2000),
-        VMSTATE_UINT32_ARRAY(pvideo.regs, NV2AState, 0x1000),
-        VMSTATE_UINT32(ptimer.pending_interrupts, NV2AState),
-        VMSTATE_UINT32(ptimer.enabled_interrupts, NV2AState),
-        VMSTATE_UINT32(ptimer.numerator, NV2AState),
-        VMSTATE_UINT32(ptimer.denominator, NV2AState),
-        VMSTATE_UNUSED(4),
-        VMSTATE_UINT32_ARRAY(pfb.regs, NV2AState, 0x1000),
-        VMSTATE_UINT32(pcrtc.pending_interrupts, NV2AState),
-        VMSTATE_UINT32(pcrtc.enabled_interrupts, NV2AState),
-        VMSTATE_UINT64(pcrtc.start, NV2AState),
-        VMSTATE_UINT32(pramdac.core_clock_coeff, NV2AState),
-        VMSTATE_UINT64(pramdac.core_clock_freq, NV2AState),
-        VMSTATE_UINT32(pramdac.memory_clock_coeff, NV2AState),
-        VMSTATE_UINT32(pramdac.video_clock_coeff, NV2AState),
-        VMSTATE_UINT16(puserdac.write_mode_address, NV2AState),
-        VMSTATE_UINT8_ARRAY(puserdac.palette, NV2AState, 256*3),
-        VMSTATE_BOOL(pgraph.waiting_for_flip, NV2AState),
-        VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
-        VMSTATE_UNUSED(1),
-        VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
-        VMSTATE_UINT64_V(ptimer.alarm_time, NV2AState, 4),
-        VMSTATE_UINT64_V(ptimer.time_offset, NV2AState, 4),
-        VMSTATE_TIMER_V(ptimer.timer, NV2AState, 4),
-        VMSTATE_END_OF_LIST()
-    },
+    .fields =
+        (VMStateField[]){
+            // FIXME: Split this up into subsections
+            VMSTATE_PCI_DEVICE(parent_obj, NV2AState),
+            VMSTATE_STRUCT(vga, NV2AState, 0, vmstate_vga_common,
+                           VGACommonState),
+            VMSTATE_UINT32(pgraph.pending_interrupts, NV2AState),
+            VMSTATE_UINT32(pgraph.enabled_interrupts, NV2AState),
+            VMSTATE_UINT64(pgraph.context_surfaces_2d.object_instance,
+                           NV2AState),
+            VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_source,
+                           NV2AState),
+            VMSTATE_UINT64(pgraph.context_surfaces_2d.dma_image_dest,
+                           NV2AState),
+            VMSTATE_UINT32(pgraph.context_surfaces_2d.color_format, NV2AState),
+            VMSTATE_UINT32(pgraph.context_surfaces_2d.source_pitch, NV2AState),
+            VMSTATE_UINT32(pgraph.context_surfaces_2d.dest_pitch, NV2AState),
+            VMSTATE_UINT64(pgraph.context_surfaces_2d.source_offset, NV2AState),
+            VMSTATE_UINT64(pgraph.context_surfaces_2d.dest_offset, NV2AState),
+            VMSTATE_UINT64(pgraph.image_blit.object_instance, NV2AState),
+            VMSTATE_UINT64(pgraph.image_blit.context_surfaces, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.operation, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.in_x, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.in_y, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.out_x, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.out_y, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.width, NV2AState),
+            VMSTATE_UINT32(pgraph.image_blit.height, NV2AState),
+            VMSTATE_UINT64(pgraph.kelvin.object_instance, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_color, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_zeta, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_color.draw_dirty, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_zeta.draw_dirty, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_color.buffer_dirty, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_zeta.buffer_dirty, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_color.write_enabled_cache, NV2AState),
+            VMSTATE_BOOL(pgraph.surface_zeta.write_enabled_cache, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_color.pitch, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_zeta.pitch, NV2AState),
+            VMSTATE_UINT64(pgraph.surface_color.offset, NV2AState),
+            VMSTATE_UINT64(pgraph.surface_zeta.offset, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_type, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.z_format, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.color_format, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.zeta_format, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.log_width, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.log_height, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.clip_x, NV2AState),
+            VMSTATE_UINT32_V(pgraph.surface_shape.clip_y, NV2AState, 2),
+            VMSTATE_UINT32(pgraph.surface_shape.clip_width, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.clip_height, NV2AState),
+            VMSTATE_UINT32(pgraph.surface_shape.anti_aliasing, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.z_format, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.color_format, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.zeta_format, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.log_width, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.log_height, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.clip_x, NV2AState),
+            VMSTATE_UINT32_V(pgraph.last_surface_shape.clip_y, NV2AState, 2),
+            VMSTATE_UINT32(pgraph.last_surface_shape.clip_width, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.clip_height, NV2AState),
+            VMSTATE_UINT32(pgraph.last_surface_shape.anti_aliasing, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_a, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_b, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_state, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_notifies, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_semaphore, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_report, NV2AState),
+            VMSTATE_UINT64(pgraph.report_offset, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_vertex_a, NV2AState),
+            VMSTATE_UINT64(pgraph.dma_vertex_b, NV2AState),
+            VMSTATE_UINT32(pgraph.primitive_mode, NV2AState),
+            VMSTATE_UINT32_ARRAY(pgraph.vertex_state_shader_v0, NV2AState, 4),
+            VMSTATE_UINT32_2DARRAY(pgraph.program_data, NV2AState,
+                                   NV2A_MAX_TRANSFORM_PROGRAM_LENGTH,
+                                   VSH_TOKEN_SIZE),
+            VMSTATE_UINT32_2DARRAY(pgraph.vsh_constants, NV2AState,
+                                   NV2A_VERTEXSHADER_CONSTANTS, 4),
+            VMSTATE_BOOL_ARRAY(pgraph.vsh_constants_dirty, NV2AState,
+                               NV2A_VERTEXSHADER_CONSTANTS),
+            VMSTATE_UINT32_2DARRAY(pgraph.ltctxa, NV2AState, NV2A_LTCTXA_COUNT,
+                                   4),
+            VMSTATE_BOOL_ARRAY(pgraph.ltctxa_dirty, NV2AState,
+                               NV2A_LTCTXA_COUNT),
+            VMSTATE_UINT32_2DARRAY(pgraph.ltctxb, NV2AState, NV2A_LTCTXB_COUNT,
+                                   4),
+            VMSTATE_BOOL_ARRAY(pgraph.ltctxb_dirty, NV2AState,
+                               NV2A_LTCTXB_COUNT),
+            VMSTATE_UINT32_2DARRAY(pgraph.ltc1, NV2AState, NV2A_LTC1_COUNT, 4),
+            VMSTATE_BOOL_ARRAY(pgraph.ltc1_dirty, NV2AState, NV2A_LTC1_COUNT),
+            VMSTATE_STRUCT_ARRAY(pgraph.vertex_attributes, NV2AState,
+                                 NV2A_VERTEXSHADER_ATTRIBUTES, 1,
+                                 vmstate_nv2a_pgraph_vertex_attributes,
+                                 VertexAttribute),
+            VMSTATE_UINT32(pgraph.inline_array_length, NV2AState),
+            VMSTATE_UINT32_SUB_ARRAY(pgraph.inline_array, NV2AState, 0,
+                                     NV2A_MAX_BATCH_LENGTH_V2),
+            VMSTATE_UINT32_SUB_ARRAY_V(
+                pgraph.inline_array, NV2AState, NV2A_MAX_BATCH_LENGTH_V2,
+                NV2A_MAX_BATCH_LENGTH - NV2A_MAX_BATCH_LENGTH_V2, 3),
+            VMSTATE_UINT32(pgraph.inline_elements_length, NV2AState), // fixme
+            VMSTATE_UINT32_SUB_ARRAY(pgraph.inline_elements, NV2AState, 0,
+                                     NV2A_MAX_BATCH_LENGTH_V2),
+            VMSTATE_UINT32_SUB_ARRAY_V(
+                pgraph.inline_elements, NV2AState, NV2A_MAX_BATCH_LENGTH_V2,
+                NV2A_MAX_BATCH_LENGTH - NV2A_MAX_BATCH_LENGTH_V2, 3),
+            VMSTATE_UINT32(pgraph.inline_buffer_length, NV2AState), // fixme
+            VMSTATE_UINT32(pgraph.draw_arrays_length, NV2AState),
+            VMSTATE_UINT32(pgraph.draw_arrays_max_count, NV2AState),
+            VMSTATE_INT32_ARRAY(pgraph.draw_arrays_start, NV2AState, 1250),
+            VMSTATE_INT32_ARRAY(pgraph.draw_arrays_count, NV2AState, 1250),
+            VMSTATE_UINT32_ARRAY(pgraph.regs_, NV2AState, 0x2000),
+            VMSTATE_UINT32(pmc.pending_interrupts, NV2AState),
+            VMSTATE_UINT32(pmc.enabled_interrupts, NV2AState),
+            VMSTATE_UINT32(pfifo.pending_interrupts, NV2AState),
+            VMSTATE_UINT32(pfifo.enabled_interrupts, NV2AState),
+            VMSTATE_UINT32_ARRAY(pfifo.regs, NV2AState, 0x2000),
+            VMSTATE_UINT32_ARRAY(pvideo.regs, NV2AState, 0x1000),
+            VMSTATE_UINT32(ptimer.pending_interrupts, NV2AState),
+            VMSTATE_UINT32(ptimer.enabled_interrupts, NV2AState),
+            VMSTATE_UINT32(ptimer.numerator, NV2AState),
+            VMSTATE_UINT32(ptimer.denominator, NV2AState),
+            VMSTATE_UNUSED(4),
+            VMSTATE_UINT32_ARRAY(pfb.regs, NV2AState, 0x1000),
+            VMSTATE_UINT32(pcrtc.pending_interrupts, NV2AState),
+            VMSTATE_UINT32(pcrtc.enabled_interrupts, NV2AState),
+            VMSTATE_UINT64(pcrtc.start, NV2AState),
+            VMSTATE_UINT32(pramdac.core_clock_coeff, NV2AState),
+            VMSTATE_UINT64(pramdac.core_clock_freq, NV2AState),
+            VMSTATE_UINT32(pramdac.memory_clock_coeff, NV2AState),
+            VMSTATE_UINT32(pramdac.video_clock_coeff, NV2AState),
+            VMSTATE_UINT16(puserdac.write_mode_address, NV2AState),
+            VMSTATE_UINT8_ARRAY(puserdac.palette, NV2AState, 256 * 3),
+            VMSTATE_BOOL(pgraph.waiting_for_flip, NV2AState),
+            VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
+            VMSTATE_UNUSED(1),
+            VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
+            VMSTATE_UINT64_V(ptimer.alarm_time, NV2AState, 4),
+            VMSTATE_UINT64_V(ptimer.time_offset, NV2AState, 4),
+            VMSTATE_TIMER_V(ptimer.timer, NV2AState, 4),
+            VMSTATE_END_OF_LIST() },
+    .subsections =
+        (const VMStateDescription *const[]){
+            &vmstate_nv2a_metal4_reports, &vmstate_nv2a_metal4_vertices,
+            &vmstate_nv2a_metal4_vertex_capture,
+            &vmstate_nv2a_metal4_begin_capture,
+            &vmstate_nv2a_metal4_pending_capture, NULL },
 };
 
 static void nv2a_class_init(ObjectClass *klass, const void *data)

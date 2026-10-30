@@ -19,6 +19,10 @@
 #pragma once
 
 #include <SDL3/SDL.h>
+#include "texture.h"
+#ifdef XEMU_NATIVE_METAL4_UI
+#include "metal4/frontend.h"
+#endif
 #include <epoxy/gl.h>
 #include "ui/xemu-settings.h"
 

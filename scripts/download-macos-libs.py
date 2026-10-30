@@ -7,8 +7,12 @@ Downloads required libraries for xemu builds on macOS from MacPorts repositories
 from urllib.request import urlopen
 import re
 import os.path
+import posixpath
+import copy
 from tarfile import TarFile
 import subprocess
+import tempfile
+import shutil
 
 MIRROR = 'https://packages.macports.org'
 
@@ -17,18 +21,15 @@ MIRROR = 'https://packages.macports.org'
 # FIXME: Support multiple mirrors
 
 class LibInstaller:
-	DARWIN_TARGET_X64="darwin_21" # macOS 11
 	DARWIN_TARGET_ARM64="darwin_23" # macOS 14.x
 
 	def __init__(self, arch):
 		self._queue = []
 		self._installed = []
-		if arch == 'x86_64':
-			self._darwin_target = self.DARWIN_TARGET_X64
-		elif arch == 'arm64':
+		if arch == 'arm64':
 			self._darwin_target = self.DARWIN_TARGET_ARM64
 		else:
-			assert False, "Add arch"
+			raise ValueError("Metal4 dependencies require Apple Silicon (arm64)")
 		self._arch = arch
 
 		self._extract_path = os.path.realpath(f'./macos-libs/{self._arch}')
@@ -39,10 +40,18 @@ class LibInstaller:
 		if not os.path.exists(self._pkgs_path):
 			os.makedirs(self._pkgs_path)
 
-	def get_latest_pkg_filename_url(self, pkg_name):
+	def get_latest_pkg_filename_url(self, pkg_name, pkg_version=None):
 		pkg_base_url = f'{MIRROR}/{pkg_name}'
-		pkg_list = urlopen(pkg_base_url).read().decode('utf-8')
-		pkgs = re.findall(pkg_name + r'[\w\.\-\_\+]*?\.(?:any_any|darwin_any|' + self._darwin_target + r')\.(?:noarch|' + self._arch + r')\.tbz2', pkg_list)
+		version = re.escape(pkg_version) if pkg_version else r'[\w\.\-\_\+]*?'
+		pattern = re.escape(pkg_name) + '-' + version + r'\.(?:any_any|darwin_any|' + self._darwin_target + r')\.(?:noarch|' + self._arch + r')\.tbz2'
+		if pkg_version:
+			cached = [name for name in sorted(os.listdir(self._pkgs_path))
+			          if re.fullmatch(pattern, name)]
+			if cached:
+				return cached[-1], f'{pkg_base_url}/{cached[-1]}'
+		with urlopen(pkg_base_url) as response:
+			pkg_list = response.read().decode('utf-8')
+		pkgs = re.findall(pattern, pkg_list)
 		if len(pkgs) < 1:
 			print(f'    [*] [ERROR] Unable to find version of {pkg_name} compatible with {self._darwin_target}.{self._arch}')
 			exit(1)
@@ -50,12 +59,17 @@ class LibInstaller:
 		pkg_filename = pkgs[-1]
 		return pkg_filename, f'{pkg_base_url}/{pkg_filename}'
 
+	def installed_pkg_version(self, pkg_name):
+		if os.path.exists(self._installed_path):
+			with open(self._installed_path) as f:
+				for line in f:
+					name, separator, version = line.strip().partition('=')
+					if name == pkg_name and separator and version:
+						return version
+		return None
+
 	def is_pkg_installed(self, pkg_name):
-		if not os.path.exists(self._installed_path):
-			return False
-		with open(self._installed_path) as f:
-			installed = [l.strip().split('=')[0] for l in f.readlines()]
-			return pkg_name in installed
+		return self.installed_pkg_version(pkg_name) is not None
 
 	def mark_pkg_installed(self, pkg_name, pkg_version):
 		if self.is_pkg_installed(pkg_name):
@@ -64,12 +78,22 @@ class LibInstaller:
 			f.write(f'{pkg_name}={pkg_version}\n')
 
 	def download_file(self, desc, url, dst):
-		if os.path.exists(dst):
+		if os.path.exists(dst) and os.path.getsize(dst):
 			print(f'    [+] Already have {desc}')
-		else:
-			print(f'    [+] Downloading {desc}')
-			with open(dst, 'wb') as f:
-				f.write(urlopen(url).read())
+			return
+		print(f'    [+] Downloading {desc}')
+		fd, partial = tempfile.mkstemp(prefix=os.path.basename(dst) + '.',
+		                               suffix='.part', dir=os.path.dirname(dst))
+		try:
+			with os.fdopen(fd, 'wb') as f, urlopen(url) as response:
+				shutil.copyfileobj(response, f)
+				expected = getattr(response, 'headers', {}).get('Content-Length')
+				if not f.tell() or (expected is not None and f.tell() != int(expected)):
+					raise OSError(f'Incomplete download: {desc}')
+			os.replace(partial, dst)
+		finally:
+			if os.path.exists(partial):
+				os.unlink(partial)
 
 	def verify_pkg(self, pkg_path, sig_path):
 		PUBKEYURL="https://svn.macports.org/repository/macports/trunk/base/macports-pubkey.pem"
@@ -93,19 +117,42 @@ class LibInstaller:
 	def is_pkg_skipped(self, pkg_name):
 		return any(pkg_name.startswith(n) for n in ('python', 'ncurses', 'mesa', 'llvm', 'libsndfile'))
 
-	def install_pkg(self, pkg_name):
-		if self.is_pkg_installed(pkg_name):
-			print(f'[*] Package {pkg_name} already installed')
-			return
+	def extract_members(self, tb):
+		# Build dependencies need the MacPorts prefix, not system launch services.
+		members = []
+		for original in tb.getmembers():
+			member = copy.copy(original)
+			name = posixpath.normpath(member.name)
+			if name not in ('opt', 'opt/local') and not name.startswith('opt/local/'):
+				continue
+			if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+				raise ValueError(f'Unsupported archive entry: {member.name}')
+			member.name = name
+			if member.issym() or member.islnk():
+				target = member.linkname
+				if target.startswith('/opt/local/'):
+					target = target.lstrip('/')
+				elif member.issym():
+					target = posixpath.join(posixpath.dirname(name), target)
+				target = posixpath.normpath(target)
+				if not target.startswith('opt/local/'):
+					raise ValueError(f'Archive link escapes MacPorts prefix: {member.name}')
+				member.linkname = (posixpath.relpath(target, posixpath.dirname(name))
+				                   if member.issym() else target)
+			members.append(member)
+		return members
 
+	def install_pkg(self, pkg_name):
+		if pkg_name in self._installed:
+			return
 		if self.is_pkg_skipped(pkg_name):
 			print(f'[*] Skipping package {pkg_name}')
 			return
 
 		print(f'[*] Fetching {pkg_name}')
-		pkg_filename, pkg_url = self.get_latest_pkg_filename_url(pkg_name)
-		pkg_version = pkg_filename[re.search(r'-\d', pkg_filename).span()[0]+1:]
-		pkg_version = pkg_version[:pkg_version.find('.'+self._darwin_target)]
+		installed_version = self.installed_pkg_version(pkg_name)
+		pkg_filename, pkg_url = self.get_latest_pkg_filename_url(pkg_name, installed_version)
+		pkg_version = pkg_filename[len(pkg_name) + 1:].rsplit('.', 3)[0]
 		dst_pkg_filename = os.path.join(self._pkgs_path, pkg_filename)
 		print(f'    [*] Found package {pkg_filename}')
 		self.download_file(pkg_filename, pkg_url, dst_pkg_filename)
@@ -119,6 +166,13 @@ class LibInstaller:
 
 		print(f'    [+] Looking for dependencies')
 		tb = TarFile.open(dst_pkg_filename)
+		try:
+			self.install_archive(tb, pkg_name, pkg_version, installed_version is not None)
+		finally:
+			tb.close()
+		self._installed.append(pkg_name)
+
+	def install_archive(self, tb, pkg_name, pkg_version, installed):
 		pkg_contents_file = tb.extractfile('./+CONTENTS').read().decode('utf-8')
 		for dep in re.findall(r'@pkgdep (.+)', pkg_contents_file):
 			print(f'        [>] {dep}')
@@ -129,14 +183,27 @@ class LibInstaller:
 
 		print(f'    [*] Checking tarball...')
 
-		for fpath in tb.getnames():
+		members = self.extract_members(tb)
+		for member in members:
+			fpath = member.name
 			extracted_path = os.path.realpath(os.path.join(self._extract_path, fpath))
-			assert extracted_path.startswith(self._extract_path), f'tarball has a global file: {fname}'
+			assert os.path.commonpath([self._extract_path, extracted_path]) == self._extract_path, f'tarball has a global file: {fpath}'
+
+		# Installed parents must still restore their dependency closure on resume.
+		def present(member):
+			path = os.path.join(self._extract_path, member.name)
+			if member.issym():
+				return os.path.islink(path) and os.readlink(path) == member.linkname
+			return os.path.isdir(path) if member.isdir() else os.path.isfile(path)
+		if installed and all(present(member) for member in members):
+			print(f'[*] Package {pkg_name} already installed; dependencies queued')
+			return
 
 		print(f'    [*] Extracting to {self._extract_path}')
-		tb.extractall(self._extract_path, numeric_owner=True)
+		tb.extractall(self._extract_path, members=members, numeric_owner=True)
 
-		for fpath in tb.getnames():
+		for member in members:
+			fpath = member.name
 			# FIXME: Symlinks
 			extracted_path = os.path.realpath(os.path.join(self._extract_path, fpath))
 			if extracted_path.endswith('.pc'):
@@ -169,7 +236,8 @@ class LibInstaller:
 		self.mark_pkg_installed(pkg_name, pkg_version)
 
 	def install_pkgs(self, requested):
-		self._queue.extend(requested)
+		self._installed.clear()
+		self._queue = list(requested)
 		while len(self._queue) > 0:
 			pkg_name = self._queue.pop(0)
 			self.install_pkg(pkg_name)
@@ -177,7 +245,7 @@ class LibInstaller:
 def main():
 	import argparse
 	ap = argparse.ArgumentParser()
-	ap.add_argument('arch', choices=('arm64', 'x86_64'))
+	ap.add_argument('arch', choices=('arm64',))
 	args = ap.parse_args()
 	li = LibInstaller(args.arch)
 	li.install_pkgs([

@@ -24,7 +24,7 @@
 #define XEMU_HUD_H
 
 #include <SDL3/SDL.h>
-#include <epoxy/gl.h>
+#include "texture.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,7 +46,11 @@ void xemu_hud_update(void);
 void xemu_hud_render(void);
 void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
-void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
+void xemu_hud_set_framebuffer_texture(XemuTexture tex, bool flip);
+#ifdef XEMU_NATIVE_METAL4_UI
+bool xemu_hud_begin_frame(void);
+void xemu_hud_set_metal4_framebuffer(void *frame);
+#endif
 
 #ifdef __cplusplus
 }

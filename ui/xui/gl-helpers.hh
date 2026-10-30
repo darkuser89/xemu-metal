@@ -21,6 +21,10 @@
 #include "common.hh"
 #include "../xemu-input.h"
 
+#ifdef XEMU_NATIVE_METAL4_UI
+#include "metal4/rendering.hh"
+#endif
+
 class Fbo
 {
 public:
@@ -30,18 +34,31 @@ public:
 
     int w, h;
     GLuint fbo, tex;
+#ifdef XEMU_NATIVE_METAL4_UI
+    XemuMetal4UI::Fbo *native = nullptr;
+    bool owns_native = true;
+    explicit Fbo(XemuMetal4UI::Fbo *target);
+#endif
 
     Fbo(int width, int height);
     ~Fbo();
-    inline GLuint Texture() { return tex; }
+    inline XemuTexture Texture()
+    {
+#ifdef XEMU_NATIVE_METAL4_UI
+        if (native)
+            return native->Texture();
+#endif
+        return tex;
+    }
     void Target();
     void Restore();
 };
 
 extern Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
-extern GLuint g_icon_tex;
+extern XemuTexture g_icon_tex;
 
 void InitCustomRendering(void);
+void CleanupCustomRendering(void);
 void RenderLogo(uint32_t time);
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state);
@@ -49,8 +66,11 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color);
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color);
-void RenderFramebuffer(GLint tex, int width, int height, bool flip);
-void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2]);
-bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width = 0, int max_height = 0);
-void SaveScreenshot(GLuint tex, bool flip);
+void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip);
+void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip,
+                       float scale[2]);
+bool RenderFramebufferToPng(XemuTexture tex, bool flip,
+                            std::vector<uint8_t> &png, int max_width = 0,
+                            int max_height = 0);
+void SaveScreenshot(XemuTexture tex, bool flip);
 void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height);

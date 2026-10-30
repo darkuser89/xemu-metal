@@ -316,6 +316,10 @@
 #       define NV_PGRAPH_CSV0_D_SKIN_4G                             5
 #       define NV_PGRAPH_CSV0_D_SKIN_4                              6
 #define NV_PGRAPH_CSV0_C                                 0x00000FB8
+#   define NV_PGRAPH_CSV0_C_BACK_SPECULAR                       (3 << 0)
+#   define NV_PGRAPH_CSV0_C_BACK_DIFFUSE                        (3 << 2)
+#   define NV_PGRAPH_CSV0_C_BACK_AMBIENT                        (3 << 4)
+#   define NV_PGRAPH_CSV0_C_BACK_EMISSION                       (3 << 6)
 #   define NV_PGRAPH_CSV0_C_CHEOPS_PROGRAM_START                0x0000FF00
 #   define NV_PGRAPH_CSV0_C_SPECULAR_ENABLE                     (1 << 16)
 #   define NV_PGRAPH_CSV0_C_ALPHA_FROM_MATERIAL_SPECULAR        (1 << 17)
@@ -325,6 +329,7 @@
 #   define NV_PGRAPH_CSV0_C_AMBIENT                             (3 << 23)
 #   define NV_PGRAPH_CSV0_C_EMISSION                            (3 << 25)
 #   define NV_PGRAPH_CSV0_C_NORMALIZATION_ENABLE                (1 << 27)
+#   define NV_PGRAPH_CSV0_C_TWO_SIDE                            (1 << 29)
 #   define NV_PGRAPH_CSV0_C_LOCALEYE                            (1 << 30)
 #   define NV_PGRAPH_CSV0_C_LIGHTING                            (1 << 31)
 #define NV_PGRAPH_CSV1_B                                 0x00000FBC
@@ -514,6 +519,7 @@
 #       define NV_PGRAPH_SETUPRASTER_CULLCTRL_BACK                  2
 #       define NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK        3
 #   define NV_PGRAPH_SETUPRASTER_FRONTFACE                      (1 << 23)
+#   define NV_PGRAPH_SETUPRASTER_TWO_SIDE                       (1 << 24)
 #   define NV_PGRAPH_SETUPRASTER_CULLENABLE                     (1 << 28)
 #   define NV_PGRAPH_SETUPRASTER_Z_FORMAT                       (1 << 29)
 #   define NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE                 (1 << 31)
@@ -1145,8 +1151,12 @@
 #           define NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP        6
 #       define NV097_SET_VERTEX_DATA_ARRAY_FORMAT_SIZE            0x000000F0
 #       define NV097_SET_VERTEX_DATA_ARRAY_FORMAT_STRIDE          0xFFFFFF00
+#   define NV097_SET_BACK_SCENE_AMBIENT_COLOR                 0x000017A0
+#   define NV097_SET_BACK_MATERIAL_ALPHA                      0x000017AC
+#   define NV097_SET_BACK_MATERIAL_EMISSION                   0x000017B0
 #   define NV097_SET_LOGIC_OP_ENABLE                          0x000017BC
 #   define NV097_SET_LOGIC_OP                                 0x000017C0
+#   define NV097_SET_LIGHT_TWO_SIDE_ENABLE                    0x000017C4
 #   define NV097_CLEAR_REPORT_VALUE                           0x000017C8
 #       define NV097_CLEAR_REPORT_VALUE_TYPE                      0xFFFFFFFF
 #           define NV097_CLEAR_REPORT_VALUE_TYPE_ZPASS_PIXEL_CNT      1
@@ -1225,7 +1235,10 @@
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FLOAT 0x2F
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED 0x30
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT 0x31
+#           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y16            0x32
+#           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_YB_16_YA_16     0x33
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y16      0x35
+#           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_YB16YA16  0x36
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8       0x3A
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8       0x3B
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8       0x3C
