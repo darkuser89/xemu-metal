@@ -82,6 +82,8 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
 }
 @implementation NV2AMetalBlit {
     id<MTLDevice> _device;
+    id<MTL4Compiler> _compiler;
+    id<MTLLibrary> _library;
     id<MTLComputePipelineState> _parallel, _serial, _alpha;
     id<MTL4ArgumentTable> _arguments;
 }
@@ -97,42 +99,39 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
         return nil;
     }
     _device = device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!compiler || !library)
-        return nil;
-    for (unsigned i = 0; i < 3; i++) {
-        MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-        fn.library = library;
-        fn.name = i == 0 ? @"nv2a_blit_parallel" :
-                  i == 1 ? @"nv2a_blit_serial" :
-                           @"nv2a_blit_alpha";
-        MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-        pd.computeFunctionDescriptor = fn;
-        id<MTLComputePipelineState> pipeline =
-            [compiler newComputePipelineStateWithDescriptor:pd
-                                        compilerTaskOptions:nil
-                                                      error:error];
-        if (!pipeline)
-            return nil;
-        if (i == 0)
-            _parallel = pipeline;
-        else if (i == 1)
-            _serial = pipeline;
-        else
-            _alpha = pipeline;
-    }
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
     ad.maxBufferBindCount = 3;
     ad.initializeBindings = YES;
     _arguments = [device newArgumentTableWithDescriptor:ad error:error];
     return _arguments ? self : nil;
+}
+- (id<MTLComputePipelineState>)pipelineForFunction:(NSString *)name
+                                             error:(NSError **)error
+{
+    if (!_library) {
+        id<MTL4Compiler> compiler =
+            [_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                         error:error];
+        if (!compiler)
+            return nil;
+        MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
+        ld.source = @(metal_shader_source);
+        ld.options = [MTLCompileOptions new];
+        ld.options.languageVersion = MTLLanguageVersion4_0;
+        id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
+        if (!library)
+            return nil;
+        _compiler = compiler;
+        _library = library;
+    }
+    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
+    fn.library = _library;
+    fn.name = name;
+    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
+    pd.computeFunctionDescriptor = fn;
+    return [_compiler newComputePipelineStateWithDescriptor:pd
+                                         compilerTaskOptions:nil
+                                                       error:error];
 }
 - (BOOL)encodeSource:(id<MTLBuffer>)source
          destination:(id<MTLBuffer>)dest
@@ -209,6 +208,25 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
     uint64_t blend_row = (uint64_t)c->row_bytes / l.bytes_per_pixel * 4;
     BOOL serial = alias || (c->operation == NV09F_SET_OPERATION_BLEND_AND &&
                             c->rows > 1 && blend_row > c->destination_pitch);
+    id<MTLComputePipelineState> pipeline = serial ? _serial : _parallel;
+    if (!pipeline) {
+        pipeline = [self pipelineForFunction:serial ? @"nv2a_blit_serial" :
+                                                      @"nv2a_blit_parallel"
+                                       error:error];
+        if (!pipeline)
+            return NO;
+        if (serial)
+            _serial = pipeline;
+        else
+            _parallel = pipeline;
+    }
+    unsigned rowBytes = MAX(c->rows ? c->row_bytes : 0, c->tail_bytes);
+    BOOL patchAlpha = l.patch_alpha && rowBytes >= 4;
+    if (patchAlpha && !_alpha) {
+        _alpha = [self pipelineForFunction:@"nv2a_blit_alpha" error:error];
+        if (!_alpha)
+            return NO;
+    }
     NV2AMetalBlitUniforms u = { sa,
                                 da,
                                 read_offset,
@@ -247,32 +265,26 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
                   beforeStages:MTLStageAll
              visibilityOptions:MTL4VisibilityOptionDevice];
     [e setArgumentTable:_arguments];
-    [e setComputePipelineState:serial ? _serial : _parallel];
-    unsigned count = MAX(c->rows ? c->row_bytes : 0, c->tail_bytes);
+    [e setComputePipelineState:pipeline];
+    unsigned count = rowBytes;
     if (c->operation == NV09F_SET_OPERATION_BLEND_AND)
         count = count / l.bytes_per_pixel * 3;
     NSUInteger rows = (NSUInteger)c->rows + (c->tail_bytes != 0);
     if (serial) {
+        NSUInteger width = MIN(128u, pipeline.maxTotalThreadsPerThreadgroup);
         [e dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(
-                                      MIN(128u,
-                                          _serial
-                                              .maxTotalThreadsPerThreadgroup),
-                                      1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
     } else if (count) {
         [e dispatchThreads:MTLSizeMake(count, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(_parallel.threadExecutionWidth, 1,
+            threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1,
                                               1)];
     }
-    if (l.patch_alpha && MAX(c->rows ? c->row_bytes : 0, c->tail_bytes) / 4) {
+    if (patchAlpha) {
         [e barrierAfterEncoderStages:MTLStageDispatch
                  beforeEncoderStages:MTLStageDispatch
                    visibilityOptions:MTL4VisibilityOptionDevice];
         [e setComputePipelineState:_alpha];
-        [e dispatchThreads:MTLSizeMake(
-                               MAX(c->rows ? c->row_bytes : 0, c->tail_bytes) /
-                                   4,
-                               rows, 1)
+        [e dispatchThreads:MTLSizeMake(rowBytes / 4, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(_alpha.threadExecutionWidth, 1,
                                               1)];
     }

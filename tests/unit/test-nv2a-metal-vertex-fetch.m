@@ -330,6 +330,217 @@ static void kelvin_normalization(NV2AMetalVertexFetch *fetch,
 }
 
 
+/* Range prerequisites for a future attribute-dependent readonly proof.
+ * Check the existing decoder, not Xbox hardware parity or queue admission. */
+static void attribute_bounds_tests(NV2AMetalVertexFetch *fetch,
+                                   NV2AMetalCommands *commands)
+{
+    enum { Shorts = 65536, Packed = 2048 };
+    unsigned char *shorts = calloc(1 + Shorts * 9, 1);
+    unsigned char *indices = calloc(1 + Shorts * 2, 1);
+    assert(shorts && indices);
+    for (unsigned v = 0; v < Shorts; v++) {
+        for (unsigned k = 0; k < 4; k++)
+            put16(shorts + 1 + v * 9 + k * 2, (v + 113 * k) & 65535);
+        put16(indices + 1 + v * 2, Shorts - 1 - v);
+    }
+    id<MTLBuffer> raw = buffer(commands, shorts, 1 + Shorts * 9),
+                  index = buffer(commands, indices, 1 + Shorts * 2);
+    unsigned lanes = 0;
+    float normalizedLow = 1, normalizedHigh = -1;
+    for (unsigned path = 0; path < 2; path++) {
+        @autoreleasepool {
+            NV2AMetalAttributeSource sources[16], before[16];
+            defaults(sources);
+            for (unsigned a = 0; a < 16; a++) {
+                sources[a].buffer = raw;
+                sources[a].offset = 1;
+                sources[a].byteLength = Shorts * 9 - 1;
+                sources[a].stride = 9;
+                sources[a].count = a % 4 + 1;
+                sources[a].format =
+                    a < 8 ? NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1 :
+                            NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K;
+            }
+            memcpy(before, sources, sizeof(before));
+            unsigned prefix = path ? 127 : 0;
+            begin(commands);
+            NSError *error = nil;
+            NV2AMetalFetchResult *result =
+                [fetch encodeSources:sources
+                               count:Shorts
+                         firstVertex:0
+                             indices:path ? index : nil
+                         indexOffset:path ? 1 : 0
+                           indexSize:path ? 2 : 0
+                       currentVertex:NSNotFound
+                      skippingPrefix:prefix
+                            commands:commands
+                               error:&error];
+            require(result != nil, error);
+            /* Descriptors are CPU input, not persistent proof of the GPU's
+             * format. Its immutable encoded snapshot must survive changes. */
+            memset(sources, 0xcc, sizeof(sources));
+            finish(commands);
+            const NV2AMetalProgramInput *out = values(result);
+            assert(result.vertexCount == Shorts - prefix);
+            for (unsigned v = 0; v < result.vertexCount; v++) {
+                unsigned at = path ? Shorts - 1 - (v + prefix) : v;
+                for (unsigned a = 0; a < 16; a++)
+                    for (unsigned k = 0; k < 4; k++) {
+                        float value = out[v].attributes[a][k];
+                        if (k >= before[a].count)
+                            check_bits(value, k == 3 ? 0x3f800000u : 0);
+                        else if (a < 8) {
+                            assert(isfinite(value) && value >= -1 &&
+                                   value <= 1);
+                            normalizedLow = fminf(normalizedLow, value);
+                            normalizedHigh = fmaxf(normalizedHigh, value);
+                        } else {
+                            unsigned bits = (at + 113 * k) & 65535;
+                            int expected =
+                                bits < 32768 ? (int)bits : (int)bits - 65536;
+                            assert(value == expected);
+                        }
+                        lanes++;
+                    }
+            }
+        }
+    }
+    assert(normalizedLow == -1 && normalizedHigh == 1);
+    assert(!memcmp(raw.contents, shorts, 1 + Shorts * 9));
+    assert(!memcmp(index.contents, indices, 1 + Shorts * 2));
+    free(shorts);
+    free(indices);
+
+    unsigned char bytes[1 + Packed * 7] = { 0 }, packed[1 + Packed * 5] = { 0 };
+    uint32_t floatBits[Packed * 4];
+    const uint32_t controls[] = { 0xff7fffffu, 0x7f7fffffu, 0xff800000u,
+                                  0x7f800000u, 0x7fc12345u, 0xc0000000u,
+                                  0x40000000u, 0x3f000000u };
+    for (unsigned v = 0; v < Packed; v++) {
+        for (unsigned k = 0; k < 4; k++) {
+            bytes[1 + v * 7 + k] = (v * 53 + k * 37) & 255;
+            floatBits[v * 4 + k] = controls[(v + k) % 8];
+        }
+        put32(packed + 1 + v * 5, v | (((v * 103 + 911) & 2047) << 11) |
+                                      (((v * 37 + 3) & 1023) << 22));
+    }
+    const unsigned char minimum[] = { 0, 4, 32, 128 };
+    NV2AMetalAttributeSource sources[16];
+    defaults(sources);
+    raw = buffer(commands, bytes, sizeof(bytes));
+    for (unsigned a = 0; a < 5; a++) {
+        sources[a].buffer = raw;
+        sources[a].offset = 1;
+        sources[a].stride = 7;
+        sources[a].count = a == 4 ? 4 : a + 1;
+        sources[a].format = a == 4 ?
+                                NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D :
+                                NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL;
+    }
+    id<MTLBuffer> packedBuffer = buffer(commands, packed, sizeof(packed)),
+                  minimumBuffer = buffer(commands, minimum, sizeof(minimum)),
+                  floatBuffer = buffer(commands, floatBits, sizeof(floatBits));
+    NSArray *owners = @[ raw, packedBuffer, minimumBuffer, floatBuffer ];
+    sources[5] = (NV2AMetalAttributeSource){
+        .buffer = packedBuffer,
+        .offset = 1,
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP,
+        .count = 1,
+        .stride = 5,
+    };
+    sources[6] = (NV2AMetalAttributeSource){
+        .buffer = minimumBuffer,
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP,
+        .count = 1,
+    };
+    sources[7] = sources[4];
+    sources[7].stride = 0;
+    sources[8] = (NV2AMetalAttributeSource){
+        .buffer = floatBuffer,
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .count = 4,
+        .stride = 16,
+    };
+    /* A disabled normalized-format descriptor still means raw inline Float4,
+     * including unbounded/nonfinite values; its format cannot prove a range. */
+    sources[11].format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL;
+    memcpy(sources[11].inline_value, controls, 4 * sizeof(float));
+    NV2AMetalFetchResult *result = run(fetch, commands, sources, Packed, 0);
+    const NV2AMetalProgramInput *out = values(result);
+    BOOL belowMinusOne[3] = { NO };
+    for (unsigned v = 0; v < Packed; v++) {
+        for (unsigned a = 0; a < 8; a++)
+            for (unsigned k = 0; k < 4; k++) {
+                float value = out[v].attributes[a][k];
+                if (a == 5 || a == 6) {
+                    assert(isfinite(value) && value >= (a == 5 ? -2 : -1) &&
+                           value <= 1);
+                    if (k == 3)
+                        check_bits(value, 0x3f800000u);
+                    else if (a == 6)
+                        assert(value == -1);
+                    else
+                        belowMinusOne[k] |= value < -1;
+                } else if (k >= sources[a].count) {
+                    check_bits(value, k == 3 ? 0x3f800000u : 0);
+                } else {
+                    unsigned component = a == 4 && k < 3 ? 2 - k : k;
+                    unsigned vertex = a == 7 ? 0 : v;
+                    unsigned code = (vertex * 53 + component * 37) & 255;
+                    assert(isfinite(value) && value >= 0 && value <= 1);
+                    check_bits(value, kelvin_ubyte[code]);
+                }
+                lanes++;
+            }
+        for (unsigned k = 0; k < 4; k++) {
+            uint32_t bits = controls[(v + k) % 8];
+            float value = out[v].attributes[8][k];
+            if ((bits & 0x7fffffffu) > 0x7f800000u)
+                assert(isnan(value));
+            else
+                check_bits(value, bits);
+            check_bits(out[v].attributes[11][k], controls[k]);
+            lanes += 2;
+        }
+    }
+    assert(belowMinusOne[0] && belowMinusOne[1] && belowMinusOne[2]);
+    /* An overflowing index skips conversion entirely. Even an enabled
+     * normalized format then returns its raw inline Float4, not [0,1] or
+     * [-1,1]. Format metadata alone cannot certify these records. */
+    for (unsigned a = 0; a < 16; a++)
+        for (unsigned k = 0; k < 4; k++)
+            sources[a].inline_value[k] = 1024 + 64 * a + k;
+    memcpy(&sources[1].inline_value[0], &controls[4], sizeof(float));
+    const uint32_t overflow = UINT32_MAX;
+    id<MTLBuffer> overflowIndex = buffer(commands, &overflow, sizeof(overflow));
+    begin(commands);
+    result = encode(fetch, commands, sources, 1, 1, overflowIndex, 0, 4);
+    finish(commands);
+    assert(result.vertexCount == 1 && !result.hasCurrent);
+    assert(((const uint32_t *)result.faults.contents)[0] == UINT32_MAX);
+    assert(*(const uint32_t *)((const char *)result.faults.contents +
+                               result.faultSummaryOffset) == UINT32_MAX);
+    out = result.attributes.contents;
+    for (unsigned a = 0; a < 16; a++)
+        for (unsigned k = 0; k < 4; k++) {
+            if (a == 1 && k == 0)
+                assert(isnan(out[0].attributes[a][k]));
+            else
+                assert(out[0].attributes[a][k] == sources[a].inline_value[k]);
+            lanes++;
+        }
+    assert(owners.count == 4);
+    printf("Metal4 input bounds: all65536 short codes,all2048/1024 CMP lane "
+           "codes,all256 byte codes;%u lanes;S1[-1,1],raw S32K,"
+           "CMP array<-1 versus Current-clamped,stride-zero D3D,"
+           "missing defaults,unbounded Float/inline controls,"
+           "indexed suffix,overflow raw-inline fallback and immutable "
+           "descriptor snapshot PASS\n",
+           lanes);
+}
+
 /* Compare the fused Current record with the independent stride-zero API.
  * Raw bytes include asymmetric D3D colors and CMP negative endpoints. */
 static void fused_current_tests(NV2AMetalVertexFetch *fetch,
@@ -391,6 +602,23 @@ static void fused_current_tests(NV2AMetalVertexFetch *fetch,
                            5 * sizeof(NV2AMetalProgramInput));
                     assert(fused.faultSummaryOffset == 5 * sizeof(uint32_t));
                     assert(fused.faults.length == 6 * sizeof(uint32_t));
+                    unsigned indexSize = mode == 0 ? 0 : mode == 1 ? 2 : 4;
+                    NV2AMetalFetchResult *array =
+                        encode(fetch, commands, sources, 4, mode ? 0 : 1,
+                               indexBuffers[mode], 0, indexSize);
+                    NV2AMetalFetchResult *currentOnly =
+                        [fetch encodeSources:sources
+                                       count:4
+                                 firstVertex:mode ? 0 : 1
+                                     indices:indexBuffers[mode]
+                                 indexOffset:0
+                                   indexSize:indexSize
+                               currentVertex:ordinal
+                              skippingPrefix:4
+                                    commands:commands
+                                       error:&error];
+                    require(currentOnly != nil, error);
+                    assert(!currentOnly.vertexCount && currentOnly.hasCurrent);
                     sources[3].offset += vertex * sources[3].stride;
                     sources[3].byteLength -= vertex * sources[3].stride;
                     sources[3].stride = 0;
@@ -401,7 +629,10 @@ static void fused_current_tests(NV2AMetalVertexFetch *fetch,
                     require([commands waitUntilIdleWithError:&error], error);
                     const NV2AMetalProgramInput *out =
                         fused.attributes.contents;
+                    assert(!memcmp(out, array.attributes.contents, 4 * sizeof(*out)));
                     assert(!memcmp(out + 4, reference.attributes.contents,
+                                   sizeof(*out)));
+                    assert(!memcmp(out + 4, currentOnly.attributes.contents,
                                    sizeof(*out)));
                     for (unsigned i = 0; i < 5; i++)
                         assert(!((uint32_t *)fused.faults.contents)[i]);
@@ -466,6 +697,8 @@ static void fused_current_tests(NV2AMetalVertexFetch *fetch,
     printf("Metal4 fused Current: %u exact 256-byte comparisons, 2 GPU faults, "
            "2 invalid ordinals PASS\n",
            cases);
+    puts("Fetch shared attribute decode: fused vertex and Current match "
+         "separate array, stride-zero and Current-only dispatches PASS");
 }
 
 static uint32_t expected_fetch_fault(uint32_t index, unsigned first)
@@ -486,6 +719,9 @@ static void fault_summary_tests(NV2AMetalVertexFetch *fetch,
     NSError *error = nil;
     uint8_t bytes[49] = { 0 };
     id<MTLBuffer> source = buffer(commands, bytes, sizeof(bytes));
+    NV2AMetalVertexFetch *summaryFetch = [[NV2AMetalVertexFetch alloc]
+        initWithDevice:commands.device faultSummaryOnly:YES error:&error];
+    require(summaryFetch != nil, error);
     for (unsigned l = 0; l < sizeof(lengths) / sizeof(*lengths); l++) {
         unsigned count = lengths[l];
         for (unsigned mode = 0; mode < 6; mode++) {
@@ -538,6 +774,18 @@ static void fault_summary_tests(NV2AMetalVertexFetch *fetch,
                            (count + current) * sizeof(uint32_t));
                     assert(result.faults.length ==
                            result.faultSummaryOffset + sizeof(uint32_t));
+                    NV2AMetalFetchResult *summary =
+                        [summaryFetch encodeSources:sources
+                                              count:count
+                                        firstVertex:first
+                                            indices:index
+                                        indexOffset:0
+                                          indexSize:4
+                                      currentVertex:current ? count / 2 : NSNotFound
+                                           commands:commands
+                                              error:&error];
+                    require(summary != nil, error);
+                    assert(!summary.faultSummaryOffset && summary.faults.length == 4);
                     require([commands submitWithError:&error], error);
                     require([commands waitUntilIdleWithError:&error], error);
                     const uint32_t *fault = result.faults.contents;
@@ -548,6 +796,10 @@ static void fault_summary_tests(NV2AMetalVertexFetch *fetch,
                         assert(fault[count] ==
                                expected_fetch_fault(indices[count / 2], first));
                     assert(fault[count + current] == expected);
+                    assert(*(const uint32_t *)summary.faults.contents == expected &&
+                           summary.attributes.length == result.attributes.length &&
+                           !memcmp(summary.attributes.contents, result.attributes.contents,
+                                   result.attributes.length));
                     free(indices);
                     words += count;
                     cases++;
@@ -603,6 +855,27 @@ static void fault_summary_tests(NV2AMetalVertexFetch *fetch,
             cases++;
         }
     }
+    NV2AMetalAttributeSource currentSources[16];
+    defaults(currentSources);
+    currentSources[0] = (NV2AMetalAttributeSource){
+        .buffer = source, .offset = 1, .byteLength = 16,
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .count = 4, .stride = 16,
+    };
+    const uint32_t currentIndices[] = { 3, 0 };
+    id<MTLBuffer> index = buffer(commands, currentIndices, sizeof(currentIndices));
+    begin(commands);
+    NV2AMetalFetchResult *currentOnly =
+        [summaryFetch encodeSources:currentSources count:2 firstVertex:0
+                            indices:index indexOffset:0 indexSize:4 currentVertex:0
+                     skippingPrefix:2 commands:commands error:&error];
+    require(currentOnly != nil, error);
+    finish(commands);
+    assert(!currentOnly.vertexCount && currentOnly.hasCurrent &&
+           !currentOnly.faultSummaryOffset && currentOnly.faults.length == 4 &&
+           *(const uint32_t *)currentOnly.faults.contents == 1);
+    puts("Fetch summary-only: four bytes per batch, exact vertex outputs "
+         "and faults including a skipped-prefix Current-only fault PASS");
     printf("Metal4 fetch fault summary: %u cases, %llu exact vertex words; "
            "empty/sparse/dense masks, overflow, unaligned DMA, Current and "
            "same-recording isolation PASS\n",
@@ -610,11 +883,60 @@ static void fault_summary_tests(NV2AMetalVertexFetch *fetch,
 }
 
 #include "test-metal-fetch-suffix.h"
+static void lazy_fetch_pipeline_test(NV2AMetalVertexFetch *fetch,
+                                     NV2AMetalCommands *commands)
+{
+    NSError *error = nil;
+    NV2AMetalAttributeSource sources[16];
+    defaults(sources);
+    begin(commands);
+    assert(![fetch encodeSources:sources count:1 firstVertex:0 indices:nil
+                     indexOffset:0 indexSize:0 currentVertex:NSNotFound
+                  skippingPrefix:2 commands:commands error:&error] && error);
+    error = nil;
+    NV2AMetalFetchResult *empty =
+        encode(fetch, commands, sources, 0, 0, nil, 0, 0);
+    NV2AMetalFetchResult *accepted =
+        [fetch encodeSources:sources count:2 firstVertex:0 indices:nil
+                 indexOffset:0 indexSize:0 currentVertex:NSNotFound
+              skippingPrefix:2 commands:commands error:&error];
+    require(accepted != nil, error);
+    assert(!empty.vertexCount && !empty.attributes && !accepted.vertexCount &&
+           !accepted.attributes && ![fetch valueForKey:@"module"]);
+    NV2AMetalFetchResult *current =
+        [fetch encodeSources:sources count:2 firstVertex:0 indices:nil
+                 indexOffset:0 indexSize:0 currentVertex:1
+              skippingPrefix:2 commands:commands error:&error];
+    require(current != nil, error);
+    assert(current.hasCurrent && !current.vertexCount);
+    finish(commands);
+    assert(!*(const uint32_t *)current.faults.contents &&
+           !memcmp(values(current)[0].attributes[0], sources[0].inline_value,
+                   sizeof(sources[0].inline_value)));
+
+    NV2AMetalVertexFetch *other =
+        [[NV2AMetalVertexFetch alloc] initWithDevice:commands.device error:&error];
+    require(other != nil, error);
+    id module = [fetch valueForKey:@"module"];
+    NV2AMetalFetchResult *decoded = run(other, commands, sources, 1, 0);
+    assert(module && [other valueForKey:@"module"] == module &&
+           [other valueForKey:@"pipeline"] == [fetch valueForKey:@"pipeline"] &&
+           [other valueForKey:@"arguments"] != [fetch valueForKey:@"arguments"] &&
+           [[module valueForKey:@"computeBuildCount"] unsignedIntegerValue] == 1);
+    assert(!memcmp(values(decoded)[0].attributes[0], sources[0].inline_value,
+                   sizeof(sources[0].inline_value)));
+    puts("Fetch shader startup: empty and accepted prefixes compile nothing; "
+         "first Current-only decode builds one shared pipeline PASS");
+}
+
+#include "test-metal-fetch-uniform-cache.h"
+
 int main(int argc, char **argv)
 {
     bool summaryOnly = argc == 2 && !strcmp(argv[1], "--fault-summary");
     bool suffixOnly = argc == 2 && !strcmp(argv[1], "--suffix");
-    assert(argc == 1 || summaryOnly || suffixOnly);
+    bool uniformOnly = argc == 2 && !strcmp(argv[1], "--fetch-uniform-cache");
+    assert(argc == 1 || summaryOnly || suffixOnly || uniformOnly);
     @autoreleasepool {
         NSError *error = nil;
         NV2AMetalCommands *commands =
@@ -624,6 +946,11 @@ int main(int argc, char **argv)
             [[NV2AMetalVertexFetch alloc] initWithDevice:commands.device
                                                    error:&error];
         require(fetch != nil, error);
+        lazy_fetch_pipeline_test(fetch, commands);
+        if (uniformOnly) {
+            fetch_uniform_cache_tests(commands.device);
+            return 0;
+        }
         if (suffixOnly) {
             fetch_suffix_tests(fetch, commands);
             return 0;
@@ -631,9 +958,11 @@ int main(int argc, char **argv)
         fault_summary_tests(fetch, commands);
         if (summaryOnly)
             return 0;
+        fetch_uniform_cache_tests(commands.device);
         fused_current_tests(fetch, commands);
         fetch_suffix_tests(fetch, commands);
         kelvin_normalization(fetch, commands);
+        attribute_bounds_tests(fetch, commands);
         NV2AMetalAttributeSource sources[16];
         defaults(sources);
 

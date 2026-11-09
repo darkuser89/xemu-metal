@@ -7,6 +7,8 @@
 #import "hw/xbox/nv2a/pgraph/metal/pixel-shader.h"
 #import "hw/xbox/nv2a/pgraph/metal/texture-sampler.h"
 #import "hw/xbox/nv2a/pgraph/metal/texture-snapshot.h"
+#import "hw/xbox/nv2a/pgraph/metal/shader-library.h"
+#import <objc/runtime.h>
 #include "hw/xbox/nv2a/pgraph/metal/geometry-types.h"
 #include "test-metal-texture-readback.h"
 #include <assert.h>
@@ -22,18 +24,35 @@ static unsigned int uploads;
 @interface TextureUploadTestCommands : NV2AMetalCommands
 @property(nonatomic) BOOL measureScratch;
 @property(nonatomic) NSUInteger scratchBytes;
+@property(nonatomic, weak) id<MTLBuffer> lastTransferScratch;
 @end
-@implementation TextureUploadTestCommands
+@implementation TextureUploadTestCommands {
+    BOOL _registeringTransferScratch;
+}
 - (BOOL)addResource:(id<MTLResource>)resource error:(NSError **)error
 {
     if (![super addResource:resource error:error]) {
         return NO;
     }
-    if (_measureScratch && resource.storageMode == MTLStorageModePrivate &&
+    if (_measureScratch && !_registeringTransferScratch &&
+        resource.storageMode == MTLStorageModePrivate &&
         [resource conformsToProtocol:@protocol(MTLBuffer)]) {
         _scratchBytes += ((id<MTLBuffer>)resource).length;
     }
     return YES;
+}
+- (id<MTLBuffer>)orderedTransferScratchWithLength:(NSUInteger)length
+                                            error:(NSError **)error
+{
+    _registeringTransferScratch = YES;
+    id<MTLBuffer> scratch = [super orderedTransferScratchWithLength:length
+                                                              error:error];
+    _registeringTransferScratch = NO;
+    if (_measureScratch && scratch) {
+        _scratchBytes += length;
+        _lastTransferScratch = scratch;
+    }
+    return scratch;
 }
 @end
 
@@ -389,7 +408,8 @@ static void compact_byte_tests(void)
         colors[i][2] = i * 71;
         colors[i][3] = i * 29 + 7;
     }
-    unsigned channels = 0;
+    TextureUploadTestCommands *measured = (TextureUploadTestCommands *)commands;
+    unsigned channels = 0, narrowDirect = 0, narrowDecode = 0;
     for (unsigned f = 0; f < sizeof(cases) / sizeof(*cases); f++) {
         NV2AMetalTextureShape s = shape(cases[f].format);
         s.width = s.height = 16;
@@ -408,24 +428,47 @@ static void compact_byte_tests(void)
         }
         NSError *error = nil;
         require([commands beginWithError:&error] != nil, error);
-        NV2AMetalTextureUploadResult *r = upload(s,
-            buffer(source, 256 * cases[f].bytes), 0,
-            cases[f].indexed ? buffer(colors, sizeof(colors)) : nil,
-            cases[f].indexed ? sizeof(colors) : 0);
-        assert(r.texture.pixelFormat == MTLPixelFormatRGBA8Unorm);
+        id<MTLBuffer> input = buffer(source, 256 * cases[f].bytes);
+        measured.scratchBytes = 0;
+        measured.measureScratch = YES;
+        NV2AMetalTextureUploadResult *r =
+            upload(s, input, 0,
+                   cases[f].indexed ? buffer(colors, sizeof(colors)) : nil,
+                   cases[f].indexed ? sizeof(colors) : 0);
+        measured.measureScratch = NO;
+        if (cases[f].bytes < 4 && !cases[f].indexed) {
+            assert(measured.scratchBytes == (cases[f].linear ? 0 : 4096));
+            narrowDirect += cases[f].linear;
+            narrowDecode += !cases[f].linear;
+        }
+        unsigned texelBytes = cases[f].indexed ? 4 : cases[f].bytes;
+        BOOL bgra =
+            cases[f].linear &&
+            (s.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
+             s.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8);
+        MTLPixelFormat expectedFormat =
+            texelBytes == 1 ? MTLPixelFormatR8Unorm :
+            texelBytes == 2 ? MTLPixelFormatRG8Unorm :
+            bgra            ? MTLPixelFormatBGRA8Unorm :
+                              MTLPixelFormatRGBA8Unorm;
+        assert(r.texture.pixelFormat == expectedFormat);
         id<MTLBuffer> out = read_texture(r.texture, 0, 0);
         finish();
         assert(*(uint32_t *)r.faults.contents == 0);
-        NSData *snapshot = nv2a_metal_texture_snapshot(r.texture, commands, &error);
+        NSData *snapshot =
+            nv2a_metal_texture_snapshot(r.texture, commands, &error);
         require(snapshot != nil, error);
-        assert(snapshot.length == 40 + 256 * 4);
+        assert(snapshot.length == 40 + 256 * texelBytes);
         const uint8_t *raw = (const uint8_t *)snapshot.bytes + 40;
         for (unsigned i = 0; i < 256; i++) {
             const float *p = pixel(out, 16, 16, i % 16, i / 16, 0);
+            if (texelBytes < 4)
+                assert(!memcmp(raw + i * texelBytes, colors[i], texelBytes));
             for (unsigned k = 0; k < 4; k++) {
                 int input = cases[f].channels[k];
                 uint8_t expected = input < 0 ? 255 : colors[i][input];
-                assert(raw[i * 4 + k] == expected);
+                if (texelBytes == 4)
+                    assert(raw[i * 4 + k] == (bgra ? colors[i][k] : expected));
                 assert(p[k] == expected / 255.0f);
                 channels++;
             }
@@ -433,13 +476,66 @@ static void compact_byte_tests(void)
         id<MTLTexture> restored =
             nv2a_metal_texture_restore(snapshot, commands, &error);
         require(restored != nil, error);
-        assert(restored.pixelFormat == MTLPixelFormatRGBA8Unorm);
+        assert(restored.pixelFormat == expectedFormat);
         NSData *again = nv2a_metal_texture_snapshot(restored, commands, &error);
         require(again != nil, error);
         assert([snapshot isEqualToData:again]);
     }
     printf("Metal4 compact upload: 22 byte formats, %u exact channels and "
-           "snapshot bytes, 22 compact restore/resave cycles PASS\n", channels);
+           "snapshot bytes, 22 compact restore/resave cycles, "
+           "%u narrow direct copies/%u narrow Morton decodes PASS\n",
+           channels, narrowDirect, narrowDecode);
+}
+
+/* Non-copyable layouts still unpack into the same narrow texture. */
+static void compact_byte_linear_fallback_tests(void)
+{
+    const struct {
+        unsigned format, bytes, offset, pitch;
+    } cases[] = {
+        { NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8, 1, 1, 16385 },
+        { NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8, 2, 1, 42 },
+    };
+    TextureUploadTestCommands *measured = (TextureUploadTestCommands *)commands;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const unsigned lanes = cases[i].bytes;
+        const unsigned offset = cases[i].offset;
+        NV2AMetalTextureShape s = shape(cases[i].format);
+        s.width = 17;
+        s.height = 3;
+        s.pitch = cases[i].pitch;
+        NSUInteger size = offset + s.pitch * s.height;
+        NSMutableData *source = [NSMutableData dataWithLength:size];
+        uint8_t *input = source.mutableBytes;
+        memset(input, 0xcd, size);
+        uint8_t raw[17 * 3 * 2];
+        for (unsigned y = 0; y < s.height; y++)
+            for (unsigned x = 0; x < s.width * lanes; x++) {
+                uint8_t value = x * 73 + y * 29;
+                raw[y * s.width * lanes + x] = value;
+                input[offset + y * s.pitch + x] = value;
+            }
+        NSError *error = nil;
+        require([commands beginWithError:&error] != nil, error);
+        id<MTLBuffer> data = buffer(source.bytes, size);
+        measured.scratchBytes = 0;
+        measured.measureScratch = YES;
+        NV2AMetalTextureUploadResult *result = upload(s, data, offset, nil, 0);
+        measured.measureScratch = NO;
+        assert(measured.scratchBytes == 256 * s.height);
+        assert(result.texture.pixelFormat ==
+               (lanes == 1 ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm));
+        finish();
+        assert(*(const uint32_t *)result.faults.contents == 0);
+        NSData *snapshot =
+            nv2a_metal_texture_snapshot(result.texture, commands, &error);
+        require(snapshot != nil, error);
+        NSUInteger bytes = s.width * s.height * lanes;
+        assert(snapshot.length == 40 + bytes);
+        assert(!memcmp((const uint8_t *)snapshot.bytes + 40, raw, bytes));
+    }
+    puts("Metal4 narrow linear fallbacks: over-limit R8 pitch and unaligned "
+         "RG8 offset preserve all raw bytes PASS");
 }
 
 static void direct_copy_tests(void)
@@ -798,6 +894,85 @@ static void hilo16_tests(void)
            "all65536 values per word in both layouts PASS\n");
 }
 
+static void texture_fault_buffer_tests(void)
+{
+    NSError *error = nil;
+    const uint8_t indices[32] = { 255, 0, 1, 2 };
+    const uint8_t valid[4] = { 0, 1, 2, 3 };
+    const uint32_t colors[256] = { [0] = 0xff110000, [255] = 0xff770000 };
+    id<MTLBuffer> data = buffer(indices, sizeof(indices));
+    id<MTLBuffer> bounded = buffer(valid, sizeof(valid));
+    id<MTLBuffer> palette = buffer(colors, sizeof(colors));
+    NV2AMetalTextureShape indexed =
+        shape(NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8);
+    NSUInteger sourceLength;
+    require([uploader sourceLengthForShape:&indexed
+                             paletteLength:sizeof(colors)
+                                    length:&sourceLength error:&error], error);
+    assert(sourceLength == sizeof(valid));
+    require([commands beginWithError:&error] != nil, error);
+    NV2AMetalTextureUploadResult *full =
+        upload(indexed, data, 0, palette, sizeof(colors));
+    NV2AMetalTextureUploadResult *bad = upload(indexed, data, 0, palette, 128);
+    assert(![uploader sourceLengthForShape:&indexed paletteLength:12
+                                    length:&sourceLength error:&error]);
+    error = nil;
+    NV2AMetalTextureUploadResult *good =
+        upload(indexed, bounded, 0, palette, 128);
+    NV2AMetalTextureUploadResult *direct = upload(
+        shape(NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8), data, 0, nil, 0);
+    NV2AMetalTextureUploadResult *swizzled = upload(
+        shape(NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8), data, 0, nil, 0);
+    assert(full.faults == direct.faults && full.faults == swizzled.faults &&
+           full.faults != bad.faults && full.faults != good.faults &&
+           bad.faults != good.faults);
+    id<MTLBuffer> fullPixels = read_texture(full.texture, 0, 0);
+    id<MTLBuffer> validPixels = read_texture(good.texture, 0, 0);
+    id<MTLBuffer> invalidPixels = read_texture(bad.texture, 0, 0);
+    finish();
+    assert(!*(const uint32_t *)full.faults.contents &&
+           !*(const uint32_t *)good.faults.contents &&
+           *(const uint32_t *)bad.faults.contents == 1);
+    check(pixel(fullPixels, 2, 2, 0, 0, 0)[0], 0x77 / 255.f);
+    check(pixel(validPixels, 2, 2, 0, 0, 0)[0], 0x11 / 255.f);
+    check(pixel(invalidPixels, 2, 2, 0, 0, 0)[0], 0);
+    puts("Texture upload fault buffers: direct, swizzled and full palette "
+         "share zero; short palette results stay isolated PASS");
+}
+
+static void shared_texture_transfer_scratch_test(void)
+{
+    NSError *error = nil;
+    const uint8_t firstBytes[] = { 17, 29, 43, 61 };
+    const uint8_t secondBytes[] = { 101, 130, 180, 251 };
+    NV2AMetalTextureShape s = shape(NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8);
+    TextureUploadTestCommands *measured = (TextureUploadTestCommands *)commands;
+    require([commands beginWithError:&error] != nil, error);
+    measured.measureScratch = YES;
+    NV2AMetalTextureUploadResult *first =
+        upload(s, buffer(firstBytes, sizeof(firstBytes)), 0, nil, 0);
+    id<MTLBuffer> scratch = measured.lastTransferScratch;
+    require([commands sealWithError:&error] && [commands beginWithError:&error],
+            error);
+    NV2AMetalTextureUploadResult *second =
+        upload(s, buffer(secondBytes, sizeof(secondBytes)), 0, nil, 0);
+    assert(scratch && measured.lastTransferScratch == scratch &&
+           commands.sealedBufferCount == 1);
+    measured.measureScratch = NO;
+    id<MTLBuffer> firstPixels = read_texture(first.texture, 0, 0);
+    id<MTLBuffer> secondPixels = read_texture(second.texture, 0, 0);
+    finish();
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned x = 0; x < 2; x++) {
+            unsigned index = morton(x, y, 0, 2, 2, 1);
+            check(pixel(firstPixels, 2, 2, x, y, 0)[0], firstBytes[index] / 255.f);
+            check(pixel(secondPixels, 2, 2, x, y, 0)[0], secondBytes[index] / 255.f);
+        }
+    }
+    puts("Texture transfer scratch: two sealed/open decodes reuse one native "
+         "buffer and preserve both textures PASS");
+}
+
 static void palette_yuv_tests(void)
 {
     unsigned char indices[256], colors[1024];
@@ -1033,7 +1208,12 @@ static void layout_tests(void)
     s.max_level = 3;
     data = buffer(bytes, offset);
     require([commands beginWithError:&error] != nil, error);
+    TextureUploadTestCommands *measured = (TextureUploadTestCommands *)commands;
+    measured.scratchBytes = 0;
+    measured.measureScratch = YES;
     r = upload(s, data, 3, nil, 0);
+    measured.measureScratch = NO;
+    assert(measured.scratchBytes == 512); /* Four mips share the base span. */
     assert(r.sourceLength == 23 && r.minLevel == 1 && r.maxLevel == 3);
     NSMutableArray<id<MTLBuffer>> *levels = [NSMutableArray array];
     for (unsigned int level = 0; level < 4; level++) {
@@ -1062,7 +1242,11 @@ static void layout_tests(void)
     s.max_level = 1;
     data = buffer(bytes, 768);
     require([commands beginWithError:&error] != nil, error);
+    measured.scratchBytes = 0;
+    measured.measureScratch = YES;
     r = upload(s, data, 0, nil, 0);
+    measured.measureScratch = NO;
+    assert(measured.scratchBytes == 512); /* Six faces share both mip spans. */
     assert(r.sourceLength == 768);
     [levels removeAllObjects];
     for (unsigned int face = 0; face < 6; face++) {
@@ -1078,6 +1262,8 @@ static void layout_tests(void)
             check(p[0], (17 + face * 19 + level * 74) / 255.0f);
         }
     }
+    puts("Metal4 mip scratch: four 2D levels and twelve Cube subresources "
+         "each use a 512-byte working span with exact decoded texels PASS");
 }
 
 static void packed16_tests(void)
@@ -2524,8 +2710,12 @@ static void signed_channel_tests(void)
             require(valid, error);
             require([commands beginWithError:&error] != nil, error);
             NV2AMetalTextureUploadResult *r = upload(s, input, 16, nil, 0);
-            assert(r.texture.pixelFormat == (mask ? MTLPixelFormatRGBA16Float :
-                                                    MTLPixelFormatRGBA8Unorm));
+            MTLPixelFormat expectedFormat =
+                mask ? MTLPixelFormatRGBA16Float :
+                s.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ?
+                       MTLPixelFormatBGRA8Unorm :
+                       MTLPixelFormatRGBA8Unorm;
+            assert(r.texture.pixelFormat == expectedFormat);
             id<MTLBuffer> readback = test_metal_read_texture_decoded(
                 commands, r.texture, 0, 0,
                 r.mixedSignedHalf ? (15u ^ mask) : 0);
@@ -2573,6 +2763,7 @@ static void signed_channel_tests(void)
 #include "test-metal-signed8-benchmark.h"
 #include "test-metal-packed-native.h"
 #include "test-metal-r565-upload.h"
+#include "test-metal-linear-bgra.h"
 
 static void mixed_signed8_allocation_test(void)
 {
@@ -2914,6 +3105,111 @@ static void snorm565_layout_tests(void)
            "bit-exact manual filter/view/restore pairs PASS\n",
            subresources, texels, snapshots, lane_sample_pairs - filterPairs);
 }
+static void shared_upload_pipeline_test(void)
+{
+    NSError *error = nil;
+    NV2AMetalTextureUpload *first =
+        [[NV2AMetalTextureUpload alloc] initWithDevice:commands.device
+                                                 error:&error];
+    NV2AMetalTextureUpload *other =
+        [[NV2AMetalTextureUpload alloc] initWithDevice:commands.device
+                                                 error:&error];
+    require(first && other, error);
+    NV2AMetalCommands *queues[] = {
+        commands,
+        [[NV2AMetalCommands alloc] initWithDevice:commands.device error:&error],
+    };
+    require(queues[1] != nil, error);
+    const uint8_t texels[2][4] = { { 17, 53, 101, 237 }, { 42, 93, 19, 221 } };
+    NV2AMetalTextureShape s = shape(NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8);
+    NV2AMetalTextureShape linear =
+        shape(NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8);
+    NSUInteger length = 0;
+    require([first sourceLengthForShape:&linear paletteLength:0 length:&length
+                                  error:&error] && length <= 32, error);
+    const uint8_t directBytes[32] = { 73 };
+    id<MTL4CommandBuffer> recording = [queues[0] beginWithError:&error];
+    require(recording != nil, error);
+    NV2AMetalTextureUploadResult *direct = [first
+        encodeData:buffer(directBytes, sizeof(directBytes)) offset:0
+           palette:nil paletteOffset:0 paletteLength:0 shape:&linear
+          commands:queues[0] error:&error];
+    require(direct != nil, error);
+    assert(![first valueForKey:@"module"] && ![first valueForKey:@"pipeline"] &&
+           ![first valueForKey:@"arguments"] && ![other valueForKey:@"module"]);
+
+    Method method = class_getInstanceMethod(NV2AMetalShaderLibrary.class,
+                                             @selector(computeFunction:error:));
+    assert(method);
+    IMP fail = imp_implementationWithBlock(
+        ^id(NV2AMetalShaderLibrary *library, NSString *name, NSError **failure) {
+          (void)library;
+          assert([name isEqualToString:@"nv2a_texture_decode"]);
+          *failure = [NSError errorWithDomain:@"test.texture.decode"
+                                         code:1
+                                     userInfo:nil];
+          return nil;
+        });
+    IMP original = method_setImplementation(method, fail);
+    NV2AMetalTextureUploadResult *failed = [first
+        encodeData:buffer(texels[0], sizeof(texels[0])) offset:0
+           palette:nil paletteOffset:0 paletteLength:0 shape:&s
+          commands:queues[0] error:&error];
+    method_setImplementation(method, original);
+    assert(imp_removeBlock(fail));
+    assert(!failed && [error.domain isEqualToString:@"test.texture.decode"] &&
+           queues[0].commandBuffer == recording && [first valueForKey:@"module"] &&
+           ![first valueForKey:@"pipeline"] && ![first valueForKey:@"arguments"]);
+    error = nil;
+
+    id<MTLBuffer> output[2];
+    NSUInteger genericBuildCount = 0;
+    for (unsigned i = 0; i < 2; i++) {
+        if (i)
+            require([queues[i] beginWithError:&error] != nil, error);
+        NV2AMetalTextureUploadResult *r = [(i ? other : first)
+            encodeData:buffer(texels[i], sizeof(texels[i])) offset:0
+               palette:nil paletteOffset:0 paletteLength:0 shape:&s
+              commands:queues[i] error:&error];
+        require(r != nil, error);
+        if (!i) {
+            id sharedModule = [first valueForKey:@"module"];
+            genericBuildCount = [[sharedModule valueForKey:@"computeBuildCount"]
+                unsignedIntegerValue];
+        }
+        output[i] = test_metal_read_texture(queues[i], r.texture, 0, 0);
+    }
+    id module = [first valueForKey:@"module"];
+    assert(module && module == [other valueForKey:@"module"] &&
+           genericBuildCount > 0 &&
+           [[module valueForKey:@"computeBuildCount"] unsignedIntegerValue] ==
+               genericBuildCount);
+    NSDictionary *compute = [module valueForKey:@"compute"];
+    id genericPipeline = [first valueForKey:@"pipeline"];
+    assert(genericPipeline &&
+           compute[@"nv2a_texture_decode"] == genericPipeline);
+    assert([first valueForKey:@"pipeline"] == [other valueForKey:@"pipeline"] &&
+           [first valueForKey:@"arguments"] != [other valueForKey:@"arguments"]);
+    id<MTLBuffer> directPixels =
+        test_metal_read_texture(queues[0], direct.texture, 0, 0);
+    other = nil;
+    for (unsigned i = 0; i < 2; i++)
+        require([queues[i] submitWithError:&error], error);
+    for (unsigned i = 0; i < 2; i++) {
+        require([queues[i] waitUntilIdleWithError:&error], error);
+        for (unsigned p = 0; p < 4; p++)
+            check(pixel(output[i], 2, 2, p % 2, p / 2, 0)[0],
+                  texels[i][p] / 255.f);
+    }
+    check(pixel(directPixels, 2, 2, 0, 0, 0)[0], 73 / 255.f);
+    puts("Texture upload pipeline: two queues share one native decoder with "
+         "separate arguments and exact output PASS");
+    puts("Texture upload decoder startup: direct copy and layout query create "
+         "no decoder resources; failed first decode and exact retry PASS");
+}
+#include "test-metal-bc-block-upload.h"
+#include "test-metal-bc-block-benchmark.h"
+
 int main(int argc, char **argv)
 {
     @autoreleasepool {
@@ -2924,6 +3220,33 @@ int main(int argc, char **argv)
             [[NV2AMetalTextureUpload alloc] initWithDevice:commands.device
                                                      error:&error];
         require(uploader != nil, error);
+        if (argc == 2 && !strcmp(argv[1], "--bc-block-benchmark")) {
+            bc_block_benchmark();
+            return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--bc-block-upload"))) {
+            bc_block_upload_tests();
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--linear-bgra"))) {
+            linear_bgra_tests();
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--mip-scratch")) {
+            shared_upload_pipeline_test();
+            layout_tests();
+            mip_and_lifetime_tests();
+            texture_fault_buffer_tests();
+            shared_texture_transfer_scratch_test();
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--compact-byte-layouts")) {
+            compact_byte_tests();
+            compact_byte_linear_fallback_tests();
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--snorm565-benchmark")) {
             texture_storage_benchmark(2);
             return 0;
@@ -2969,9 +3292,11 @@ int main(int argc, char **argv)
         if (argc == 2 && !strcmp(argv[1], "--float-lanes"))
             return 0;
         assert(argc == 1);
+        shared_upload_pipeline_test();
         packed_native_probe();
         packed_layout_tests();
         compact_byte_tests();
+        compact_byte_linear_fallback_tests();
         direct_copy_tests();
         compact_allocation_test();
         texture_storage_benchmark(NO);
@@ -2986,6 +3311,8 @@ int main(int argc, char **argv)
         mixed_signed8_allocation_test();
         signed_derivative_filter_tests();
         palette_yuv_tests();
+        texture_fault_buffer_tests();
+        shared_texture_transfer_scratch_test();
         bc_tests();
         layout_tests();
         packed16_tests();

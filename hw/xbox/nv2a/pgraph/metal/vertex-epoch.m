@@ -89,6 +89,12 @@ static BOOL epoch_error(NSError **error, NSString *message)
                          written:r.written] :
                nil;
 }
+- (BOOL)canUsePendingResultForCommands:(NV2AMetalCommands *)commands
+{
+    if (_fixed)
+        return !_program && commands && commands == _fixedCommands;
+    return [_program canUsePendingReadOnlyResultForCommands:commands];
+}
 - (NV2AMetalEpochResult *)resolveWithError:(NSError **)error
 {
     if (_fixed)
@@ -112,7 +118,11 @@ static BOOL epoch_error(NSError **error, NSString *message)
     NV2AMetalCommands *_commands;
     NV2AMetalVertexFixed *_fixed;
     NV2AMetalWritableProgram *_program;
+    __weak NV2AMetalPGRAPHVertexState *_fixedConstantState;
+    NSData *_fixedConstantData;
 }
+@synthesize commands = _commands;
+
 - (instancetype)initWithDevice:(id<MTLDevice>)device error:(NSError **)error
 {
     self = [super init];
@@ -131,6 +141,27 @@ static BOOL epoch_error(NSError **error, NSString *message)
     _device = device;
     return self;
 }
+- (NSData *)fixedConstantsForState:(NV2AMetalPGRAPHVertexState *)state
+                           uniforms:(const NV2AMetalFixedUniforms *)uniforms
+{
+    /* Only the exact immutable capture class supplies the identity contract.
+     * A subclass can override its by-value uniform getter; preserve its old
+     * per-result snapshot instead of caching that potentially changing value.
+     */
+    if (![state isMemberOfClass:NV2AMetalPGRAPHVertexState.class])
+        return [NSData dataWithBytes:uniforms->common.constants
+                              length:sizeof(uniforms->common.constants)];
+    @synchronized(self) {
+        if (_fixedConstantState != state || !_fixedConstantData) {
+            _fixedConstantData =
+                [NSData dataWithBytes:uniforms->common.constants
+                               length:sizeof(uniforms->common.constants)];
+            _fixedConstantState = state;
+        }
+        return _fixedConstantData;
+    }
+}
+
 - (NV2AMetalEpochResult *)executeState:(NV2AMetalPGRAPHVertexState *)state
                        attributeBuffer:(id<MTLBuffer>)attributes
                                  first:(NSUInteger)first
@@ -223,14 +254,12 @@ static BOOL epoch_error(NSError **error, NSString *message)
         if (![_commands waitUntilIdleWithError:error])
             return nil;
     }
-    uint32_t dirty[192] = { 0 };
     return [[NV2AMetalEpochResult alloc]
         initRegisters:r.registers
              vertices:r.vertices
                 count:count
-            constants:[NSData dataWithBytes:u.common.constants
-                                     length:sizeof(u.common.constants)]
-              written:[NSData dataWithBytes:dirty length:sizeof(dirty)]];
+            constants:[self fixedConstantsForState:state uniforms:&u]
+              written:nv2a_metal_zero_constant_writes()];
 }
 - (NV2AMetalEpochEncoding *)encodeState:(NV2AMetalPGRAPHVertexState *)state
                         attributeBuffer:(id<MTLBuffer>)attributes
@@ -244,6 +273,7 @@ static BOOL epoch_error(NSError **error, NSString *message)
                        first:first
                        count:count
             compactRegisters:NO
+              attributeFetch:nil
                     commands:commands
                        error:error];
 }
@@ -253,6 +283,25 @@ static BOOL epoch_error(NSError **error, NSString *message)
                       first:(NSUInteger)first
                       count:(NSUInteger)count
                    previous:(NV2AMetalEpochEncoding *)previous
+                   commands:(NV2AMetalCommands *)commands
+                      error:(NSError **)error
+{
+    return [self encodeSerialRasterState:state
+                         attributeBuffer:attributes
+                                   first:first
+                                   count:count
+                                previous:previous
+                          attributeFetch:nil
+                                commands:commands
+                                   error:error];
+}
+- (NV2AMetalEpochEncoding *)
+    encodeSerialRasterState:(NV2AMetalPGRAPHVertexState *)state
+            attributeBuffer:(id<MTLBuffer>)attributes
+                      first:(NSUInteger)first
+                      count:(NSUInteger)count
+                   previous:(NV2AMetalEpochEncoding *)previous
+             attributeFetch:(NV2AMetalFetchResult *)fetch
                    commands:(NV2AMetalCommands *)commands
                       error:(NSError **)error
 {
@@ -271,6 +320,7 @@ static BOOL epoch_error(NSError **error, NSString *message)
                                access:state.fullAccess ? 1 : 0
                             rasterize:!state.rasterDiscard
                              previous:previous.programEncoding
+                       attributeFetch:fetch
                              commands:commands
                                 error:error];
     return program ? [[NV2AMetalEpochEncoding alloc] initProgram:program] : nil;
@@ -283,11 +333,29 @@ static BOOL epoch_error(NSError **error, NSString *message)
                                      commands:(NV2AMetalCommands *)commands
                                         error:(NSError **)error
 {
+    return [self encodeRasterState:state
+                   attributeBuffer:attributes
+                             first:first
+                             count:count
+                    attributeFetch:nil
+                          commands:commands
+                             error:error];
+}
+- (NV2AMetalEpochEncoding *)encodeRasterState:
+                                (NV2AMetalPGRAPHVertexState *)state
+                              attributeBuffer:(id<MTLBuffer>)attributes
+                                        first:(NSUInteger)first
+                                        count:(NSUInteger)count
+                               attributeFetch:(NV2AMetalFetchResult *)fetch
+                                     commands:(NV2AMetalCommands *)commands
+                                        error:(NSError **)error
+{
     return [self encodeState:state
              attributeBuffer:attributes
                        first:first
                        count:count
             compactRegisters:YES
+              attributeFetch:fetch
                     commands:commands
                        error:error];
 }
@@ -296,6 +364,7 @@ static BOOL epoch_error(NSError **error, NSString *message)
                                   first:(NSUInteger)first
                                   count:(NSUInteger)count
                        compactRegisters:(BOOL)compact
+                         attributeFetch:(NV2AMetalFetchResult *)fetch
                                commands:(NV2AMetalCommands *)commands
                                   error:(NSError **)error
 {
@@ -322,6 +391,7 @@ static BOOL epoch_error(NSError **error, NSString *message)
                         writeEnable:NO
                           rasterize:!state.rasterDiscard
                    compactRegisters:compact
+                     attributeFetch:fetch
                            commands:commands
                               error:error];
         return program ? [[NV2AMetalEpochEncoding alloc] initProgram:program] :
@@ -344,14 +414,12 @@ static BOOL epoch_error(NSError **error, NSString *message)
                                                      error:error];
     if (!discard && !r)
         return nil;
-    uint32_t dirty[192] = { 0 };
     NV2AMetalEpochResult *result = [[NV2AMetalEpochResult alloc]
         initRegisters:r.registers
              vertices:r.vertices
                 count:count
-            constants:[NSData dataWithBytes:u.common.constants
-                                     length:sizeof(u.common.constants)]
-              written:[NSData dataWithBytes:dirty length:sizeof(dirty)]];
+            constants:[self fixedConstantsForState:state uniforms:&u]
+              written:nv2a_metal_zero_constant_writes()];
     return [[NV2AMetalEpochEncoding alloc] initFixed:result commands:commands];
 }
 @end

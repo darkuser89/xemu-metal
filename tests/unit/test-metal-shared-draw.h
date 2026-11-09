@@ -34,12 +34,12 @@ static BOOL shared_submission_wait_count(id object, SEL selector,
 }
 static NV2AMetalEpochEncoding *(*shared_original_encode)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
-    NSUInteger, NV2AMetalCommands *, NSError **);
+    NSUInteger, NV2AMetalFetchResult *, NV2AMetalCommands *, NSError **);
 static unsigned shared_encode_calls;
 static NV2AMetalEpochEncoding *shared_late_host_failure(
     id object, SEL selector, NV2AMetalPGRAPHVertexState *captured,
     id<MTLBuffer> attributes, NSUInteger first, NSUInteger count,
-    NV2AMetalCommands *commands, NSError **error)
+    NV2AMetalFetchResult *fetch, NV2AMetalCommands *commands, NSError **error)
 {
     if (++shared_encode_calls == 2) {
         if (error)
@@ -53,7 +53,7 @@ static NV2AMetalEpochEncoding *shared_late_host_failure(
         return nil;
     }
     return shared_original_encode(object, selector, captured, attributes, first,
-                                  count, commands, error);
+                                  count, fetch, commands, error);
 }
 static NV2AMetalPixelDraw *shared_cached_raster_failure(
     id object, SEL selector, NV2AMetalGeometryResult *geometry,
@@ -82,7 +82,7 @@ static NV2AMetalPixelDraw *shared_cached_raster_failure(
 }
 static void shared_cached_producer_tests(void)
 {
-    for (unsigned mode = 0; mode < 4; mode++) {
+    for (unsigned mode = 0; mode < 9; mode++) {
         fixture();
         NSError *error = nil;
         PGRAPHState *pg = &state->pgraph;
@@ -95,7 +95,29 @@ static void shared_cached_producer_tests(void)
             pg->program_data[0][3] &= ~(1u << 11);
             mov(1, 0, 0, false);
             mov(2, 3, 3, true);
-        } else if (mode == 3) {
+        } else if (mode >= 5) {
+            Token reciprocal = token(0, mode == 7 ? NV2AMetalILURsq :
+                                       mode == 8 ? NV2AMetalILURcc :
+                                                   NV2AMetalILURcp, 100);
+            source(&reciprocal, 2, 3, 0, 0);
+            destination(&reciprocal, 0, 0, 0, 2, 0, 15);
+            memcpy(pg->program_data[0], reciprocal.word, sizeof(reciprocal));
+            Token arl = token(NV2AMetalMACArl, 0, 96);
+            source(&arl, 0, 1, 2, 0);
+            memcpy(pg->program_data[1], arl.word, sizeof(arl));
+            mov(2, 0, 0, false);
+            mov(3, 0, 3, true);
+            unsigned base = mode == 8 ? 98 : 96;
+            pg->program_data[3][1] = 1u << 21 | base << 13 | 27;
+            pg->program_data[3][2] = 3u << 26;
+            pg->program_data[3][3] |= 2;
+            const float input = mode == 5 ? 1 : mode == 7 ? .25f :
+                                                   mode == 8 ? -.5f : .5f;
+            const float green[4] = { 0, 1, 0, 1 };
+            memcpy(&pg->vsh_constants[100][0], &input, sizeof(input));
+            memcpy(pg->vsh_constants[mode == 5 ? 97 : mode == 8 ? 96 : 98],
+                   green, sizeof(green));
+        } else if (mode >= 3) {
             mov(0, 1, 0, false);
             pg->program_data[0][1] = 13u << 21 | 1u << 9 | 27;
             pg->program_data[0][3] = 0;
@@ -106,6 +128,21 @@ static void shared_cached_producer_tests(void)
             pg->program_data[2][3] |= 2;
             const float green[4] = { 0, 1, 0, 1 };
             memcpy(pg->vsh_constants[96], green, 16);
+            if (mode == 4) {
+                /* Same sampled address as the bounded inline case. Guarded
+                 * finite Float32 words now supply an immutable address domain. */
+                pg->vertex_attributes[1] = (VertexAttribute){
+                    .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+                    .count = 1,
+                    .size = 4,
+                    .stride = 4,
+                    .offset = 64,
+                };
+                const float addresses[3] = { 0 };
+                cpu_write(16384 + 64, sizeof(addresses));
+                memcpy(state->vram_ptr + 16384 + 64, addresses,
+                       sizeof(addresses));
+            }
         }
         qemu_mutex_lock(&pg->lock);
         require([surfaces prepareColor:YES
@@ -145,6 +182,19 @@ static void shared_cached_producer_tests(void)
             NV2AMetalCommands.class, @selector(waitUntilIdleWithError:));
         Method receipt = class_getInstanceMethod(
             NV2AMetalCommands.class, @selector(waitForSubmission:error:));
+        SEL currentSelector = @selector(canCaptureCurrentForInput:);
+        Method currentProbe = class_getInstanceMethod(NV2AMetalPGRAPHFetch.class,
+                                                         currentSelector);
+        assert(currentProbe);
+        BOOL (*originalProbe)(id, SEL, NV2AMetalPendingInput *) =
+            (void *)method_getImplementation(currentProbe);
+        __block unsigned currentProbes = 0;
+        IMP probeSpy = imp_implementationWithBlock(
+            ^BOOL(id fetch, NV2AMetalPendingInput *input) {
+                currentProbes++;
+                return originalProbe(fetch, currentSelector, input);
+            });
+        method_setImplementation(currentProbe, probeSpy);
         for (unsigned attempt = 0; attempt < 3; attempt++) {
             if (attempt == 1) {
                 shared_original_submit = (void *)method_setImplementation(
@@ -161,6 +211,11 @@ static void shared_cached_producer_tests(void)
             error = nil;
             assert(![draw flushDrawWithError:&error] &&
                    [error.domain isEqualToString:@"test.cached-producer"]);
+            if (!attempt) {
+                method_setImplementation(currentProbe, (IMP)originalProbe);
+                assert(imp_removeBlock(probeSpy));
+                assert(currentProbes == (mode == 2 ? 0u : 1u));
+            }
             NV2AMetalPendingJournal *pending = [draw valueForKey:@"pending"];
             assert(pending.retainedStreams.count == 1 &&
                    pending.retainedStreams[0].count == 1);
@@ -175,7 +230,7 @@ static void shared_cached_producer_tests(void)
             }
             assert(span.resource == accepted && !gate.signaledValue &&
                    !commands.commandBuffer &&
-                   commands.sealedBufferCount == (mode < 2 ? 1u : 0u) &&
+                   commands.sealedBufferCount == (mode == 2 ? 0u : 1u) &&
                    !pg->draw_time && !surfaces.color.dirty &&
                    !memcmp(current, pg->vertex_attributes[0].inline_value, 16));
             if (attempt && mode == 2)
@@ -206,7 +261,11 @@ static void shared_cached_producer_tests(void)
         color(1, 1, 0xff00ff00);
     }
     groups++;
+    puts("Draw Current preflight: constant writers skip the CPU probe; "
+         "guarded finite Float and other proven producers still check it PASS");
     puts("Cached producer:readonly/nonwriting/constant-writing/relative-ARL;"
+         "bounded inline and guarded finite Float stay queued "
+         "behind a closed raster gate;bounded and fractional RCP/RCC/RSQ stay queued;"
          "three gated raster failures retain accepted GPU prefix,zero retry "
          "submits/waits and empty producer sections,no context-store replay;"
          "live Current changes after source mutation while frozen green "
@@ -314,7 +373,8 @@ static void shared_draw_contract_tests(void)
         NSError *error = nil;
         Method encode = class_getInstanceMethod(
             NV2AMetalEpochExecutor.class,
-            @selector(encodeRasterState:attributeBuffer:first:count:commands:error:));
+            @selector(encodeRasterState:attributeBuffer:first:count:
+                      attributeFetch:commands:error:));
         if (!mode) {
             shared_original_encode = (void *)method_setImplementation(
                 encode, (IMP)shared_late_host_failure);

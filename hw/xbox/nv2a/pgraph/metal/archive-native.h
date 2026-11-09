@@ -7,7 +7,7 @@
 NS_ASSUME_NONNULL_BEGIN
 /* Exact zero-valued transport for discarded raster output, with no GPU
  * allocation. Drawing adapters must reject this resource. Snapshot capture
- * materializes its bytes with a Metal fill; no vertex program is replayed. */
+ * materializes its zero bytes without replaying the vertex program. */
 __attribute__((objc_subclassing_restricted))
 @interface NV2AMetalDiscardedVertices : NSObject
 @property(nonatomic, readonly) NSUInteger count;
@@ -17,7 +17,8 @@ __attribute__((objc_subclassing_restricted))
 @end
 /* Caller holds pg.lock and has completed previous producer commands. Commands
  * must not have an active recording. Captures all cached ranges, including the
- * hidden last one. Restore uploads transformed bytes; no vertex program runs.
+ * hidden last one. Indexed owners retain referenced physical records and a
+ * logical remap. Restore uploads transformed bytes; no vertex program runs.
  * Neither function changes any existing journal or PGRAPH/Begin/Query state. */
 API_AVAILABLE(macos(26.0))
 NV2AMetalPendingArchive *_Nullable nv2a_metal_pending_capture(

@@ -21,6 +21,7 @@
 #import "pixel-pgraph.h"
 #import "geometry.h"
 #import "lru-cache.h"
+#import "pipeline-compiler.h"
 #include "renderer.h"
 
 static BOOL pgraph_draw_error(NSError **error, NSString *message)
@@ -33,25 +34,95 @@ static BOOL pgraph_draw_error(NSError **error, NSString *message)
     return NO;
 }
 static NV2AMetalPGRAPHVertexState *capture_only(PGRAPHState *pg,
+                                                NV2AMetalPGRAPHVertexState *previous,
                                                 NSError **error)
 {
     return [[NV2AMetalPGRAPHVertexState alloc] initRawXFWithState:pg
+                                             reusingProgramFrom:previous
                                                             error:error];
 }
-/* Current must be host-readable. New XF output additionally needs a proven
- * nonwriting, fault-free context. Fully accepted prefixes execute no XF and
- * must neither wait for new feedback nor replay earlier context stores. */
+static BOOL can_deduplicate_vertices(NV2AMetalPGRAPHVertexState *vertex)
+{
+    return vertex && !vertex.rasterDiscard &&
+           (!vertex.programmed ||
+            (vertex.validatedProgram &&
+             (!vertex.writeEnable ||
+              !vertex.validatedProgram.mayWriteConstants)));
+}
+
+/* Journal ranges remain logical ordinals. Only an explicitly remapped fetch
+ * changes the number of physical records executed by the readonly epoch. */
+static BOOL fetch_xf_range(NV2AMetalPGRAPHFetchBatch *batch,
+                           NSUInteger inputCount, NSUInteger first,
+                           NSUInteger count, BOOL allowIndexed,
+                           NSUInteger *attributeFirst,
+                           NSUInteger *physicalCount, NSError **error)
+{
+    if (batch.inputVertexCount != inputCount || first > inputCount ||
+        count != inputCount - first || first < batch.firstDecodedVertex)
+        return pgraph_draw_error(error, @"Pending input/fetch count mismatch");
+    if (batch.remap) {
+        if (!allowIndexed || first != batch.firstDecodedVertex ||
+            count > NSUIntegerMax / sizeof(uint32_t) ||
+            batch.remap.length != count * sizeof(uint32_t) ||
+            batch.physicalVertexCount > count ||
+            batch.physicalVertexCount > batch.fetch.vertexCount ||
+            (count && !batch.physicalVertexCount))
+            return pgraph_draw_error(error, @"Invalid indexed readonly XF range");
+        *attributeFirst = 0;
+        *physicalCount = batch.physicalVertexCount;
+    } else {
+        NSUInteger offset = first - batch.firstDecodedVertex;
+        if (offset > batch.fetch.vertexCount ||
+            count > batch.fetch.vertexCount - offset)
+            return pgraph_draw_error(error,
+                                     @"Pending suffix exceeds compact fetch output");
+        *attributeFirst = offset;
+        *physicalCount = count;
+    }
+    return YES;
+}
+/* A Float candidate only selects an attempted shared producer. Every actual
+ * encoded proof still precedes early publication; rejection takes the normal
+ * resolve path. Accepted prefixes never replay earlier context stores. */
 static BOOL can_queue_captured_context(NV2AMetalPGRAPHFetch *fetch,
                                        NV2AMetalPendingInput *input,
                                        NV2AMetalPGRAPHVertexState *vertex,
                                        BOOL suffix)
 {
-    return vertex &&
-           (!suffix || !vertex.programmed ||
-            ((!vertex.writeEnable ||
-              !vertex.validatedProgram.mayWriteConstants) &&
-             vertex.faultFreeReadOnlyAccess)) &&
-           [fetch canCaptureCurrentForInput:input];
+    if (!vertex)
+        return NO;
+    if (suffix && vertex.programmed) {
+        NV2AMetalValidatedProgram *program = vertex.validatedProgram;
+        if (!program || (vertex.writeEnable && program.mayWriteConstants))
+            return NO;
+        if (![program hasFaultFreeReadOnlyAccess:vertex.fullAccess ? 1 : 0]) {
+            NV2AMetalFetchUniforms preview;
+            uint16_t attributes = program.readAttributes;
+            if (attributes)
+                [fetch getSourcePreview:&preview attributes:attributes];
+            if (![vertex mayAttemptReadonlyFloatProofWithPreview:attributes ?
+                                                                     &preview :
+                                                                     NULL] &&
+                ![vertex
+                    mayUseReadonlyFetchPreview:attributes ? &preview : NULL])
+                return NO;
+        }
+    }
+    /* Only a producer that can remain queued needs the CPU Current probe. */
+    return [fetch canCaptureCurrentForInput:input];
+}
+static BOOL can_queue_encoded_context(NSArray *encodings,
+                                      NV2AMetalCommands *commands)
+{
+    for (id encoding in encodings) {
+        if (encoding == NSNull.null)
+            continue;
+        if (![encoding isKindOfClass:NV2AMetalEpochEncoding.class] ||
+            ![encoding canUsePendingResultForCommands:commands])
+            return NO;
+    }
+    return YES;
 }
 static NV2AMetalGeometryRasterConfig raster_config(PGRAPHState *pg)
 {
@@ -216,16 +287,75 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     BOOL _restoredPendingRawOnly;
     NV2AMetalGeometry *_geometry;
     NV2AMetalLRUCache<NSNumber *, NV2AMetalPixelShader *> *_pixels;
+    NSMapTable<NSNumber *, NV2AMetalLRUCache *> *_pixelPipelineCaches;
+    NV2AMetalPipelineCompiler *_pixelCompiler;
     BOOL _closed, _active, _nop, _resumeQuery;
     NV2AMetalPGRAPHQuery *_query;
     unsigned _control, _stencil, _primitive;
     BOOL _firstProvoking;
     NV2AMetalGeometryRasterConfig _rasterConfig;
     NV2AMetalPGRAPHVertexState *_vertexState, *_restoredVertexState;
+    NV2AMetalPGRAPHVertexState *_programCaptureWitness;
     NV2AMetalPGRAPHPixelState *_pixelState;
+    NV2AMetalDrawState *_lastCapturedRaster;
     NV2AMetalDepthStencilCache *_depthStencilCache;
     NSData *_restoredBeginSnapshot;
     NV2AMetalSurfaceBindings _surfaceBindings;
+}
+/* A single pure CPU program witness survives ordinary Begin/End sessions.
+ * Constructors still snapshot every live uniform and inline value before
+ * their existing exact-token comparison. Never reuse this as active state. */
+- (NV2AMetalPGRAPHVertexState *)programCaptureWitness
+{
+    return _programCaptureWitness;
+}
+- (void)publishProgramCaptureWitness:(NV2AMetalPGRAPHVertexState *)capture
+{
+    if ([capture isMemberOfClass:NV2AMetalPGRAPHVertexState.class] &&
+        capture.programmed && capture.validatedProgram)
+        _programCaptureWitness = capture;
+}
+
+/* Mirrors existing raster rejection only; producer and pixel validation
+ * still execute. Original polygon topology, never transport triangles, owns
+ * the cull rule. Window clipping uses the fragment's immutable captured data.
+ */
+- (BOOL)hasNoRasterSamplesForPrimitive:(enum NV2AMetalPrimitive)primitive
+                                raster:(const NV2AMetalDrawConfig *)raster
+                              geometry:(const NV2AMetalGeometryRasterConfig *)
+                                           geometry
+                              uniforms:(const NV2AMetalPixelUniforms *)uniforms
+                                 width:(NSUInteger)width
+                                height:(NSUInteger)height
+{
+    if (raster->scissor_enabled) {
+        NSUInteger x = MIN(raster->scissor.x, width);
+        NSUInteger y = MIN(raster->scissor.y, height);
+        if (!MIN(raster->scissor.width, width - x) ||
+            !MIN(raster->scissor.height, height - y))
+            return YES;
+    }
+    if (primitive >= NV2AMetalPrimitiveTriangles && geometry->cullFront &&
+        geometry->cullBack)
+        return YES;
+    /* The effective state has already disabled absent depth/stencil
+     * attachments. Keep encoding raster work, including stencil fail ops. */
+    if ((uniforms->alpha_test && uniforms->alpha_func == ALPHA_FUNC_NEVER) ||
+        ((raster->control[0] & NV_PGRAPH_CONTROL_0_ZENABLE) &&
+         GET_MASK(raster->control[0], NV_PGRAPH_CONTROL_0_ZFUNC) ==
+             NV_PGRAPH_CONTROL_0_ZFUNC_NEVER) ||
+        ((raster->control[1] & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE) &&
+         GET_MASK(raster->control[1], NV_PGRAPH_CONTROL_1_STENCIL_FUNC) ==
+             NV_PGRAPH_CONTROL_1_STENCIL_FUNC_NEVER))
+        return YES;
+    if (!uniforms->window_clip_exclusive) {
+        for (unsigned i = 0; i < 8; i++)
+            if (uniforms->clip_regions[i][0] < uniforms->clip_regions[i][2] &&
+                uniforms->clip_regions[i][1] < uniforms->clip_regions[i][3])
+                return NO;
+        return YES;
+    }
+    return NO;
 }
 - (instancetype)initWithState:(NV2AState *)d
                      surfaces:(NV2AMetalPGRAPHSurfaces *)surfaces
@@ -255,6 +385,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     _pending = [[NV2AMetalPendingJournal alloc] initWithLimit:NSUIntegerMax];
     _geometry = [[NV2AMetalGeometry alloc] initWithDevice:device error:error];
     _pixels = [[NV2AMetalLRUCache alloc] initWithCapacity:32];
+    _pixelPipelineCaches = [NSMapTable strongToWeakObjectsMapTable];
     _depthStencilCache = [NV2AMetalDepthStencilCache sharedWithDevice:device
                                                                error:error];
     _blitter = [[NV2AMetalPGRAPHBlit alloc] initWithState:d
@@ -262,10 +393,26 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                                                     error:error];
     _reports = [[NV2AMetalPGRAPHReports alloc] initWithState:d
                                                        cache:surfaces.cache];
-    return _textures && _fetch && _epoch && _pending && _stateProgram &&
-                   _geometry && _blitter && _depthStencilCache ?
-               self :
-               nil;
+    if (!(_textures && _fetch && _epoch && _pending && _stateProgram &&
+          _geometry && _blitter && _depthStencilCache))
+        return nil;
+    /* Pure optional compiler metadata; failure preserves the old sync path. */
+    _pixelCompiler = [NV2AMetalPipelineCompiler sharedForDevice:device error:NULL];
+    return self;
+}
+- (NV2AMetalPGRAPHPixelState *)capturePixelStateWithTextures:
+                                  (NV2AMetalPGRAPHTextureSnapshot *)textures
+                                                     error:(NSError **)error
+{
+    NV2AMetalPGRAPHPixelState *state = [[NV2AMetalPGRAPHPixelState alloc]
+        initWithState:&_d->pgraph
+             textures:textures
+               device:_surfaces.cache.commands.device
+        reusingRaster:_lastCapturedRaster
+                error:error];
+    if (state)
+        _lastCapturedRaster = state.raster;
+    return state;
 }
 - (NV2AMetalPixelShader *)pixelForColor:(MTLPixelFormat)color
                                   depth:(MTLPixelFormat)depth
@@ -300,20 +447,32 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         channels = NV2AMetalSurfaceStorageO7;
         break;
     }
-    NSNumber *key = @((NSUInteger)color | (NSUInteger)channels << 16 |
-                      (NSUInteger)depth << 32);
+    NSUInteger layout = (NSUInteger)color | (NSUInteger)channels << 16;
+    NSNumber *key = @(layout | (NSUInteger)depth << 32);
     NV2AMetalPixelShader *pixel = _pixels[key];
     if (!pixel) {
+        /* Metal 4 describes depth/stencil on the render pass. Packed alpha
+         * variants of the same color format also share a descriptor: the
+         * shader reads the exact guest alpha layout from its uniforms. */
+        unsigned pipelineChannels = MIN(channels, NV2AMetalSurfaceStorageZ1);
+        NSNumber *layoutKey = @((NSUInteger)color |
+                                (NSUInteger)pipelineChannels << 16);
+        NV2AMetalLRUCache *pipelines =
+            [_pixelPipelineCaches objectForKey:layoutKey] ?:
+                [[NV2AMetalLRUCache alloc] initWithCapacity:256];
         pixel = [[NV2AMetalPixelShader alloc]
              initWithDevice:_surfaces.cache.commands.device
                 colorFormat:color
                 depthFormat:depth
                 sampleCount:1
             surfaceChannels:channels
+              pipelineCache:pipelines
+           pipelineCompiler:_pixelCompiler
                       error:error];
         if (pixel) {
             /* Submitted command slots retain evicted renderers until idle. */
             _pixels[key] = pixel;
+            [_pixelPipelineCaches setObject:pipelines forKey:layoutKey];
         }
     }
     return pixel;
@@ -334,32 +493,16 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
 }
 - (NV2AMetalPGRAPHVertexState *)
     transformBatches:(NSArray<NV2AMetalPGRAPHFetchBatch *> *)batches
-              inputs:(NSArray<NV2AMetalPendingInput *> *)inputs
-              vertex:(NV2AMetalPGRAPHVertexState *)vertex
-    preserveMetadata:(BOOL)preserveMetadata
-               error:(NSError **)error
-{
-    return [self transformBatches:batches
-                           inputs:inputs
-                           vertex:vertex
-                 preserveMetadata:preserveMetadata
-                        encodings:nil
-                     pendingGPU:NO
-                            error:error];
-}
-- (NV2AMetalPGRAPHVertexState *)
-    transformBatches:(NSArray<NV2AMetalPGRAPHFetchBatch *> *)batches
-              inputs:(NSArray<NV2AMetalPendingInput *> *)inputs
+                plan:(NV2AMetalPendingPlan *)plan
               vertex:(NV2AMetalPGRAPHVertexState *)vertex
     preserveMetadata:(BOOL)preserveMetadata
            encodings:(NSArray *)encodings
         pendingGPU:(BOOL)pendingGPU
+   completedProgress:(NV2AMetalPendingProgress **)completedProgress
                error:(NSError **)error
 {
     PGRAPHState *pg = &_d->pgraph;
-    NV2AMetalPendingPlan *plan = [_pending planInputs:inputs
-                                  preservingLastArray:YES
-                                                error:error];
+    NSArray<NV2AMetalPendingInput *> *inputs = plan.inputs;
     NV2AMetalPendingProgress *progress =
         plan ? [_pending beginProgressForPlan:plan error:error] : nil;
     if (!progress || batches.count != inputs.count) {
@@ -369,21 +512,14 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     }
     for (NSUInteger index = 0; index < batches.count; index++) {
         NV2AMetalPGRAPHFetchBatch *b = batches[index];
-        if (b.inputVertexCount != inputs[index].count) {
-            pgraph_draw_error(error,
-                              @"Pending input/fetch vertex count mismatch");
-            return nil;
-        }
         NSUInteger first = plan.prefixCounts[index].unsignedIntegerValue;
         NSUInteger count = inputs[index].count - first;
-        if (first < b.firstDecodedVertex ||
-            first - b.firstDecodedVertex > b.fetch.vertexCount ||
-            count > b.fetch.vertexCount - (first - b.firstDecodedVertex)) {
-            pgraph_draw_error(error,
-                              @"Pending suffix exceeds compact fetch output");
+        NSUInteger attributeFirst, physicalCount;
+        if (!fetch_xf_range(b, inputs[index].count, first, count,
+                            can_deduplicate_vertices(vertex), &attributeFirst,
+                            &physicalCount, error)) {
             return nil;
         }
-        NSUInteger attributeFirst = first - b.firstDecodedVertex;
         if (!count) {
             if (![_pending commitNextSuffix:nil progress:progress error:error])
                 return nil;
@@ -408,7 +544,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                     [encoded pendingResultForCommands:_surfaces.cache.commands
                                               error:error] :
                     [encoded resolveWithError:error];
-            if (r && r.vertexCount != count) {
+            if (r && r.vertexCount != physicalCount) {
                 pgraph_draw_error(error,
                                   @"Shared XF epoch suffix count changed");
                 return nil;
@@ -417,7 +553,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
             r = [_epoch executeRasterState:vertex
                            attributeBuffer:b.fetch.attributes
                                      first:attributeFirst
-                                     count:count
+                                     count:physicalCount
                                      error:error];
         }
         if (!r)
@@ -437,11 +573,27 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         if (!cached)
             return nil;
         id resource = r.vertices;
+        if (b.remap && resource) {
+            resource = [[NV2AMetalIndexedVertices alloc]
+                initWithVertices:r.vertices
+                   physicalCount:physicalCount
+                           remap:b.remap
+                           error:error];
+            if (!resource)
+                return nil;
+        }
         if (!resource && vertex.rasterDiscard)
             resource = [[NV2AMetalDiscardedVertices alloc] initWithCount:count];
+        NV2AMetalSurfaceRecording *producer =
+            pendingGPU ? _surfaces.cache.recording : nil;
+        if (pendingGPU && !producer) {
+            pgraph_draw_error(error, @"Pending XF output has no surface recording");
+            return nil;
+        }
         NV2AMetalPendingSpan *span = [NV2AMetalPendingSpan resource:resource
                                                               first:0
-                                                              count:count];
+                                                              count:count
+                                                  producerRecording:producer];
         if (!span)
             return nil;
         if (![_pending commitNextSuffix:span progress:progress error:error])
@@ -463,6 +615,8 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         if (_active)
             _vertexState = cached;
     }
+    if (completedProgress)
+        *completedProgress = progress;
     return vertex;
 }
 - (BOOL)drawBatchWithError:(NSError **)error advanceTime:(BOOL)advanceTime
@@ -545,17 +699,24 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     NV2AMetalPGRAPHVertexState *originalVertexState = nil;
     BOOL originalCaptureDirty = NO;
     NV2AMetalPendingUpdate *pending = nil;
+    NV2AMetalPendingProgress *completedProgress = nil;
     NV2AMetalPendingNative *native = nil;
     NSArray<NV2AMetalVertexSlice *> *vertices = nil;
     NSMutableArray<NSArray<NV2AMetalGeometryResult *> *> *preparedGeometry =
         nil;
+    NSMutableData *compactGroups = nil;
+    NSMutableArray *geometryContinuations = nil;
+    typedef struct {
+        NSUInteger group, slice;
+    } CompactGeometryGroup;
     NSMutableArray<NV2AMetalPixelDraw *> *preparedPixels = nil;
     NSMutableArray<NV2AMetalCachedSurface *> *rasterTargets = nil;
-    NSMutableArray *completed = nil;
     MTL4RenderPassDescriptor *pass = nil;
     id<MTL4RenderCommandEncoder> renderEncoder = nil;
     NV2AMetalVisibilityCounter *visibility = nil;
-    id<MTLTexture> viewport = nil;
+    NV2AMetalPixelUniforms polygonUniforms[NV2AMetalPolygonLine + 2];
+    unsigned preparedModes = 0;
+    NV2AMetalSurfaceTransfer *viewport = nil;
     MTLPixelFormat preparedColor = MTLPixelFormatInvalid,
                    preparedDepth = MTLPixelFormatInvalid;
     unsigned preparedSurfaceFormat = 0;
@@ -593,8 +754,10 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     producerVertex =
         _active && (!suffix || (!rebind && !_vertexCaptureDirty)) ?
             _vertexState :
-            [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
-                                                        error:&captureError];
+            [[NV2AMetalPGRAPHVertexState alloc]
+                     initWithState:pg
+                reusingProgramFrom:_vertexState ?: [self programCaptureWitness]
+                             error:&captureError];
     /* An invalid capture keeps the fetch/validation order. Context writers
      * publish only after producer completion; proven readonly context may stay
      * queued with its immutable inputs and outputs. */
@@ -614,6 +777,13 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                                                       NV2AMetalInputIndexed ?
                                               inputs[0] :
                                               nil
+                               deduplicateReadonly:can_deduplicate_vertices(
+                                                       producerVertex)
+                               proofAttributeLanes:
+                                   producerVertex.programmed ?
+                                       producerVertex.validatedProgram
+                                           .readonlyProofAttributeLanes64 :
+                                       0
                                              error:error];
         else
             batches = [_fetch
@@ -624,6 +794,13 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                                                           NV2AMetalInputIndexed ?
                                                   inputs[0] :
                                                   nil
+                                   deduplicateReadonly:can_deduplicate_vertices(
+                                                           producerVertex)
+                                   proofAttributeLanes:
+                                       producerVertex.programmed ?
+                                           producerVertex.validatedProgram
+                                               .readonlyProofAttributeLanes64 :
+                                           0
                                                  error:error];
         if (!batches)
             goto fail;
@@ -635,13 +812,15 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         NV2AMetalEpochEncoding *previous = nil;
         for (NSUInteger i = 0; i < batches.count; i++) {
             NSUInteger first = plan.prefixCounts[i].unsignedIntegerValue;
-            if (batches[i].inputVertexCount != inputs[i].count ||
-                batches[i].firstDecodedVertex != first ||
-                batches[i].fetch.vertexCount != inputs[i].count - first) {
+            NSUInteger count = inputs[i].count - first;
+            NSUInteger attributeFirst, physicalCount;
+            if (batches[i].firstDecodedVertex != first ||
+                !fetch_xf_range(batches[i], inputs[i].count, first, count,
+                                can_deduplicate_vertices(producerVertex),
+                                &attributeFirst, &physicalCount, error)) {
                 pgraph_draw_error(error, @"Shared fetch input count mismatch");
                 goto fail;
             }
-            NSUInteger count = inputs[i].count - first;
             if (!count) {
                 [encodings addObject:NSNull.null];
                 continue;
@@ -652,15 +831,20 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                         producerVertex.validatedProgram.mayWriteConstants ?
                     [_epoch encodeSerialRasterState:producerVertex
                                     attributeBuffer:batches[i].fetch.attributes
-                                              first:0
-                                              count:count
+                                              first:attributeFirst
+                                              count:physicalCount
                                            previous:previous
+                                     attributeFetch:batches[i].fetch
                                            commands:_fetch.encodingCommands
                                               error:&epochError] :
                     [_epoch encodeRasterState:producerVertex
                               attributeBuffer:batches[i].fetch.attributes
-                                        first:0
-                                        count:count
+                                        first:attributeFirst
+                                        count:physicalCount
+                               attributeFetch:(producerVertex.programmed ||
+                                               currentQueued) ?
+                                                  batches[i].fetch :
+                                                  nil
                                      commands:_fetch.encodingCommands
                                         error:&epochError];
             if (!encoded) {
@@ -675,11 +859,11 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
             [encodings addObject:encoded];
             previous = encoded;
         }
-        /* A later host encoding error must retain completed leading ranges.
-         * Resolve that error path before publishing its Pending prefix, rather
-         * than leaving it in the cancellable raster transaction. */
-        if ([encodings.lastObject isKindOfClass:NSError.class])
-            currentQueued = NO;
+        /* Every new range needs its actual proof before publishing Current.
+         * Feedback also preserves leading ranges on a later encoding error. */
+        currentQueued =
+            currentQueued &&
+            can_queue_encoded_context(encodings, _fetch.encodingCommands);
         if (!currentQueued && ![_fetch submitWithError:error])
             goto fail;
         /* Fragment capture reads no Current or XF feedback. Submitted
@@ -692,20 +876,15 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                                                         device:commands.device
                                                          error:&fragmentError] :
                 _active ? _pixelState :
-                          [[NV2AMetalPGRAPHPixelState alloc]
-                              initWithState:pg
-                                   textures:textures
-                                     device:commands.device
-                                      error:&fragmentError];
+                          [self capturePixelStateWithTextures:textures
+                                                        error:&fragmentError];
             if (fragment) {
-                preparedColor =
-                    _surfaces.color ?
-                        _surfaces.color.transfer.texture.pixelFormat :
-                        MTLPixelFormatInvalid;
-                preparedDepth =
-                    _surfaces.zeta ?
-                        _surfaces.zeta.transfer.texture.pixelFormat :
-                        MTLPixelFormatInvalid;
+                preparedColor = _surfaces.color ?
+                                    _surfaces.color.transfer.nativePixelFormat :
+                                    MTLPixelFormatInvalid;
+                preparedDepth = _surfaces.zeta ?
+                                    _surfaces.zeta.transfer.nativePixelFormat :
+                                    MTLPixelFormatInvalid;
                 preparedSurfaceFormat =
                     _surfaces.color ? _surfaces.color.transfer.config.format :
                                       0;
@@ -724,7 +903,13 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                   [_fetch completeWithError:error]))
             goto fail;
     } else {
-        batches = [_fetch prepareWithError:error];
+        batches =
+            [_fetch prepareWithIndexedInput:inputs.count == 1 &&
+                                                    inputs[0].kind ==
+                                                        NV2AMetalInputIndexed ?
+                                                inputs[0] :
+                                                nil
+                                      error:error];
         if (!batches)
             goto fail;
     }
@@ -751,29 +936,29 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         suffix |= inputs[i].count > plan.prefixCounts[i].unsignedIntegerValue;
     vertex = _active && (!suffix || (!rebind && !_vertexCaptureDirty)) ?
                  _vertexState :
-                 [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
-                                                             error:error];
+                 [[NV2AMetalPGRAPHVertexState alloc]
+                          initWithState:pg
+                     reusingProgramFrom:producerVertex ?:
+                                            [self programCaptureWitness]
+                                  error:error];
     if (!fragmentPrepared)
         fragment = rebind ?
                        [_pixelState recaptureShaderWithState:pg
                                                       device:commands.device
                                                        error:error] :
                    _active ? _pixelState :
-                             [[NV2AMetalPGRAPHPixelState alloc]
-                                 initWithState:pg
-                                      textures:textures
-                                        device:commands.device
-                                         error:error];
+                             [self capturePixelStateWithTextures:textures
+                                                           error:error];
     else if (vertex && !fragment && error)
         *error = fragmentError;
     if (!vertex || !fragment)
         goto fail;
-    viewport = _surfaces.color ? _surfaces.color.transfer.texture :
-                                 _surfaces.zeta.transfer.texture;
+    viewport =
+        _surfaces.color ? _surfaces.color.transfer : _surfaces.zeta.transfer;
     NV2AMetalDrawConfig boundRaster = fragment.raster.config;
     drawRaster = fragment.raster;
     BOOL hasStencil =
-        _surfaces.zeta && _surfaces.zeta.transfer.texture.pixelFormat ==
+        _surfaces.zeta && _surfaces.zeta.transfer.nativePixelFormat ==
                               MTLPixelFormatDepth32Float_Stencil8;
     if ((!_surfaces.zeta && drawRaster.requiresDepth) ||
         (!hasStencil && drawRaster.requiresStencil)) {
@@ -788,11 +973,12 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                                                           error:error];
         if (!drawRaster)
             goto fail;
+        boundRaster = effective;
     }
     geometry_config.viewportWidth =
-        boundRaster.viewport_width ?: viewport.width;
+        boundRaster.viewport_width ?: viewport.nativeWidth;
     geometry_config.viewportHeight =
-        boundRaster.viewport_height ?: viewport.height;
+        boundRaster.viewport_height ?: viewport.nativeHeight;
     /* Queue-resident readonly output is consumed on these same commands.
      * Serial context feedback still publishes in completed range order. */
     if (!encodings && ![cache submitWithError:error])
@@ -803,18 +989,19 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         originalPending = _pending;
         originalVertexState = _vertexState;
         originalCaptureDirty = _vertexCaptureDirty;
-        _pending = [_pending copyForTransaction];
-        if (!_pending) {
-            pgraph_draw_error(error, @"Cannot stage pending GPU vertices");
+        _pending = [_pending copyForTransactionWithPlan:plan
+                                             stagedPlan:&plan
+                                                  error:error];
+        if (!_pending)
             goto fail;
-        }
     }
     vertex = [self transformBatches:batches
-                             inputs:inputs
+                               plan:plan
                              vertex:vertex
                    preserveMetadata:rebind && !_vertexCaptureDirty
                           encodings:encodings
                          pendingGPU:currentQueued
+                   completedProgress:&completedProgress
                               error:error];
     if (!vertex)
         goto fail;
@@ -827,13 +1014,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
             goto fail;
         originalPending = nil;
     }
-    plan = [_pending planInputs:inputs preservingLastArray:YES error:error];
-    if (!plan)
-        goto fail;
-    completed = [NSMutableArray new];
-    for (NSUInteger index = 0; index < inputs.count; index++)
-        [completed addObject:NSNull.null];
-    pending = [_pending preparePlan:plan suffixes:completed error:error];
+    pending = [_pending prepareCompletedProgress:completedProgress error:error];
     if (!pending || ![_pending commitUpdate:pending error:error])
         goto fail;
     native = [[NV2AMetalPendingNative alloc]
@@ -855,11 +1036,11 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     /* Fetch may have retired aliased attachments. Reuse CPU preparation only
      * if the revalidated attachment formats and guest storage policy match. */
     MTLPixelFormat colorFormat =
-        _surfaces.color ? _surfaces.color.transfer.texture.pixelFormat :
+        _surfaces.color ? _surfaces.color.transfer.nativePixelFormat :
                           MTLPixelFormatInvalid;
-    MTLPixelFormat depthFormat =
-        _surfaces.zeta ? _surfaces.zeta.transfer.texture.pixelFormat :
-                         MTLPixelFormatInvalid;
+    MTLPixelFormat depthFormat = _surfaces.zeta ?
+                                     _surfaces.zeta.transfer.nativePixelFormat :
+                                     MTLPixelFormatInvalid;
     unsigned surfaceFormat =
         _surfaces.color ? _surfaces.color.transfer.config.format : 0;
     if (!pixelPrepared || preparedColor != colorFormat ||
@@ -869,101 +1050,244 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         *error = pixelError;
     if (!pixel)
         goto fail;
-    pass = [MTL4RenderPassDescriptor new];
-    if (_query && !_query.discarded) {
-        visibility = [_reports allocateCounterWithError:error];
-        if (!visibility)
-            goto fail;
-        if (![cache prepareGPUReadAtAddress:0 length:0 error:error])
-            goto fail;
-    }
-    pass.visibilityResultBuffer = _reports.visibilityBuffer;
-    if (pass.visibilityResultBuffer)
-        pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
-    if (_surfaces.color) {
-        pass.colorAttachments[0].texture = _surfaces.color.transfer.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    }
-    if (_surfaces.zeta) {
-        pass.depthAttachment.texture = _surfaces.zeta.transfer.texture;
-        pass.depthAttachment.loadAction = MTLLoadActionLoad;
-        pass.depthAttachment.storeAction = MTLStoreActionStore;
-        if (pass.depthAttachment.texture.pixelFormat ==
-            MTLPixelFormatDepth32Float_Stencil8) {
-            pass.stencilAttachment.texture = pass.depthAttachment.texture;
-            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
-        }
-    }
     /* All streams use the same captured attachments, textures and raster
-     * state. Geometry reads only their immutable vertex buffers, so prepare
+     * state. Geometry reads only their immutable vertices/remaps, so prepare
      * every producer before opening the shared raster pass. Keep stream and
      * per-primitive front/back ordering in the following draw loop. */
     preparedGeometry = [NSMutableArray new];
+    uint64_t geometrySerial = commands.recordingSerial;
+    enum NV2AMetalPrimitive geometryPrimitive =
+        (enum NV2AMetalPrimitive)pg->primitive_mode;
     for (NSUInteger index = 0; index < vertices.count; index++) {
+        NV2AMetalGeometryContinuation *continuation = nil;
         NSArray<NV2AMetalGeometryResult *> *geometries =
-            [_geometry encodeNativeRasterVertices:vertices[index].buffer
-                                            first:vertices[index].firstVertex
-                                            count:vertices[index].vertexCount
-                                        primitive:(enum NV2AMetalPrimitive)
-                                                      pg->primitive_mode
+            [_geometry encodeNativeRasterSlice:vertices[index]
+                                        primitive:geometryPrimitive
                                            config:&geometry_config
                                            smooth:vertex.smooth
                                    firstProvoking:first_provoking
                                      zPerspective:vertex.zPerspective
                                          commands:commands
+                                     surfaceCache:cache
+                                     continuation:&continuation
                                             error:error];
         if (!geometries)
             goto fail;
-        [preparedGeometry addObject:geometries];
+        BOOL compact = NO;
+        for (NV2AMetalGeometryResult *geometry in geometries)
+            compact |= geometry.compactLines || geometry.compactPolygons;
+        for (NV2AMetalGeometryResult *geometry in geometries) {
+            if (geometry.vertexCount) {
+                if (compact) {
+                    if (!compactGroups) {
+                        compactGroups = [NSMutableData new];
+                        geometryContinuations = [NSMutableArray new];
+                    }
+                    CompactGeometryGroup entry = { preparedGeometry.count,
+                                                   index };
+                    [compactGroups appendBytes:&entry length:sizeof(entry)];
+                    [geometryContinuations
+                        addObject:continuation ?: NSNull.null];
+                }
+                [preparedGeometry addObject:geometries];
+                break;
+            }
+        }
     }
-    rasterTargets = [NSMutableArray new];
-    if (_surfaces.color)
-        [rasterTargets addObject:_surfaces.color];
-    if (_surfaces.zeta)
-        [rasterTargets addObject:_surfaces.zeta];
-    if (![cache prepareRasterPass:pass targets:rasterTargets error:error])
-        goto fail;
+    if (preparedGeometry.count) {
+        /* An incomplete primitive still completes its vertex work. It has
+         * no raster pass and must not reserve or wait for a counter. */
+        if (_query && !_query.discarded) {
+            unsigned mode = 0;
+            for (NV2AMetalGeometryResult *g in preparedGeometry.firstObject)
+                if (g.vertexCount) {
+                    mode =
+                        MIN((unsigned)g.polygonMode, NV2AMetalPolygonLine + 1u);
+                    break;
+                }
+            polygonUniforms[mode] =
+                [fragment uniformsForPolygon:(enum NV2AMetalPolygonMode)mode];
+            preparedModes |= 1u << mode;
+            BOOL zeroSamples =
+                [self hasNoRasterSamplesForPrimitive:geometryPrimitive
+                                              raster:&boundRaster
+                                            geometry:&geometry_config
+                                            uniforms:&polygonUniforms[mode]
+                                               width:viewport.nativeWidth
+                                              height:viewport.nativeHeight];
+            visibility =
+                zeroSamples ?
+                    [_reports allocateZeroSampleCounterWithError:error] :
+                    [_reports allocateCounterWithError:error];
+            if (!visibility)
+                goto fail;
+        }
+        /* Counter pressure may have submitted the producer recording. GPU
+         * attachment borrows need a live cache-owned slot before pass setup. */
+        if (!commands.commandBuffer && ![cache beginRecordingWithError:error])
+            goto fail;
+        pass = [MTL4RenderPassDescriptor new];
+        pass.visibilityResultBuffer = _reports.visibilityBuffer;
+        if (pass.visibilityResultBuffer)
+            pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+        rasterTargets = [NSMutableArray new];
+        if (_surfaces.color) {
+            pass.colorAttachments[0].texture =
+                [_surfaces.color.transfer textureForCommands:commands
+                                                       error:error];
+            if (!pass.colorAttachments[0].texture)
+                goto fail;
+            pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            [rasterTargets addObject:_surfaces.color];
+        }
+        if (_surfaces.zeta) {
+            pass.depthAttachment.texture =
+                [_surfaces.zeta.transfer textureForCommands:commands
+                                                      error:error];
+            if (!pass.depthAttachment.texture)
+                goto fail;
+            pass.depthAttachment.loadAction = MTLLoadActionLoad;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            if (pass.depthAttachment.texture.pixelFormat ==
+                MTLPixelFormatDepth32Float_Stencil8) {
+                pass.stencilAttachment.texture = pass.depthAttachment.texture;
+                pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+            [rasterTargets addObject:_surfaces.zeta];
+        }
+        if (![cache prepareRasterPass:pass targets:rasterTargets error:error])
+            goto fail;
+    }
+    /* Counter pressure or an attachment switch can submit the producer
+     * recording. Compact coverage belongs to that recording, whereas the
+     * retained XF outputs/remaps remain immutable. Recreate only derived
+     * geometry after a successful boundary unless its exact submitted producer
+     * permits an immutable handoff. Never replay fetch/XF or relax the coverage
+     * owner/recording checks. Keep mixed modes together. */
+    if (compactGroups && geometrySerial != commands.recordingSerial) {
+        const CompactGeometryGroup *groups = compactGroups.bytes;
+        NSUInteger count = compactGroups.length / sizeof(*groups);
+        for (NSUInteger index = 0; index < count; index++) {
+            CompactGeometryGroup entry = groups[index];
+            NSArray<NV2AMetalGeometryResult *> *old =
+                preparedGeometry[entry.group];
+            NSArray<NV2AMetalGeometryResult *> *fresh =
+                index < geometryContinuations.count ?
+                    [_geometry continueNativeRasterGeometry:
+                                   geometryContinuations[index]
+                                               surfaceCache:cache
+                                                   commands:commands] :
+                    nil;
+            if (!fresh)
+                fresh = [_geometry encodeNativeRasterSlice:vertices[entry.slice]
+                                                 primitive:geometryPrimitive
+                                                    config:&geometry_config
+                                                    smooth:vertex.smooth
+                                            firstProvoking:first_provoking
+                                              zPerspective:vertex.zPerspective
+                                                  commands:commands
+                                                     error:error];
+            if (!fresh)
+                goto fail;
+            BOOL matches = fresh.count == old.count;
+            for (NSUInteger mode = 0; matches && mode < old.count; mode++) {
+                NV2AMetalGeometryResult *a = old[mode], *b = fresh[mode];
+                matches = a.vertexCount == b.vertexCount &&
+                          a.verticesPerPrimitive == b.verticesPerPrimitive &&
+                          a.primitiveCount == b.primitiveCount &&
+                          a.primitiveType == b.primitiveType &&
+                          a.polygonMode == b.polygonMode &&
+                          a.compactLines == b.compactLines &&
+                          a.compactPolygons == b.compactPolygons &&
+                          a.sourcePrimitive == b.sourcePrimitive;
+                if (matches && (a.compactLines || a.compactPolygons))
+                    matches = a.vertices == b.vertices &&
+                              a.indexedVertices == b.indexedVertices &&
+                              a.sourceVertexCount == b.sourceVertexCount &&
+                              a.physicalVertexCount == b.physicalVertexCount &&
+                              a.firstVertex == b.firstVertex &&
+                              a.indexOffset == b.indexOffset;
+            }
+            if (!matches) {
+                pgraph_draw_error(
+                    error, @"Geometry changed across recording boundary");
+                goto fail;
+            }
+            preparedGeometry[entry.group] = fresh;
+        }
+    }
     /* Finish every fallible pipeline/binding/upload operation before opening
      * the pass. This makes the raster group ready for a shared recording. */
+    NV2AMetalPixelTexture bindings[4] = { 0 };
+    if (preparedGeometry.count &&
+        ![fragment copyTextureBindings:bindings error:error])
+        goto fail;
+    /* The immutable fragment capture is shared by every slice. Only the
+     * polygon offset changes with the mode. The last slot is the original
+     * offset-disabled result for any mode outside the polygon enum. */
     preparedPixels = [NSMutableArray new];
+    if (preparedGeometry.count > 1 || preparedGeometry.firstObject.count > 1)
+        [pixel beginPreparationForPass:pass commands:commands];
     for (NSArray<NV2AMetalGeometryResult *> *geometries in preparedGeometry) {
         BOOL slices =
             geometries.count > 1 && pg->primitive_mode != PRIM_TYPE_POLYGON;
-        NSUInteger rounds = slices ? geometries[0].primitiveCount : 1;
-        for (NSUInteger p = 0; p < rounds; p++) {
+        if (slices) {
+            NSUInteger primitives = geometries[0].primitiveCount;
             for (NV2AMetalGeometryResult *g in geometries) {
-                if (!g.vertexCount)
-                    continue;
-                NSUInteger count =
-                    slices ? g.verticesPerPrimitive : g.vertexCount;
-                NSUInteger offset =
-                    slices ? p * count * sizeof(NV2AMetalVertex) : 0;
-                NV2AMetalPixelUniforms uniforms =
-                    [fragment uniformsForPolygon:g.polygonMode];
-                NV2AMetalPixelTexture bindings[4] = { 0 };
-                NV2AMetalPixelRasterClass rasterClass =
-                    g.directTriangles ?
-                        (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectTriangle |
-                                                    g.directTriangleOptions) :
-                    g.directPoints ? NV2AMetalPixelRasterDirectPoint :
-                    g.directLineMode == NV2AMetalGeometryDirectLineSmooth ?
-                                     NV2AMetalPixelRasterDirectLineSmooth :
-                    g.directLineMode == NV2AMetalGeometryDirectLineFlatFirst ?
-                                     NV2AMetalPixelRasterDirectLineFlatFirst :
-                    g.directLineMode == NV2AMetalGeometryDirectLineFlatLast ?
-                                     NV2AMetalPixelRasterDirectLineFlatLast :
-                    g.expandedLines    ? NV2AMetalPixelRasterExpandedLine :
-                    g.expandedPolygons ? NV2AMetalPixelRasterExpandedPolygon :
-                                         NV2AMetalPixelRasterNative;
-                if (![fragment copyTextureBindings:bindings error:error])
+                if (!g.verticesPerPrimitive || g.primitiveCount != primitives ||
+                    g.vertexCount % g.verticesPerPrimitive ||
+                    g.vertexCount / g.verticesPerPrimitive != primitives) {
+                    pgraph_draw_error(error, @"Invalid mixed geometry group");
                     goto fail;
-                NV2AMetalPixelDraw *prepared = [pixel
-                         prepareGeometry:g
-                                  offset:offset
-                                   count:count
-                                uniforms:&uniforms
+                }
+            }
+        }
+        for (NV2AMetalGeometryResult *g in geometries) {
+            if (!g.vertexCount)
+                continue;
+            enum NV2AMetalPolygonMode polygon = g.polygonMode;
+            unsigned mode = MIN((unsigned)polygon, NV2AMetalPolygonLine + 1u);
+            unsigned bit = 1u << mode;
+            if (!(preparedModes & bit)) {
+                polygonUniforms[mode] = [fragment uniformsForPolygon:polygon];
+                preparedModes |= bit;
+            }
+            NV2AMetalPixelRasterClass rasterClass =
+                g.compactPolygons ?
+                    NV2AMetalPixelRasterCompactPolygon :
+                g.compactLines ?
+                    NV2AMetalPixelRasterCompactLine :
+                g.directPolygonOptions ?
+                    (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectTriangle |
+                                                g.directPolygonOptions) :
+                g.directQuadOptions ?
+                    (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectTriangle |
+                                                g.directQuadOptions) :
+                g.directTriangles ?
+                    (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectTriangle |
+                                                g.directTriangleOptions) :
+                g.directPoints ?
+                    NV2AMetalPixelRasterDirectPoint :
+                g.directLineMode && (g.directLineOptions &
+                                     NV2AMetalDirectLineTopologyMask) ?
+                    (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectMappedLine |
+                                                g.directLineOptions) :
+                g.directLineMode == NV2AMetalGeometryDirectLineSmooth ?
+                    NV2AMetalPixelRasterDirectLineSmooth :
+                g.directLineMode == NV2AMetalGeometryDirectLineFlatFirst ?
+                    NV2AMetalPixelRasterDirectLineFlatFirst :
+                g.directLineMode == NV2AMetalGeometryDirectLineFlatLast ?
+                    NV2AMetalPixelRasterDirectLineFlatLast :
+                g.expandedLines    ? NV2AMetalPixelRasterExpandedLine :
+                g.expandedPolygons ? NV2AMetalPixelRasterExpandedPolygon :
+                                     NV2AMetalPixelRasterNative;
+            NV2AMetalPixelDraw *prepared =
+                [pixel prepareGeometry:g
+                                  offset:0
+                                   count:g.vertexCount
+                                uniforms:&polygonUniforms[mode]
                                 textures:bindings
                                     pass:pass
                                drawState:drawRaster
@@ -971,12 +1295,12 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                     ignorePolygonCulling:g.expandedLines || g.expandedPolygons
                                 commands:commands
                                    error:error];
-                if (!prepared)
-                    goto fail;
-                [preparedPixels addObject:prepared];
-            }
+            if (!prepared)
+                goto fail;
+            [preparedPixels addObject:prepared];
         }
     }
+    [pixel endPreparation];
     if (preparedPixels.count) {
         if (visibility && ![_reports recordCounter:visibility error:error])
             goto fail;
@@ -987,17 +1311,46 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         }
         if (pass.visibilityResultBuffer)
             [renderEncoder
-                setVisibilityResultMode:visibility ?
+                setVisibilityResultMode:visibility.buffer ?
                                             MTLVisibilityResultModeCounting :
                                             MTLVisibilityResultModeDisabled
-                                 offset:visibility ? visibility.offset : 0];
-        for (NV2AMetalPixelDraw *prepared in preparedPixels) {
-            if (![prepared encodeWithRenderEncoder:renderEncoder
-                                          commands:commands
-                                             error:error])
-                goto fail;
-            drew = YES;
+                                 offset:visibility.buffer ? visibility.offset :
+                                                            0];
+        [pixel beginRasterEncoding:renderEncoder];
+        NSUInteger firstPacket = 0;
+        for (NSArray<NV2AMetalGeometryResult *>
+                 *geometries in preparedGeometry) {
+            BOOL slices =
+                geometries.count > 1 && pg->primitive_mode != PRIM_TYPE_POLYGON;
+            NSUInteger rounds = slices ? geometries[0].primitiveCount : 1;
+            NSUInteger packetEnd = firstPacket;
+            for (NSUInteger p = 0; p < rounds; p++) {
+                packetEnd = firstPacket;
+                for (NV2AMetalGeometryResult *g in geometries) {
+                    if (!g.vertexCount)
+                        continue;
+                    NV2AMetalPixelDraw *prepared = preparedPixels[packetEnd++];
+                    BOOL ok =
+                        slices ?
+                            [prepared
+                                encodeWithRenderEncoder:renderEncoder
+                                               commands:commands
+                                            firstVertex:p *
+                                                        g.verticesPerPrimitive
+                                            vertexCount:g.verticesPerPrimitive
+                                                  error:error] :
+                            [prepared encodeWithRenderEncoder:renderEncoder
+                                                     commands:commands
+                                                        error:error];
+                    if (!ok)
+                        goto fail;
+                    drew = YES;
+                }
+            }
+            firstPacket = packetEnd;
         }
+        assert(firstPacket == preparedPixels.count);
+        [pixel endRasterEncoding];
     }
     /* Close before surface bookkeeping, submission and any following producer.
      * Failure above cancels the entire raster recording, including all streams.
@@ -1021,6 +1374,8 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         goto fail;
     if (![_pending consumeUpdate:pending error:error])
         goto fail;
+    if (suffix)
+        [self publishProgramCaptureWitness:vertex];
     if (rebind) {
         _vertexState = vertex;
         _pixelState = fragment;
@@ -1033,6 +1388,8 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         pg->draw_time++;
     return YES;
 fail:
+    [pixel endPreparation];
+    [pixel endRasterEncoding];
     if (originalPending) {
         _pending = originalPending;
         _vertexState = originalVertexState;
@@ -1053,15 +1410,87 @@ fail:
     pg->surface_zeta.draw_dirty = zeta_dirty;
     return NO;
 }
-- (BOOL)transformPendingWithError:(NSError **)error
+/* A host error in a later range must leave earlier results available for
+ * ordered publication after the recording succeeds. */
+- (NSArray *)encodeXFRanges:(NSArray<NV2AMetalPGRAPHFetchBatch *> *)batches
+                    forPlan:(NV2AMetalPendingPlan *)plan
+                     vertex:(NV2AMetalPGRAPHVertexState *)vertex
+                   commands:(NV2AMetalCommands *)commands
+              pendingCurrent:(BOOL)pendingCurrent
+                 encodedWork:(BOOL *)encodedWork
 {
-    return [self transformPendingWithError:error standalone:NO];
+    NSMutableArray *encodings = [NSMutableArray new];
+    NV2AMetalEpochEncoding *previous = nil;
+    *encodedWork = NO;
+    for (NSUInteger i = 0; i < batches.count; i++) {
+        NSError *epochError = nil;
+        NV2AMetalPGRAPHFetchBatch *batch = batches[i];
+        NSUInteger first = plan.prefixCounts[i].unsignedIntegerValue;
+        NSUInteger count = plan.inputs[i].count - first;
+        NSUInteger attributeFirst, physicalCount;
+        if (!fetch_xf_range(batch, plan.inputs[i].count, first, count,
+                            can_deduplicate_vertices(vertex), &attributeFirst,
+                            &physicalCount, &epochError)) {
+            pgraph_draw_error(&epochError,
+                              @"Pending input/fetch vertex count mismatch");
+            [encodings addObject:epochError];
+            break;
+        }
+        if (!count) {
+            [encodings addObject:NSNull.null];
+            continue;
+        }
+        NV2AMetalEpochEncoding *encoded =
+            vertex.programmed && vertex.writeEnable &&
+                    vertex.validatedProgram.mayWriteConstants ?
+                [_epoch encodeSerialRasterState:vertex
+                                attributeBuffer:batch.fetch.attributes
+                                          first:attributeFirst
+                                          count:physicalCount
+                                       previous:previous
+                                 attributeFetch:batch.fetch
+                                       commands:commands
+                                          error:&epochError] :
+                [_epoch
+                    encodeRasterState:vertex
+                      attributeBuffer:batch.fetch.attributes
+                                first:attributeFirst
+                                count:physicalCount
+                       attributeFetch:(vertex.programmed || pendingCurrent) ?
+                                          batch.fetch :
+                                          nil
+                             commands:commands
+                                error:&epochError];
+        if (!encoded) {
+            if (!epochError)
+                pgraph_draw_error(&epochError,
+                                  @"Cannot encode shared XF boundary");
+            [encodings addObject:epochError];
+            break;
+        }
+        [encodings addObject:encoded];
+        *encodedWork = YES;
+        previous = encoded;
+    }
+    return encodings;
 }
-- (BOOL)transformPendingWithError:(NSError **)error standalone:(BOOL)standalone
+
+- (BOOL)consumeCompletedXFProgress:(NV2AMetalPendingProgress *)progress
+                              error:(NSError **)error
+{
+    NV2AMetalPendingUpdate *update =
+        [_pending prepareCompletedProgress:progress error:error];
+    return update && [_pending commitUpdate:update error:error] &&
+           [_pending consumeUpdate:update error:error];
+}
+- (BOOL)transformPendingWithError:(NSError **)error
+                       standalone:(BOOL)standalone
+                          consume:(BOOL)consume
 {
     if (_closed)
         return pgraph_draw_error(error, @"Closed native XF boundary");
-    if (!_active && !standalone)
+    BOOL skipTransform = !_active && !standalone;
+    if (skipTransform && !consume)
         return YES;
     PGRAPHState *pg = &_d->pgraph;
     NSArray<NV2AMetalPendingInput *> *inputs =
@@ -1078,17 +1507,32 @@ fail:
     for (NSUInteger i = 0; i < inputs.count; i++)
         suffix |= inputs[i].count > plan.prefixCounts[i].unsignedIntegerValue;
     /* Program uploads may be incomplete between consecutive method words. */
-    if (!suffix)
-        return YES;
+    if (!suffix || skipTransform) {
+        if (!consume)
+            return YES;
+        NV2AMetalPendingProgress *progress =
+            [_pending beginProgressForPlan:plan error:error];
+        if (!progress)
+            return NO;
+        for (NSUInteger i = 0; i < inputs.count; i++)
+            if (![_pending commitNextSuffix:nil progress:progress error:error])
+                return NO;
+        return [self consumeCompletedXFProgress:progress error:error];
+    }
     NV2AMetalSurfaceCache *cache = _surfaces.cache;
     NV2AMetalPGRAPHVertexState *producer = nil;
     /* A speculative capture is CPU-only. An invalid one keeps the original
      * fetch-first fallback and its error ordering. */
     if (!_active || _vertexCaptureDirty)
-        producer = _nop || standalone ?
-                       capture_only(pg, NULL) :
-                       [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
-                                                                   error:NULL];
+        producer =
+            _nop || standalone ?
+                capture_only(pg, _vertexState ?: [self programCaptureWitness],
+                             NULL) :
+                [[NV2AMetalPGRAPHVertexState alloc]
+                         initWithState:pg
+                    reusingProgramFrom:_vertexState ?:
+                                                      [self programCaptureWitness]
+                                 error:NULL];
     else
         producer = _vertexState;
     BOOL currentQueued = can_queue_captured_context(
@@ -1097,8 +1541,11 @@ fail:
             inputs[0] :
             nil,
         producer, suffix);
-    if (!(currentQueued ? [cache checkpointWithError:error] :
-                          [cache submitWithError:error]))
+    /* Seal the accepted surface work before fetch can append or cancel its
+     * own section. A producer with no VRAM conflict can finish independently;
+     * one that reads pending writes submits the ordered batch with its fetch.
+     * The fetch-first fallback uses the same dependency checks. */
+    if (![cache checkpointWithError:error])
         return NO;
     NV2AMetalPGRAPHInputCheckpoint *checkpoint =
         [[NV2AMetalPGRAPHInputCheckpoint alloc] initWithState:pg error:error];
@@ -1107,8 +1554,9 @@ fail:
     NSArray<NV2AMetalPGRAPHFetchBatch *> *batches = nil;
     NV2AMetalPGRAPHVertexState *vertex = nil, *originalVertexState = nil;
     NV2AMetalPendingJournal *originalPending = nil;
-    NSMutableArray *encodings = nil;
-    BOOL ok = NO, originalCaptureDirty = NO;
+    NV2AMetalPendingProgress *completedProgress = nil;
+    NSArray *encodings = nil;
+    BOOL ok = NO, originalCaptureDirty = NO, encodedWork = NO;
     NSError *restoreError = nil;
     if (producer) {
         if (currentQueued)
@@ -1120,6 +1568,13 @@ fail:
                                                       NV2AMetalInputIndexed ?
                                               inputs[0] :
                                               nil
+                               deduplicateReadonly:can_deduplicate_vertices(
+                                                       producer)
+                               proofAttributeLanes:
+                                   producer.programmed ?
+                                       producer.validatedProgram
+                                           .readonlyProofAttributeLanes64 :
+                                       0
                                              error:error];
         else
             batches = [_fetch
@@ -1130,65 +1585,44 @@ fail:
                                                           NV2AMetalInputIndexed ?
                                                   inputs[0] :
                                                   nil
+                                   deduplicateReadonly:can_deduplicate_vertices(
+                                                           producer)
+                                   proofAttributeLanes:
+                                       producer.programmed ?
+                                           producer.validatedProgram
+                                               .readonlyProofAttributeLanes64 :
+                                           0
                                                  error:error];
         if (!batches || batches.count != inputs.count) {
             if (batches)
                 pgraph_draw_error(error, @"XF boundary input/fetch mismatch");
             goto done;
         }
-        encodings = [NSMutableArray new];
-        NV2AMetalEpochEncoding *previous = nil;
-        for (NSUInteger i = 0; i < batches.count; i++) {
-            NSError *epochError = nil;
-            NSUInteger first = plan.prefixCounts[i].unsignedIntegerValue;
-            if (batches[i].inputVertexCount != inputs[i].count ||
-                batches[i].firstDecodedVertex != first ||
-                batches[i].fetch.vertexCount != inputs[i].count - first) {
-                pgraph_draw_error(&epochError,
-                                  @"Pending input/fetch vertex count mismatch");
-                [encodings addObject:epochError];
-                break;
-            }
-            NSUInteger count = inputs[i].count - first;
-            if (!count) {
-                [encodings addObject:NSNull.null];
-                continue;
-            }
-            NV2AMetalEpochEncoding *encoded =
-                producer.programmed && producer.writeEnable &&
-                        producer.validatedProgram.mayWriteConstants ?
-                    [_epoch encodeSerialRasterState:producer
-                                    attributeBuffer:batches[i].fetch.attributes
-                                              first:0
-                                              count:count
-                                           previous:previous
-                                           commands:_fetch.encodingCommands
-                                              error:&epochError] :
-                    [_epoch encodeRasterState:producer
-                              attributeBuffer:batches[i].fetch.attributes
-                                        first:0
-                                        count:count
-                                     commands:_fetch.encodingCommands
-                                        error:&epochError];
-            if (!encoded) {
-                if (!epochError)
-                    pgraph_draw_error(&epochError,
-                                      @"Cannot encode shared XF boundary");
-                [encodings addObject:epochError];
-                break;
-            }
-            [encodings addObject:encoded];
-            previous = encoded;
-        }
-        /* Preserve successful leading ranges across a later host error, just
-         * as the required-feedback path does. */
-        if ([encodings.lastObject isKindOfClass:NSError.class])
-            currentQueued = NO;
+        encodings = [self encodeXFRanges:batches
+                                 forPlan:plan
+                                  vertex:producer
+                                commands:_fetch.encodingCommands
+                          pendingCurrent:currentQueued
+                             encodedWork:&encodedWork];
+        /* Resolve the successful leading ranges if a later range needs
+         * feedback or has a host encoding error. */
+        currentQueued =
+            currentQueued &&
+            can_queue_encoded_context(encodings, _fetch.encodingCommands);
         if (!(currentQueued ? [_fetch completeCurrentSnapshotsWithError:error] :
                               [_fetch completeWithError:error]))
             goto done;
     } else {
-        batches = [_fetch prepareWithError:error];
+        /* Validate all fetch inputs before retrying the vertex capture, and
+         * wait only for the fetch's own submission. */
+        batches = [_fetch
+            encodeIndependentSnapshotsWithIndexedInput:
+                inputs.count == 1 && inputs[0].kind == NV2AMetalInputIndexed ?
+                    inputs[0] :
+                    nil
+                                                 error:error];
+        if (batches && ![_fetch completeWithError:error])
+            goto done;
     }
     if (!batches || batches.count != inputs.count) {
         if (batches)
@@ -1196,33 +1630,61 @@ fail:
         goto done;
     }
     if (!_active || _vertexCaptureDirty) {
-        vertex = _nop || standalone ?
-                     capture_only(pg, error) :
-                     [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
-                                                                 error:error];
+        vertex =
+            _nop || standalone ?
+                capture_only(pg, producer ?: [self programCaptureWitness],
+                             error) :
+                [[NV2AMetalPGRAPHVertexState alloc]
+                         initWithState:pg
+                    reusingProgramFrom:producer ?: [self programCaptureWitness]
+                                 error:error];
     } else {
         vertex = _vertexState;
     }
-    if (!vertex || (!encodings && (![cache submitWithError:error] ||
-                                   ![cache waitUntilIdleWithError:error])))
+    if (!vertex)
         goto done;
+    if (!producer) {
+        /* Fetch is complete and its faults have priority over the recapture.
+         * Use one private XF recording and chain writable context on GPU. */
+        NV2AMetalCommands *commands = _epoch.commands;
+        if (![commands beginWithError:error])
+            goto done;
+        encodings = [self encodeXFRanges:batches
+                                 forPlan:plan
+                                  vertex:vertex
+                                commands:commands
+                           pendingCurrent:NO
+                              encodedWork:&encodedWork];
+        if (!encodedWork) {
+            [commands cancel];
+        } else {
+            if (![commands submitWithError:error]) {
+                [commands cancel];
+                goto done;
+            }
+            if (![commands waitForSubmission:commands.lastSubmitted
+                                        error:error])
+                goto done;
+        }
+    }
     if (currentQueued) {
         /* A failed host transaction must not retain unsubmitted GPU spans. */
         originalPending = _pending;
         originalVertexState = _vertexState;
         originalCaptureDirty = _vertexCaptureDirty;
-        _pending = [_pending copyForTransaction];
-        if (!_pending) {
-            pgraph_draw_error(error, @"Cannot stage XF-only GPU vertices");
+        _pending = [_pending copyForTransactionWithPlan:plan
+                                             stagedPlan:&plan
+                                                  error:error];
+        if (!_pending)
             goto done;
-        }
     }
     ok = [self transformBatches:batches
-                         inputs:inputs
+                           plan:plan
                          vertex:vertex
                preserveMetadata:NO
                       encodings:encodings
                      pendingGPU:currentQueued
+               completedProgress:&completedProgress
                           error:error] != nil;
 done:
     /* Restore the common controller's input state before accepting GPU work.
@@ -1245,7 +1707,18 @@ done:
             [cache cancel];
         [_fetch cancel];
     }
-    return ok;
+    /* Consume only after Current is restored and any queued work is sealed.
+     * A failed consume leaves the accepted prefix available for retry. */
+    if (!ok || (consume &&
+                ![self consumeCompletedXFProgress:completedProgress
+                                           error:error]))
+        return NO;
+    [self publishProgramCaptureWitness:vertex];
+    return YES;
+}
+- (BOOL)transformPendingWithError:(NSError **)error
+{
+    return [self transformPendingWithError:error standalone:NO consume:NO];
 }
 /* XF precedes rasterization. Finish the current input ranges without issuing
  * raster work, preserving Current/populated/compressed through the checkpoint.
@@ -1253,26 +1726,9 @@ done:
 - (BOOL)transformAndConsumeWithError:(NSError **)error
                           standalone:(BOOL)standalone
 {
-    if (![self transformPendingWithError:error standalone:standalone])
-        return NO;
-    NSArray<NV2AMetalPendingInput *> *inputs =
-        [NV2AMetalPGRAPHPendingInputs inputsWithState:&_d->pgraph
-                                        reusingInputs:_pending.retainedInputs
-                                                error:error];
-    NV2AMetalPendingPlan *plan = inputs ? [_pending planInputs:inputs
-                                              preservingLastArray:YES
-                                                            error:error] :
-                                          nil;
-    if (!plan)
-        return NO;
-    NSMutableArray *completed = [NSMutableArray new];
-    for (NSUInteger i = 0; i < inputs.count; i++)
-        [completed addObject:NSNull.null];
-    NV2AMetalPendingUpdate *update = [_pending preparePlan:plan
-                                                  suffixes:completed
-                                                     error:error];
-    return update && [_pending commitUpdate:update error:error] &&
-           [_pending consumeUpdate:update error:error];
+    return [self transformPendingWithError:error
+                                standalone:standalone
+                                   consume:YES];
 }
 - (BOOL)prepareVertexStateChangeWithError:(NSError **)error
 {
@@ -1312,10 +1768,28 @@ done:
     if (!_active || (!_pending.streamCount && !_vertexCaptureDirty))
         return [NSData data];
     NV2AMetalSurfaceCache *cache = _surfaces.cache;
-    if (![cache submitWithError:error] || ![cache waitUntilIdleWithError:error])
+    /* Surface recordings share one ordered queue. Its newest retained XF
+     * producer also covers any earlier producer still awaiting feedback. */
+    NV2AMetalSurfaceRecording *latest = nil;
+    for (NSArray<NV2AMetalPendingSpan *> *stream in _pending.retainedStreams) {
+        for (NV2AMetalPendingSpan *span in stream) {
+            NV2AMetalSurfaceRecording *producer = span.producerRecording;
+            if (producer.cancelled) {
+                pgraph_draw_error(error, @"Pending XF producer was cancelled");
+                return nil;
+            }
+            if (!producer.completed && producer.serial > latest.serial)
+                latest = producer;
+        }
+    }
+    if (latest && ![cache waitForProducersOfRecording:latest error:error])
+        return nil;
+    /* Private vertex readbacks must not submit unrelated surface work. */
+    NV2AMetalCommands *snapshot = [self snapshotCommandsWithError:error];
+    if (!snapshot)
         return nil;
     NV2AMetalPendingArchive *archive =
-        nv2a_metal_pending_capture(_pending, cache.commands, error);
+        nv2a_metal_pending_capture(_pending, snapshot, error);
     if (!archive)
         return nil;
     uint32_t words[] = { 0x4d345045, _nop ? 2u : 1u,
@@ -1355,6 +1829,7 @@ done:
     _restoredPending = pending;
     _restoredVertexCaptureDirty = ldl_be_p((const uint8_t *)data.bytes + 8) & 1;
     _restoredPendingRawOnly = ldl_be_p((const uint8_t *)data.bytes + 4) == 2;
+    _programCaptureWitness = nil;
     return YES;
 }
 - (void)resetSession
@@ -1428,7 +1903,9 @@ done:
     if (_nop) {
         /* Raster masks do not disable serial vertex-context writes. Capturing
          * XF does not bind surfaces, pixel shaders, textures or a query. */
-        _vertexState = _restoredVertexState ?: capture_only(pg, error);
+        _vertexState =
+            _restoredVertexState ?:
+                capture_only(pg, [self programCaptureWitness], error);
         if (!_vertexState)
             return NO;
         if (_restoredPending) {
@@ -1460,8 +1937,9 @@ done:
                                                    error:error]))
         goto fail;
     if (_restoredBeginSnapshot && restored.textures) {
-        if (![cache submitWithError:error] ||
-            ![cache waitUntilIdleWithError:error])
+        /* Restore uploads use private textures and serialized bytes. Their
+         * queue has no dependency on the prepared guest attachments. */
+        if (![cache collectCompletedWithError:error])
             goto fail;
         NV2AMetalCommands *snapshot = [self snapshotCommandsWithError:error];
         if (!snapshot)
@@ -1486,19 +1964,17 @@ done:
                                                    error:error]))
         goto fail;
     _vertexState = _restoredVertexState ?:
-                       [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
-                                                                   error:error];
+                       [[NV2AMetalPGRAPHVertexState alloc]
+                                initWithState:pg
+                           reusingProgramFrom:[self programCaptureWitness]
+                                        error:error];
     _pixelState = _restoredBeginSnapshot ?
                       [[NV2AMetalPGRAPHPixelState alloc]
                           initWithSnapshot:restored.pixel
                                   textures:textures
                                     device:cache.commands.device
                                      error:error] :
-                      [[NV2AMetalPGRAPHPixelState alloc]
-                          initWithState:pg
-                               textures:textures
-                                 device:cache.commands.device
-                                  error:error];
+                      [self capturePixelStateWithTextures:textures error:error];
     _surfaceBindings = [_surfaces captureBindings];
     if (!_vertexState || !_pixelState || ![cache checkpointWithError:error])
         goto fail;
@@ -1534,7 +2010,7 @@ fail:
                                            error:error];
         if (!next)
             return NO;
-        if (![_surfaces prepareBindings:_surfaceBindings error:error])
+        if (![_surfaces selectBindingsForClear:_surfaceBindings error:error])
             return NO;
     }
     if (![_surfaces clearSurface:parameter error:error])
@@ -1592,6 +2068,7 @@ fail:
 }
 - (void)invalidateSession
 {
+    _programCaptureWitness = nil;
     _restoredVertexState = nil;
     _restoredBeginSnapshot = nil;
     _resumeQuery = _resumeQuery || _active;
@@ -1651,6 +2128,7 @@ fail:
     _query = nil;
     _resumeQuery = NO;
     [_textures flush];
+    _programCaptureWitness = nil;
     return YES;
 }
 - (BOOL)closeWithError:(NSError **)error
@@ -1668,8 +2146,10 @@ fail:
     [_textures close];
     [_fetch close];
     [_pixels removeAllObjects];
+    _lastCapturedRaster = nil;
     _depthStencilCache = nil;
     _closed = YES;
+    _programCaptureWitness = nil;
     return YES;
 }
 - (NSData *)beginSnapshotWithError:(NSError **)error
@@ -1684,16 +2164,28 @@ fail:
         NV2AMetalPGRAPHTextureSnapshot *bound = _pixelState.textureSnapshot;
         if (!bound)
             bound = [NV2AMetalPGRAPHTextureSnapshot emptySnapshot];
-        /* Texture readback uses a private command transaction. Complete the
-         * cache-owned prefix before validating or serializing its bindings. */
-        if (bound.enabledMask &&
-            (![_surfaces.cache submitWithError:error] ||
-             ![_surfaces.cache waitUntilIdleWithError:error]))
-            return nil;
         /* Keep private snapshot transactions off the cache-owned queue so
          * concurrent CPU access checks never observe a foreign recording. */
-        NV2AMetalCommands *snapshot = _surfaces.cache.commands;
+        NV2AMetalSurfaceCache *cache = _surfaces.cache;
+        NV2AMetalCommands *snapshot = cache.commands;
         if (bound.enabledMask) {
+            /* The latest captured producer covers all earlier decodes and
+             * RTT copies on this queue, regardless of texture-stage order. */
+            if (![cache collectCompletedWithError:error])
+                return nil;
+            NV2AMetalSurfaceRecording *latest = nil;
+            for (unsigned stage = 0; stage < 4; stage++) {
+                NV2AMetalSurfaceRecording *producer =
+                    [bound textureAtIndex:stage].producerRecording;
+                if (producer.cancelled) {
+                    pgraph_draw_error(error, @"Captured texture producer was cancelled");
+                    return nil;
+                }
+                if (!producer.completed && producer.serial > latest.serial)
+                    latest = producer;
+            }
+            if (latest && ![cache waitForProducersOfRecording:latest error:error])
+                return nil;
             snapshot = [self snapshotCommandsWithError:error];
             if (!snapshot)
                 return nil;
@@ -1744,6 +2236,7 @@ fail:
         capture.primitive != _d->pgraph.primitive_mode)
         return pgraph_draw_error(error, @"Restored Begin primitive mismatch");
     _restoredBeginSnapshot = [data copy];
+    _programCaptureWitness = nil;
     return YES;
 }
 - (NSData *)vertexSnapshot
@@ -1759,6 +2252,7 @@ fail:
     if (!capture)
         return NO;
     _restoredVertexState = capture;
+    _programCaptureWitness = nil;
     return YES;
 }
 - (NSData *)reportSnapshotWithError:(NSError **)error
@@ -1772,6 +2266,7 @@ fail:
         return NO;
     _query = query;
     _resumeQuery = query != nil;
+    _programCaptureWitness = nil;
     return YES;
 }
 @end

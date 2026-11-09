@@ -8,18 +8,39 @@
 @interface NV2AMetalVertexFixed (SpecializedFixedTest)
 - (id<MTLComputePipelineState>)pipelineForUniforms:
                                    (const NV2AMetalFixedUniforms *)u
-                                           compact:(BOOL)compact;
+                                           compact:(BOOL)compact
+                                             error:(NSError **)error;
+- (id<MTLComputePipelineState>)generalPipelineCompact:(BOOL)compact
+                                               error:(NSError **)error;
+- (id<MTLComputePipelineState>)compilePipelineCompact:(BOOL)compact
+                                           constants:(MTLFunctionConstantValues *)values
+                                               error:(NSError **)error;
 - (NSArray *)compileVariant:(NSData *)key error:(NSError **)error;
 @end
 @interface SpecializedFixedReference : NV2AMetalVertexFixed
+@property(nonatomic) BOOL failPipeline;
 @end
 @implementation SpecializedFixedReference
 - (id<MTLComputePipelineState>)pipelineForUniforms:
                                    (const NV2AMetalFixedUniforms *)u
                                            compact:(BOOL)compact
+                                             error:(NSError **)error
 {
     (void)u;
-    return [self valueForKey:compact ? @"rasterPipeline" : @"pipeline"];
+    return [self generalPipelineCompact:compact error:error];
+}
+- (id<MTLComputePipelineState>)compilePipelineCompact:(BOOL)compact
+                                           constants:(MTLFunctionConstantValues *)values
+                                               error:(NSError **)error
+{
+    if (_failPipeline) {
+        if (error)
+            *error = [NSError errorWithDomain:@"fixed-compile-test"
+                                         code:1
+                                     userInfo:nil];
+        return nil;
+    }
+    return [super compilePipelineCompact:compact constants:values error:error];
 }
 @end
 static NV2AMetalFixedUniforms sf_uniforms(void)
@@ -127,6 +148,38 @@ static void sf_cold_tests(NV2AMetalCommands *commands)
                 inputs[i].attributes[9 + t][k] += (i % 7) * .125f;
     }
     NV2AMetalFixedUniforms u = uniforms();
+    assert(![fixed valueForKey:@"library"] && ![fixed valueForKey:@"compiler"]);
+    begin(commands);
+    assert(!sf_encode(fixed, commands, &u, source, 0, 0, YES, YES).vertexCount);
+    assert(![fixed encodeAttributes:source
+                              first:4100
+                              count:1
+                           uniforms:&u
+                           rasterize:YES
+                    compactRegisters:YES
+                           commands:commands
+                               error:&error] && error);
+    assert(![fixed valueForKey:@"library"]);
+    fixed.failPipeline = YES;
+    error = nil;
+    assert(![fixed encodeAttributes:source
+                              first:3
+                              count:1
+                           uniforms:&u
+                           rasterize:YES
+                    compactRegisters:YES
+                           commands:commands
+                               error:&error] &&
+           [error.domain isEqualToString:@"fixed-compile-test"]);
+    id library = [fixed valueForKey:@"library"];
+    assert(library && ![fixed valueForKey:@"rasterPipeline"] &&
+           ![fixed valueForKey:@"pipeline"]);
+    fixed.failPipeline = NO;
+    sf_encode(fixed, commands, &u, source, 3, 1, YES, YES);
+    id compactPipeline = [fixed valueForKey:@"rasterPipeline"];
+    assert(compactPipeline && ![fixed valueForKey:@"pipeline"] &&
+           [fixed valueForKey:@"library"] == library);
+    finish(commands);
     NSUInteger pairs = 0, vertices = 0;
     for (unsigned n = 0; n < sizeof(counts) / sizeof(*counts); n++) {
         NSUInteger count = counts[n];
@@ -172,6 +225,9 @@ static void sf_cold_tests(NV2AMetalCommands *commands)
     }
     assert(pairs == 14 && vertices == 8842);
     assert(![[fixed valueForKey:@"variants"] count]);
+    assert([fixed valueForKey:@"rasterPipeline"] == compactPipeline);
+    puts("Fixed shader startup: empty and rejected draws compile nothing; "
+         "one layout on demand, injected failure retries with the same library PASS");
     printf("Cold Fixed:14 full/compact pairs,8842 CPU position/texgen/"
            "raster checks,28 general dispatches with no specialization PASS\n");
 }

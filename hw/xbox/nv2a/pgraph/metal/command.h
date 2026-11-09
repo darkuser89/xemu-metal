@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 enum {
     NV2AMetalCommandBatchLimit = 32,
     NV2AMetalCommandBatchExtraBytes = 32 * 1024 * 1024,
+    NV2AMetalCommandTransferScratchLimit = 16 * 1024 * 1024,
 };
 
 /* One immutable submission identity, independent of reusable command slots.
@@ -28,6 +29,13 @@ enum {
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalSubmission : NSObject
 - (BOOL)completedWithError:(NSError *_Nullable *_Nullable)error;
+/* A split batch's producer commits precede its raster commit. Producer
+ * feedback can publish compute-written witnesses while raster resources
+ * remain owned by the full receipt. Ordinary submissions use full feedback.
+ * Known aggregate errors still win; producer success does not promise that
+ * the later raster part succeeds. */
+@property(nonatomic, readonly) BOOL hasSeparateProducerFeedback;
+- (BOOL)completedProducersWithError:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
@@ -46,12 +54,18 @@ API_AVAILABLE(macos(26.0))
  * Zero before the first begin; meaningful only while commandBuffer is set. */
 @property(nonatomic, readonly) uint64_t recordingSerial;
 @property(nonatomic, readonly) NSUInteger sealedBufferCount;
+/* Stable for the entire open batch, including submitted producer prefixes.
+ * Zero without a batch. Section counts are absolute within this generation. */
+@property(nonatomic, readonly) uint64_t batchSerial;
 /* Pressure above the first resource-bearing accepted section. Check only at
  * a successful host transaction boundary; the current section stays
  * cancellable until submit succeeds. One draw's resources may exceed this
  * extra budget, as they can before batching. */
 @property(nonatomic, readonly) BOOL batchNeedsSubmit;
 @property(nonatomic, readonly) BOOL hasPendingRasterPass;
+/* Pure section-state probe; does not seal, submit, or accept work. A closed
+ * raster encoder remains a raster section until the owner seals it. */
+@property(nonatomic, readonly) BOOL recordingAllowsProducerWork;
 
 - (nullable instancetype)initWithError:(NSError *_Nullable *_Nullable)error;
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
@@ -69,6 +83,13 @@ API_AVAILABLE(macos(26.0))
  * encoder is the last encoder in this logical section. End it before seal,
  * submit or cancel. The recording identity stays unchanged. */
 - (BOOL)rasterPassMatches:(MTL4RenderPassDescriptor *)pass;
+/* Detached snapshot of the open raster chain, including visibility state.
+ * The captured parent descriptor is never exposed or modified. */
+- (nullable MTL4RenderPassDescriptor *)copyPendingRasterPass;
+/* Check only this batch's known failure and actual queue-wait receipts.
+ * Does not wait, submit, seal, or inspect unrelated submissions. */
+- (BOOL)validateRasterContinuationWithError:
+    (NSError *_Nullable *_Nullable)error;
 - (nullable id<MTL4RenderCommandEncoder>)
     beginRasterPass:(MTL4RenderPassDescriptor *)pass
               error:(NSError *_Nullable *_Nullable)error;
@@ -76,6 +97,7 @@ API_AVAILABLE(macos(26.0))
 /* Metal 4 does not retain resources referenced by encoded GPU addresses. */
 - (BOOL)addResource:(id<MTLResource>)resource
               error:(NSError *_Nullable *_Nullable)error;
+/* Retain each object identity once through the batch's GPU lifetime. */
 - (BOOL)keepAlive:(id)object error:(NSError *_Nullable *_Nullable)error;
 /* Register a GPU-only dependency on an already submitted source. No queue
  * wait is enqueued until this batch submits; cancel drops only its suffix.
@@ -95,6 +117,16 @@ API_AVAILABLE(macos(26.0))
                                offset:(NSUInteger *)offset
                                 error:(NSError *_Nullable *_Nullable)error;
 
+/* Private, transient transfer scratch, resident and retained by this
+ * slot. Every use must have full queue-stage entry/exit barriers and finish
+ * all scratch reads before its exit; contents never survive as input/state.
+ * Slots are reused only after GPU completion. Cache at most 16 MiB of backing
+ * per slot; larger requests remain standalone. Growth may retain old buffers
+ * until this recording completes. No host writes or cross-queue use. */
+- (nullable id<MTLBuffer>)
+    orderedTransferScratchWithLength:(NSUInteger)length
+                               error:(NSError *_Nullable *_Nullable)error;
+
 /* Register at most one drawable for this recording. Submission waits for the
  * display, commits, signals rendering complete, then presents it. Cancellation
  * releases it without queuing a wait or presentation. Begin recording before
@@ -102,9 +134,25 @@ API_AVAILABLE(macos(26.0))
 - (BOOL)presentDrawableOnSubmit:(id<CAMetalDrawable>)drawable
                           error:(NSError *_Nullable *_Nullable)error;
 
+/* Submit only a sealed producer prefix, preserving later producer sections
+ * and the complete unsubmitted raster chain. No section may be recording.
+ * Repeating a covered cut returns its existing immutable receipt. Resources,
+ * uploads and allocator remain owned until the batch closes and every commit
+ * completes. The owner validates prior queue feedback before CPU publication.
+ */
+- (nullable NV2AMetalSubmission *)
+    submitProducersThroughSectionCount:(NSUInteger)count
+                           batchSerial:(uint64_t)batchSerial
+                                 error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)submitWithError:(NSError *_Nullable *_Nullable)error;
+/* Wait only for this receipt's producer commit. The caller must validate
+ * earlier queue feedback before publishing CPU state; this never releases
+ * the command slot or retires the raster portion of a split submission. */
+- (BOOL)waitForProducersOfSubmission:(NV2AMetalSubmission *)submission
+                               error:(NSError *_Nullable *_Nullable)error;
 /* End this successful section without submitting. The next begin shares its
- * allocator, residency and uploads; submit commits all sections together.
+ * allocator, residency and uploads. Full submit commits the remaining producer
+ * sections and complete raster chain after any earlier producer prefixes.
  * At most NV2AMetalCommandBatchLimit sections may be held. No drawable may be
  * sealed. Sealing invalidates prepared packets for that recording. */
 - (BOOL)sealWithError:(NSError *_Nullable *_Nullable)error;

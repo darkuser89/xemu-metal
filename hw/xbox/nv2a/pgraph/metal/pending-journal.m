@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only */
 #import "pending-journal.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 static BOOL journal_error(NSError **error, NSString *message)
 {
@@ -12,6 +13,134 @@ static BOOL journal_error(NSError **error, NSString *message)
                             userInfo:@{ NSLocalizedDescriptionKey : message }];
     return NO;
 }
+
+/* Bound optional spare storage without imposing a new input-count limit.
+ * The largest PGRAPH index list fits in 2 MiB; larger API inputs retain the
+ * ordinary exact-size NSData capture. Published buffers are never resized. */
+enum {
+    IndexSnapshotInitialCapacity = 64,
+    IndexSnapshotMaximumCapacity = 2 * 1024 * 1024,
+};
+@interface NV2AMetalIndexSnapshotBacking : NSObject
+@property(nonatomic, readonly) void *bytes;
+@property(nonatomic, readonly) NSUInteger capacity;
+@property(nonatomic) NSUInteger publishedLength;
+- (nullable instancetype)initWithCapacity:(NSUInteger)capacity;
+- (void)copyBytes:(const void *)bytes
+           offset:(NSUInteger)offset
+           length:(NSUInteger)length;
+@end
+@implementation NV2AMetalIndexSnapshotBacking
+- (instancetype)initWithCapacity:(NSUInteger)capacity
+{
+    self = [super init];
+    if (!self || !capacity)
+        return nil;
+    _bytes = malloc(capacity);
+    if (!_bytes)
+        return nil;
+    _capacity = capacity;
+    return self;
+}
+- (void)dealloc
+{
+    free(_bytes);
+}
+- (void)copyBytes:(const void *)bytes
+           offset:(NSUInteger)offset
+           length:(NSUInteger)length
+{
+    memcpy((uint8_t *)_bytes + offset, bytes, length);
+}
+@end
+
+/* Each view exposes only its fixed, already initialized prefix. The backing
+ * owns no views or input descriptors, including the most recently published
+ * one. Appending outside an older view's length cannot change its data/hash. */
+@interface NV2AMetalIndexSnapshotData : NSData
+@property(nonatomic, readonly) NV2AMetalIndexSnapshotBacking *backing;
+@property(nonatomic, readonly) NSUInteger length;
+- (instancetype)initWithBacking:(NV2AMetalIndexSnapshotBacking *)backing
+                         length:(NSUInteger)length;
+@end
+@implementation NV2AMetalIndexSnapshotData
+@synthesize length = _length;
+- (instancetype)initWithBacking:(NV2AMetalIndexSnapshotBacking *)backing
+                         length:(NSUInteger)length
+{
+    self = [super init];
+    if (self) {
+        _backing = backing;
+        _length = length;
+    }
+    return self;
+}
+- (const void *)bytes
+{
+    return _backing.bytes;
+}
+- (id)copyWithZone:(NSZone *)zone
+{
+    (void)zone;
+    return self;
+}
+- (Class)classForCoder
+{
+    return NSData.class;
+}
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+    /* Use Foundation's normal wire representation, with no private owner or
+     * unused capacity in the archive. Coding is outside the capture fastpath.
+     */
+    [[NSData dataWithBytes:self.bytes length:_length] encodeWithCoder:coder];
+}
+@end
+
+static NSData *index_snapshot_data(const void *bytes, NSUInteger length,
+                                   NSData *previous)
+{
+    if (length > IndexSnapshotMaximumCapacity)
+        return [NSData dataWithBytes:bytes length:length];
+    if ([previous isKindOfClass:NV2AMetalIndexSnapshotData.class]) {
+        NV2AMetalIndexSnapshotData *old = (id)previous;
+        NV2AMetalIndexSnapshotBacking *backing = old.backing;
+        @synchronized(backing) {
+            /* Recheck under the owner lock: another factory call may have
+             * published a sibling since the live-prefix comparison. Never
+             * overwrite bytes covered by any previously published view. */
+            if (old.length == backing.publishedLength &&
+                length <= backing.capacity) {
+                NSData *view =
+                    [[NV2AMetalIndexSnapshotData alloc] initWithBacking:backing
+                                                                 length:length];
+                if (view) {
+                    [backing copyBytes:(const uint8_t *)bytes + old.length
+                                offset:old.length
+                                length:length - old.length];
+                    backing.publishedLength = length;
+                    return view;
+                }
+                return [NSData dataWithBytes:bytes length:length];
+            }
+        }
+    }
+    NSUInteger capacity = IndexSnapshotInitialCapacity;
+    while (capacity < length)
+        capacity *= 2;
+    NV2AMetalIndexSnapshotBacking *backing =
+        [[NV2AMetalIndexSnapshotBacking alloc] initWithCapacity:capacity];
+    NSData *view =
+        backing ? [[NV2AMetalIndexSnapshotData alloc] initWithBacking:backing
+                                                               length:length] :
+                  nil;
+    if (!view)
+        return [NSData dataWithBytes:bytes length:length];
+    [backing copyBytes:bytes offset:0 length:length];
+    backing.publishedLength = length;
+    return view;
+}
+
 @interface NV2AMetalPendingInput ()
 @property(nonatomic, weak) NV2AMetalPendingInput *verifiedPrefix;
 - (instancetype)initKind:(NV2AMetalInputKind)kind
@@ -87,7 +216,8 @@ static BOOL journal_error(NSError **error, NSString *message)
     return [[self alloc] initKind:NV2AMetalInputIndexed
                             first:0
                             count:count
-                          indices:[NSData dataWithBytes:bytes length:count * 4]
+                          indices:index_snapshot_data(bytes, count * 4,
+                                                       prefix.indices)
                    verifiedPrefix:prefix];
 }
 + (instancetype)inlineKind:(NV2AMetalInputKind)kind count:(NSUInteger)count
@@ -105,18 +235,21 @@ static BOOL journal_error(NSError **error, NSString *message)
 @interface NV2AMetalPendingSpan ()
 - (instancetype)initResource:(id)resource
                        first:(NSUInteger)first
-                       count:(NSUInteger)count;
+                       count:(NSUInteger)count
+           producerRecording:(NV2AMetalSurfaceRecording *)producer;
 @end
 @implementation NV2AMetalPendingSpan
 - (instancetype)initResource:(id)resource
                        first:(NSUInteger)first
                        count:(NSUInteger)count
+           producerRecording:(NV2AMetalSurfaceRecording *)producer
 {
     self = [super init];
     if (self) {
         _resource = resource;
         _first = first;
         _count = count;
+        _producerRecording = producer;
     }
     return self;
 }
@@ -124,9 +257,22 @@ static BOOL journal_error(NSError **error, NSString *message)
                    first:(NSUInteger)first
                    count:(NSUInteger)count
 {
+    return [self resource:resource
+                    first:first
+                    count:count
+        producerRecording:nil];
+}
++ (instancetype)resource:(id)resource
+                   first:(NSUInteger)first
+                   count:(NSUInteger)count
+       producerRecording:(NV2AMetalSurfaceRecording *)producer
+{
     if (!resource || !count || first > NSUIntegerMax - count)
         return nil;
-    return [[self alloc] initResource:resource first:first count:count];
+    return [[self alloc] initResource:resource
+                                first:first
+                                count:count
+                    producerRecording:producer];
 }
 @end
 @class NV2AMetalPendingJournal;
@@ -159,19 +305,27 @@ static BOOL journal_error(NSError **error, NSString *message)
 }
 @end
 @interface NV2AMetalPendingUpdate ()
-@property(nonatomic) NV2AMetalPendingPlan *plan;
-@property(nonatomic) NSUInteger committedVersion;
+@property(nonatomic, weak) NV2AMetalPendingJournal *owner;
+@property(nonatomic) NSArray<NV2AMetalPendingInput *> *inputs;
+@property(nonatomic) NSUInteger version, committedVersion;
 @property(nonatomic) BOOL committed, consumed, partial;
-- (instancetype)initPlan:(NV2AMetalPendingPlan *)plan
-                 streams:(NSArray *)streams;
+- (instancetype)initInputs:(NSArray *)inputs
+                    streams:(NSArray *)streams
+                      owner:(NV2AMetalPendingJournal *)owner
+                    version:(NSUInteger)version;
 @end
 @implementation NV2AMetalPendingUpdate
-- (instancetype)initPlan:(NV2AMetalPendingPlan *)plan streams:(NSArray *)streams
+- (instancetype)initInputs:(NSArray *)inputs
+                    streams:(NSArray *)streams
+                      owner:(NV2AMetalPendingJournal *)owner
+                    version:(NSUInteger)version
 {
     self = [super init];
     if (self) {
-        _plan = plan;
+        _inputs = [inputs copy];
         _streams = [streams copy];
+        _owner = owner;
+        _version = version;
     }
     return self;
 }
@@ -223,6 +377,8 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
     NSUInteger _limit;
     NSMutableArray<NV2AMetalPendingInput *> *_inputs;
     NSMutableArray<NSArray<NV2AMetalPendingSpan *> *> *_streams;
+    NV2AMetalPendingPlan *_lastPlan;
+    BOOL _lastPlanPreservesLastArray;
 }
 - (instancetype)initWithLimit:(NSUInteger)limit
 {
@@ -257,6 +413,17 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
         journal_error(error, @"Invalid pending-stream range transition");
         return nil;
     }
+    /* Descriptors are immutable. Reuse requires the same objects and journal
+     * generation, not just equal counts or a matching vertex prefix. */
+    if (_lastPlan && _lastPlan.version == _generation &&
+        _lastPlanPreservesLastArray == preserve &&
+        inputs.count == _lastPlan.inputs.count) {
+        BOOL same = YES;
+        for (NSUInteger i = 0; same && i < inputs.count; i++)
+            same = inputs[i] == _lastPlan.inputs[i];
+        if (same)
+            return _lastPlan;
+    }
     NSMutableArray *prefixes = [NSMutableArray new],
                    *previous = [NSMutableArray new];
     NSUInteger total = 0;
@@ -289,11 +456,13 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
         journal_error(error, @"Preserved array exceeds pending limit");
         return nil;
     }
-    return [[NV2AMetalPendingPlan alloc] initInputs:inputs
+    _lastPlan = [[NV2AMetalPendingPlan alloc] initInputs:inputs
                                            prefixes:prefixes
                                            previous:previous
                                               owner:self
                                             version:_generation];
+    _lastPlanPreservesLastArray = preserve;
+    return _lastPlan;
 }
 - (NV2AMetalPendingProgress *)beginProgressForPlan:(NV2AMetalPendingPlan *)plan
                                              error:(NSError **)error
@@ -336,11 +505,30 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
                 _streams[i] = segments;
         }
         _generation++;
+        _lastPlan = nil;
         progress.version = _generation;
         progress.published = index + 1;
     }
     progress.nextInput++;
     return YES;
+}
+- (NV2AMetalPendingUpdate *)
+    prepareCompletedProgress:(NV2AMetalPendingProgress *)progress
+                        error:(NSError **)error
+{
+    NV2AMetalPendingPlan *plan = progress.plan;
+    NSUInteger count = plan.inputs.count;
+    if (!progress || plan.owner != self || progress.version != _generation ||
+        _generation >= NSUIntegerMax - 1 || progress.nextInput != count ||
+        count > _streams.count) {
+        journal_error(error, @"Stale or incomplete pending-stream progress");
+        return nil;
+    }
+    return [[NV2AMetalPendingUpdate alloc]
+        initInputs:plan.inputs
+           streams:[_streams subarrayWithRange:NSMakeRange(0, count)]
+             owner:self
+           version:_generation];
 }
 - (NV2AMetalPendingUpdate *)preparePlan:(NV2AMetalPendingPlan *)plan
                                suffixes:(NSArray *)suffixes
@@ -395,23 +583,20 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
         [streams addObject:[segments copy]];
     }
     NSRange range = NSMakeRange(0, completed);
-    NV2AMetalPendingPlan *prefix = [[NV2AMetalPendingPlan alloc]
+    NV2AMetalPendingUpdate *update = [[NV2AMetalPendingUpdate alloc]
         initInputs:[plan.inputs subarrayWithRange:range]
-          prefixes:[plan.prefixCounts subarrayWithRange:range]
-          previous:[plan.previous subarrayWithRange:range]
+           streams:streams
              owner:self
            version:_generation];
-    NV2AMetalPendingUpdate *update =
-        [[NV2AMetalPendingUpdate alloc] initPlan:prefix streams:streams];
     update.partial = partial;
     return update;
 }
 - (BOOL)commitUpdate:(NV2AMetalPendingUpdate *)update error:(NSError **)error
 {
-    if (!update || update.committed || update.plan.owner != self ||
-        update.plan.version != _generation || _generation == NSUIntegerMax)
+    if (!update || update.committed || update.owner != self ||
+        update.version != _generation || _generation == NSUIntegerMax)
         return journal_error(error, @"Stale or repeated pending-stream commit");
-    NSMutableArray *inputs = [update.plan.inputs mutableCopy],
+    NSMutableArray *inputs = [update.inputs mutableCopy],
                    *streams = [update.streams mutableCopy];
     for (NSUInteger i = inputs.count; i < _inputs.count; i++) {
         [inputs addObject:_inputs[i]];
@@ -420,6 +605,7 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
     _inputs = inputs;
     _streams = streams;
     _generation++;
+    _lastPlan = nil;
     update.committed = YES;
     update.committedVersion = _generation;
     return YES;
@@ -427,7 +613,7 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
 - (BOOL)consumeUpdate:(NV2AMetalPendingUpdate *)update error:(NSError **)error
 {
     if (!update || update.partial || !update.committed || update.consumed ||
-        update.plan.owner != self || update.committedVersion != _generation ||
+        update.owner != self || update.committedVersion != _generation ||
         _generation == NSUIntegerMax)
         return journal_error(error,
                              @"Stale or repeated pending-stream consume");
@@ -436,6 +622,7 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
     _inputs = [[_inputs subarrayWithRange:remaining] mutableCopy];
     _streams = [[_streams subarrayWithRange:remaining] mutableCopy];
     _generation++;
+    _lastPlan = nil;
     update.consumed = YES;
     return YES;
 }
@@ -450,10 +637,32 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
     }
     return copy;
 }
+- (NV2AMetalPendingJournal *)
+    copyForTransactionWithPlan:(NV2AMetalPendingPlan *)plan
+                     stagedPlan:(NV2AMetalPendingPlan **)stagedPlan
+                          error:(NSError **)error
+{
+    if (!plan || plan.owner != self || plan.version != _generation ||
+        _generation >= NSUIntegerMax - 1) {
+        journal_error(error, @"Stale pending-stream transaction plan");
+        return nil;
+    }
+    NV2AMetalPendingJournal *copy = [self copyForTransaction];
+    NV2AMetalPendingPlan *bound = copy ? [[NV2AMetalPendingPlan alloc]
+        initInputs:plan.inputs prefixes:plan.prefixCounts previous:plan.previous
+             owner:copy version:plan.version] : nil;
+    if (!bound) {
+        journal_error(error, @"Cannot stage pending-stream transaction plan");
+        return nil;
+    }
+    *stagedPlan = bound;
+    return copy;
+}
 - (void)reset
 {
     _inputs = [NSMutableArray new];
     _streams = [NSMutableArray new];
+    _lastPlan = nil;
     /* Exhausted generations remain exhausted instead of revalidating an old
      * plan. */
     if (_generation < NSUIntegerMax)

@@ -12,6 +12,9 @@
 #import "hw/xbox/nv2a/pgraph/metal/vertex-pgraph.h"
 #import "hw/xbox/nv2a/pgraph/metal/pixel-pgraph.h"
 #import "hw/xbox/nv2a/pgraph/metal/geometry.h"
+#import "hw/xbox/nv2a/pgraph/metal/vertex-writable.h"
+#include "test-metal-vertex-context.h"
+#include <time.h>
 
 #include "test-metal-idx.h"
 
@@ -19,8 +22,9 @@ static NV2AState *state;
 static NV2AMetalSurfaceCache *surfaces;
 static NV2AMetalPGRAPHFetch *adapter;
 static DMAObject dma_a, dma_b;
+static unsigned dma_loads;
 static bool dirty_last;
-static unsigned groups, reads, notifications;
+static unsigned groups, reads, dirty_read_pages, notifications;
 static unsigned chains;
 bool tcg_allowed = true;
 uint64_t memory_region_size(MemoryRegion *mr)
@@ -31,6 +35,7 @@ uint64_t memory_region_size(MemoryRegion *mr)
 DMAObject nv_dma_load(NV2AState *d, hwaddr object)
 {
     assert(d == state && (object == 16 || object == 32));
+    dma_loads++;
     return object == 16 ? dma_a : dma_b;
 }
 bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr address,
@@ -39,6 +44,9 @@ bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr address,
     assert(mr == state->vram && client == DIRTY_MEMORY_NV2A && length &&
            address <= 65536 && length <= 65536 - address);
     reads++;
+    for (hwaddr page = address / 4096;
+         page <= (address + length - 1) / 4096; page++)
+        dirty_read_pages |= 1u << page;
     bool dirty = dirty_last && address + length == 65536;
     if (dirty)
         dirty_last = false;
@@ -92,9 +100,8 @@ static NSArray<NV2AMetalPGRAPHFetchBatch *> *prepare(void)
 static const NV2AMetalProgramInput *values(NV2AMetalPGRAPHFetchBatch *b)
 {
     assert(b.fetch.attributes && b.fetch.faults);
-    const uint32_t *faults = b.fetch.faults.contents;
-    for (NSUInteger i = 0; i < b.fetch.vertexCount; i++)
-        assert(!faults[i]);
+    assert(!b.fetch.faultSummaryOffset && b.fetch.faults.length == 4 &&
+           !*(const uint32_t *)b.fetch.faults.contents);
     return b.fetch.attributes.contents;
 }
 static void cpu_write(NSUInteger address, NSUInteger length)
@@ -165,15 +172,10 @@ static void current_publication_tests(void)
             require([surfaces submitWithError:&error], error);
             require([surfaces waitUntilIdleWithError:&error], error);
             unsigned batch = failure == 2 ? 1 : 0;
-            unsigned slot = failure == 3 ? b[0].fetch.vertexCount : 0;
-            ((uint32_t *)b[batch].fetch.faults.contents)[slot] = 1;
-            if (slot < b[batch].fetch.vertexCount)
-                *(uint32_t *)((uint8_t *)b[batch].fetch.faults.contents +
-                              b[batch].fetch.faultSummaryOffset) = 1;
+            *(uint32_t *)b[batch].fetch.faults.contents =
+                failure == 3 ? UINT32_MAX : 1;
             assert(![adapter completeWithError:&error] && error);
-            assert([error.localizedDescription
-                containsString:failure == 3 ? @"current-attribute" :
-                                              @"vertex fetch"]);
+            assert([error.localizedDescription containsString:@"vertex fetch"]);
         }
         for (unsigned i = 0; i < 16; i++)
             assert(
@@ -184,7 +186,7 @@ static void current_publication_tests(void)
         scalar(pg->vertex_attributes[3].inline_value[0], 5 / 255.f);
         groups++;
     }
-    puts("Metal4 fused Current publication: cancel, first/later/current fault, "
+    puts("Metal4 fused Current publication: cancel, first/later/overflow fault, "
          "unchanged CPU state and four retries PASS");
 }
 
@@ -215,12 +217,7 @@ static void submitted_current_tests(void)
         require([surfaces.commands waitForSubmission:receipt error:&error],
                 error);
         if (failure)
-            ((uint32_t *)b[0]
-                 .fetch.faults
-                 .contents)[failure == 1 ? 0 : b[0].fetch.vertexCount] = 1;
-        if (failure == 1)
-            *(uint32_t *)((uint8_t *)b[0].fetch.faults.contents +
-                          b[0].fetch.faultSummaryOffset) = 1;
+            *(uint32_t *)b[0].fetch.faults.contents = 1u << (failure - 1);
         require([surfaces prepareGPUReadAtAddress:60000 length:4 error:&error],
                 error);
         id recording = surfaces.commands.commandBuffer;
@@ -246,7 +243,7 @@ static void submitted_current_tests(void)
         groups++;
     }
     puts("Submitted Fetch:Current unchanged until owner completion;live later "
-         "recording preserved;duplicate submit rejected;fetch/Current faults "
+         "recording preserved;duplicate submit rejected;fetch faults "
          "cancel only later work,preserve attributes and retry PASS");
 }
 
@@ -945,8 +942,8 @@ static void check_captured_fetch(NSArray<NV2AMetalPGRAPHFetchBatch *> *batches)
         assert(!result.hasCurrent);
         assert(result.attributes.length ==
                result.vertexCount * sizeof(NV2AMetalProgramInput));
-        assert(result.faults.length ==
-               (result.vertexCount ? result.vertexCount + 1 : 0) * 4);
+        assert(!result.faultSummaryOffset &&
+               result.faults.length == (result.vertexCount ? 4 : 0));
         if (!result.vertexCount)
             assert(!result.attributes && !result.faults);
     }
@@ -961,6 +958,1329 @@ static void check_captured_fetch(NSArray<NV2AMetalPGRAPHFetchBatch *> *batches)
 #include "test-metal-current-guard.h"
 #include "test-metal-fetch-prefix-reads.h"
 #include "test-metal-fetch-sparse-reads.h"
+#include "test-metal-fetch-readonly-dedupe.h"
+
+/* The cache owns range metadata, never VRAM readiness or index snapshots. */
+static NSData *index_ranges_reference(const uint32_t *indices, NSUInteger count)
+{
+    NSMutableIndexSet *set = [NSMutableIndexSet new];
+    for (NSUInteger i = 0; i < count; i++)
+        [set addIndex:indices[i]];
+    NSMutableData *result = [NSMutableData new];
+    [set enumerateRangesUsingBlock:^(NSRange range, BOOL *stop) {
+      (void)stop;
+      [result appendBytes:&range length:sizeof(range)];
+    }];
+    return result;
+}
+
+static NSData *index_ranges_run(NV2AMetalPGRAPHFetch *owner,
+                                NV2AMetalPendingInput *input, NSUInteger prefix,
+                                BOOL host)
+{
+    NSError *error = nil;
+    NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+        host ? [owner encodeCurrentSnapshotsWithPrefixes:@[ @(prefix) ]
+                                            indexedInput:input
+                                                   error:&error] :
+               [owner encodeIndependentSnapshotsWithPrefixes:@[ @(prefix) ]
+                                                indexedInput:input
+                                                       error:&error];
+    require(batches != nil, error);
+    if (state->pgraph.vertex_attributes[0].count &&
+        !state->pgraph.vertex_attributes[0].stride) {
+        BOOL completed = YES;
+        require([surfaces tryIdleCPUAccessAtAddress:dma_a.address +
+                    state->pgraph.vertex_attributes[0].offset
+            length:16 write:YES completed:&completed error:&error], error);
+        assert(!completed);
+    }
+    if (host) {
+        require([owner completeCurrentSnapshotsWithError:&error] &&
+                    [surfaces submitWithError:&error] &&
+                    [surfaces waitUntilIdleWithError:&error],
+                error);
+    } else {
+        require([owner completeWithError:&error], error);
+    }
+    PGRAPHState *pg = &state->pgraph;
+    const uint32_t *indices = input ? input.indices.bytes : pg->inline_elements;
+    NSUInteger count = pg->inline_elements_length;
+    assert(batches.count == 1 && batches[0].inputVertexCount == count &&
+           batches[0].firstDecodedVertex == prefix &&
+           batches[0].fetch.vertexCount == count - prefix);
+    if (prefix < count) {
+        const NV2AMetalProgramInput *actual = values(batches[0]);
+        for (NSUInteger i = prefix; i < count; i++)
+            assert(!memcmp(actual[i - prefix].attributes[0],
+                           state->vram_ptr + dma_a.address +
+                               pg->vertex_attributes[0].offset +
+                               indices[i] * pg->vertex_attributes[0].stride,
+                           16));
+    }
+    assert(!memcmp(pg->vertex_attributes[0].inline_value,
+                   state->vram_ptr + dma_a.address +
+                       pg->vertex_attributes[0].offset +
+                       indices[count - 1] * pg->vertex_attributes[0].stride,
+                   16));
+    NSData *cached = [owner valueForKey:@"indexRanges"];
+    BOOL needsIndexRanges = NO;
+    for (unsigned i = 0; i < 16 && !needsIndexRanges; i++)
+        needsIndexRanges = pg->vertex_attributes[i].count &&
+                           pg->vertex_attributes[i].stride;
+    if (cached && needsIndexRanges) {
+        /* The TCG read plan protects the selected Current vertex even
+         * when the entire decoded suffix is already accepted. */
+        NSUInteger firstRead = tcg_allowed ? MIN(prefix, count - 1) : prefix;
+        assert([owner valueForKey:@"indexRangesInput"] == input &&
+               [[owner valueForKey:@"indexRangesPrefix"]
+                   unsignedIntegerValue] == prefix &&
+               cached.length + [[owner valueForKey:@"indexRangesKey"] length] <=
+                   65536 &&
+               ![cached isKindOfClass:NSMutableData.class] &&
+               [cached isEqualToData:index_ranges_reference(indices + firstRead,
+                                                            count - firstRead)]);
+    }
+    groups++;
+    return needsIndexRanges ? cached : nil;
+}
+
+static NV2AMetalCachedSurface *index_ranges_writer(NSUInteger index)
+{
+    NSError *error = nil;
+    NV2AMetalSurfaceConfig config = {
+        .format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+        .width = 4,
+        .height = 1,
+        .pitch = 16,
+        .scale = 1,
+        .color = YES
+    };
+    NV2AMetalCachedSurface *dirty =
+        [surfaces prepareSurfaceAtAddress:dma_a.address + index * 16
+                                   config:&config
+                                    frame:0
+                                    error:&error];
+    NV2AMetalClear *clear =
+        [[NV2AMetalClear alloc] initWithDevice:surfaces.commands.device
+                                         error:&error];
+    NV2AMetalClearConfig c = { .parameter = NV097_CLEAR_SURFACE_COLOR,
+                               .rect = { 0, 0, 4, 1 } };
+    require(dirty && clear &&
+                [clear encodeColor:dirty.transfer.texture
+                              zeta:nil
+                            config:&c
+                          commands:surfaces.commands
+                             error:&error] &&
+                [surfaces markWritten:dirty error:&error] &&
+                [surfaces checkpointWithError:&error],
+            error);
+    return dirty;
+}
+
+static void index_ranges_benchmark(BOOL zeroStride, BOOL changing)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    PGRAPHState *pg = &state->pgraph;
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = zeroStride ? 0 : 16
+    };
+    const float source[4] = { 17, .25f, -2, 1 };
+    cpu_write(dma_a.address, 1024 * sizeof(source));
+    for (unsigned i = 0; i < 1024; i++)
+        memcpy(state->vram_ptr + dma_a.address + i * sizeof(source),
+               source, sizeof(source));
+    unsigned count = zeroStride ? 65536 : 16000;
+    pg->inline_elements_length = count;
+    for (unsigned i = 0; i < count; i++)
+        pg->inline_elements[i] = (i * 25173 + 1) % 1024;
+    double seconds = 0;
+    for (unsigned iteration = 0; iteration < 44; iteration++) {
+        @autoreleasepool {
+            if (changing)
+                for (unsigned i = 0; i < count; i++)
+                    pg->inline_elements[i] = (i * 25173 + iteration * 13 + 1) % 1024;
+            NV2AMetalPendingInput *input = [NV2AMetalPendingInput
+                indexedBytes:pg->inline_elements count:count matchingPrevious:nil];
+            assert(input);
+            struct timespec start, finish;
+            assert(!clock_gettime(CLOCK_MONOTONIC, &start));
+            NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+                [owner encodeIndependentSnapshotsWithPrefixes:@[ @0 ]
+                    indexedInput:input error:&error];
+            assert(!clock_gettime(CLOCK_MONOTONIC, &finish));
+            require(batches != nil, error);
+            if (iteration >= 4)
+                seconds += finish.tv_sec - start.tv_sec +
+                           (finish.tv_nsec - start.tv_nsec) * 1e-9;
+            require([owner completeWithError:&error], error);
+            const NV2AMetalProgramInput *actual = values(batches[0]);
+            assert(batches[0].fetch.vertexCount == count &&
+                   !memcmp(actual[0].attributes[0], source, sizeof(source)) &&
+                   !memcmp(actual[count - 1].attributes[0], source, sizeof(source)) &&
+                   !memcmp(pg->vertex_attributes[0].inline_value, source,
+                           sizeof(source)));
+        }
+    }
+    [owner close];
+    printf("Index plan encoding CPU benchmark: 40 fresh-descriptor encodes, "
+           "%u unsorted dense indices stride%u changing%u %.3f ms PASS; excludes descriptor "
+           "creation and completion waits, no guest/GPU timing\n",
+           count, pg->vertex_attributes[0].stride, (unsigned)changing, seconds * 1000);
+}
+
+static void index_range_word_tests(void)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    PGRAPHState *pg = &state->pgraph;
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = 1
+    };
+    unsigned cases = 0;
+    for (unsigned shape = 0; shape < 8; shape++) {
+        uint32_t words[129];
+        unsigned count = 129;
+        if (shape <= 1)
+            for (unsigned i = 0; i < count; i++)
+                words[i] = UINT32_MAX - 128 + (i * (shape ? 17 : 37)) % 129;
+        if (shape == 2 || shape == 3) {
+            const unsigned offsets[] = { 128, 64, 0, 63, 127, 65 };
+            count = shape == 2 ? 5 : 6;
+            for (unsigned i = 0; i < count; i++)
+                words[i] = 0x80000000u + offsets[i];
+        }
+        if (shape == 4) {
+            const uint32_t wide[] = { UINT32_MAX, 0, 0x80000000u,
+                                      0x7fffffffu, UINT32_MAX, 1 };
+            count = ARRAY_SIZE(wide);
+            memcpy(words, wide, sizeof(wide));
+        }
+        if (shape >= 5)
+            for (unsigned i = 0; i < count; i++)
+                words[i] = shape == 5 ? UINT32_MAX :
+                           shape == 6 ? 0x80000000u + i : UINT32_MAX - i;
+        pg->inline_elements_length = count;
+        memcpy(pg->inline_elements, words, count * sizeof(*words));
+        NV2AMetalPendingInput *input = [NV2AMetalPendingInput
+            indexedBytes:words count:count matchingPrevious:nil];
+        assert(input);
+        const NSUInteger prefixes[] = { 0, count / 2, count - 1, count };
+        for (unsigned hooked = 0; hooked < 2; hooked++)
+            for (unsigned p = 0; p < ARRAY_SIZE(prefixes); p++) {
+                tcg_allowed = hooked;
+                error = nil;
+                VertexAttribute saved[16];
+                memcpy(saved, pg->vertex_attributes, sizeof(saved));
+                pg->compressed_attrs = 0x40;
+                assert(![owner encodeIndependentSnapshotsWithPrefixes:@[ @(prefixes[p]) ]
+                    indexedInput:input error:&error] && error &&
+                    !memcmp(saved, pg->vertex_attributes, sizeof(saved)) &&
+                    pg->compressed_attrs == 0x40 && !surfaces.recording);
+                NSUInteger first = hooked ? MIN(prefixes[p], count - 1) : prefixes[p];
+                NSData *actual = [owner valueForKey:@"indexRanges"];
+                assert(actual && [actual isEqualToData:
+                    index_ranges_reference(words + first, count - first)]);
+                cases++;
+            }
+    }
+    tcg_allowed = true;
+    [owner close];
+    printf("Index range word boundaries: %u bitmap/sort/sorted cases, "
+           "word edges,duplicates,UINT32_MAX,wide domains,exact scratch-budget "
+           "boundary and Current prefixes match an independent index set; "
+           "invalid DMA keeps Current unchanged and prevents GPU dispatch PASS\n", cases);
+}
+
+static void index_range_radix_tests(void)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    PGRAPHState *pg = &state->pgraph;
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = 1
+    };
+    const unsigned lengths[] = { 64, 65, 129, 257, 4096, 65536,
+                                 NV2A_MAX_BATCH_LENGTH };
+    unsigned cases = 0;
+    for (unsigned shape = 0; shape < 6; shape++)
+        for (unsigned n = 0; n < ARRAY_SIZE(lengths); n++) {
+            unsigned count = lengths[n];
+            NSMutableData *words = [NSMutableData dataWithLength:count * 4];
+            uint32_t *indices = words.mutableBytes;
+            for (unsigned i = 0; i < count; i++) {
+                uint32_t v = (i * 25173 + 1) % MIN(count, 2048u);
+                switch (shape) {
+                case 0: indices[i] = v * 2654435761u; break;
+                case 1: indices[i] = 0x80000000u | v * 4093; break;
+                case 2: indices[i] = 0xffffff00u | (v & 255); break;
+                case 3: indices[i] = (v & 1) ? v : UINT32_MAX - v; break;
+                case 4: indices[i] = v * 256 + 0x7ff00000u; break;
+                case 5: indices[i] = 0xff000000u | v * 8179; break;
+                }
+            }
+            /* Keep the global domain sparse even with many duplicates;
+             * shapes 1/2/4 still drive a large shared-byte bucket deeper. */
+            indices[0] = UINT32_MAX;
+            indices[count - 1] = 0;
+            pg->inline_elements_length = count;
+            memcpy(pg->inline_elements, indices, words.length);
+            NV2AMetalPendingInput *input = [NV2AMetalPendingInput
+                indexedBytes:indices count:count matchingPrevious:nil];
+            assert(input);
+            NSData *original = [input.indices copy];
+            const NSUInteger prefixes[] = { 0, count / 2, count - 1, count };
+            for (unsigned hooked = 0; hooked < 2; hooked++)
+                for (unsigned p = 0; p < ARRAY_SIZE(prefixes); p++) {
+                    tcg_allowed = hooked;
+                    error = nil;
+                    VertexAttribute saved[16];
+                    memcpy(saved, pg->vertex_attributes, sizeof(saved));
+                    pg->compressed_attrs = 0x40;
+                    assert(![owner encodeIndependentSnapshotsWithPrefixes:@[ @(prefixes[p]) ]
+                        indexedInput:input error:&error] && error &&
+                        !memcmp(saved, pg->vertex_attributes, sizeof(saved)) &&
+                        pg->compressed_attrs == 0x40 && !surfaces.recording &&
+                        !memcmp(pg->inline_elements, indices, words.length) &&
+                        [input.indices isEqualToData:original]);
+                    NSUInteger first = hooked ? MIN(prefixes[p], count - 1) : prefixes[p];
+                    NSData *actual = [owner valueForKey:@"indexRanges"];
+                    assert(actual && [actual isEqualToData:
+                        index_ranges_reference(indices + first, count - first)]);
+                    cases++;
+                }
+        }
+    tcg_allowed = true;
+    [owner close];
+    printf("Index range radix: %u independent index-set comparisons, "
+           "64/65 boundary, all four bytes, shared-byte buckets, duplicates, "
+           "UINT32_MAX and maximum batch; input and Current unchanged, "
+           "invalid DMA prevents GPU dispatch PASS\n", cases);
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = 16
+    };
+    cpu_write(dma_a.address, 3968 * 16);
+    for (unsigned i = 0; i < 3968; i++)
+        for (unsigned lane = 0; lane < 4; lane++) {
+            float value = i * 10 + lane + .25f;
+            memcpy(state->vram_ptr + dma_a.address + i * 16 + lane * 4,
+                   &value, 4);
+        }
+    const NSUInteger prefixes[] = { 0, 1, 32, 65 };
+    cases = 0;
+    for (unsigned hooked = 0; hooked < 2; hooked++)
+        for (unsigned host = 0; host < 2; host++)
+            for (unsigned p = 0; p < ARRAY_SIZE(prefixes); p++) {
+                tcg_allowed = hooked;
+                pg->inline_elements_length = 65;
+                for (unsigned i = 0; i < 65; i++)
+                    pg->inline_elements[i] = (i * 2377 + p * 11) % 3968;
+                pg->inline_elements[0] = 3967;
+                pg->inline_elements[64] = 0;
+                NV2AMetalPendingInput *input = [NV2AMetalPendingInput
+                    indexedBytes:pg->inline_elements count:65 matchingPrevious:nil];
+                assert(input && index_ranges_run(owner, input, prefixes[p], host));
+                cases++;
+            }
+    tcg_allowed = true;
+    [owner close];
+    printf("Index range radix GPU: %u host/GPU Current,TCG/fallback,"
+           "full/suffix cases across the 64/65 cutoff; exact attributes,"
+           "Current and independent range reference PASS\n", cases);
+}
+
+static void index_ranges_wide_benchmark(void)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    PGRAPHState *pg = &state->pgraph;
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = 1
+    };
+    const unsigned count = 65536;
+    pg->inline_elements_length = count;
+    double seconds = 0;
+    for (unsigned iteration = 0; iteration < 44; iteration++) {
+        @autoreleasepool {
+            for (unsigned i = 0; i < count; i++)
+                pg->inline_elements[i] = (i + iteration * 13) * 2654435761u;
+            pg->inline_elements[0] = UINT32_MAX;
+            NV2AMetalPendingInput *input = [NV2AMetalPendingInput
+                indexedBytes:pg->inline_elements count:count matchingPrevious:nil];
+            assert(input);
+            struct timespec start, finish;
+            error = nil;
+            assert(!clock_gettime(CLOCK_MONOTONIC, &start));
+            NSArray *batches = [owner encodeIndependentSnapshotsWithPrefixes:@[ @0 ]
+                indexedInput:input error:&error];
+            assert(!clock_gettime(CLOCK_MONOTONIC, &finish));
+            assert(!batches && error && !surfaces.recording &&
+                   ![owner valueForKey:@"indexRanges"] &&
+                   !memcmp(pg->inline_elements, input.indices.bytes, count * 4));
+            if (iteration >= 4)
+                seconds += finish.tv_sec - start.tv_sec +
+                           (finish.tv_nsec - start.tv_nsec) * 1e-9;
+        }
+    }
+    [owner close];
+    printf("Index wide plan CPU benchmark: 40 fresh-descriptor plans, "
+           "65536 sparse uint32 indices %.3f ms PASS; invalid DMA after "
+           "range construction, no GPU dispatch or guest timing\n", seconds * 1000);
+}
+
+static NV2AMetalValidatedProgram *constant_read_program(NSError **error)
+{
+    Token tokens[3];
+    tokens[0] = token(NV2AMetalMACMov, 0, 96);
+    source(&tokens[0], 0, 2, 0, 0xe4);
+    destination(&tokens[0], 0x100, 15, 0, 0, 0, 0);
+    tokens[1] = token(NV2AMetalMACArl, 0, 96);
+    tokens[1].word[1] |= 3u << 9;
+    source(&tokens[1], 0, 2, 0, 0);
+    destination(&tokens[1], 0, 0, 0, 0, 0, 0);
+    tokens[2] = token(NV2AMetalMACMov, 0, 96);
+    source(&tokens[2], 0, 3, 0, 0xe4);
+    destination(&tokens[2], 0x103, 15, 0, 0, 0, 0);
+    tokens[2].word[3] |= 3;
+    return [[NV2AMetalValidatedProgram alloc]
+        initWithTokens:tokens[0].word length:3 error:error];
+}
+
+static void constant_float_proof_tests(void)
+{
+    NSError *error = nil;
+    NV2AMetalCommands *commands = surfaces.commands;
+    NV2AMetalWritableProgram *engine = [[NV2AMetalWritableProgram alloc]
+        initWithDevice:commands.device error:&error];
+    require(engine != nil, error);
+    NV2AMetalValidatedProgram *program = constant_read_program(&error);
+    require(program != nil, error);
+    NV2AMetalProgramUniforms u = { 0 };
+    u.surface_size[0] = u.surface_size[1] = 8;
+    u.zmax = 65535;
+    u.point_scale = u.point_size = 1;
+    u.constants[97][1] = u.constants[97][3] = 1;
+    const float data[4] = { 1.25f, -0.5f, 0.25f, 2 };
+    unsigned cases = 0;
+    for (unsigned hostSeed = 0; hostSeed < 2; hostSeed++)
+        for (unsigned components = 1; components <= 4; components++)
+            for (unsigned indexed = 0; indexed < 2; indexed++)
+                for (unsigned access = 0; access < 2; access++) {
+                    require([surfaces discardForRestoreWithError:&error], error);
+                    reset();
+                    PGRAPHState *pg = &state->pgraph;
+                    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+                        initWithState:state surfaces:surfaces error:&error];
+                    require(owner != nil, error);
+                    pg->vertex_attributes[3] = (VertexAttribute){
+                        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+                        .size = 4, .count = components, .stride = 0
+                    };
+                    cpu_write(dma_a.address, sizeof(data));
+                    memcpy(state->vram_ptr + dma_a.address, data, sizeof(data));
+                    if (indexed) {
+                        pg->inline_elements_length = 3;
+                        const uint32_t indices[] = { UINT32_MAX, 4, 2 };
+                        memcpy(pg->inline_elements, indices, sizeof(indices));
+                    } else {
+                        pg->draw_arrays_length = 1;
+                        pg->draw_arrays_start[0] = 2;
+                        pg->draw_arrays_count[0] = 3;
+                    }
+                    NV2AMetalFetchUniforms preview;
+                    [owner getSourcePreview:&preview attributes:1u << 3];
+                    assert(preview.attributes[3].count == components);
+                    NSArray<NV2AMetalPGRAPHFetchBatch *> *seed = hostSeed ?
+                        [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error] :
+                        [owner encodeIndependentSnapshotsWithError:&error];
+                    require(seed != nil, error);
+                    require(hostSeed ? [owner completeCurrentSnapshotsWithError:&error] :
+                                       [owner completeWithError:&error], error);
+                    if (hostSeed)
+                        require([surfaces submitWithError:&error] &&
+                                [surfaces waitUntilIdleWithError:&error], error);
+                    float expected[4] = { 0, 0, 0, 1 };
+                    memcpy(expected, data, components * 4);
+                    [owner getSourcePreview:&preview attributes:1u << 3];
+                    assert(!preview.attributes[3].count &&
+                           !memcmp(preview.attributes[3].inline_value, expected, 16) &&
+                           [program hasFaultFreeReadOnlyAccess:access constants:&u.constants[0][0]
+                                               sourceUniforms:&preview]);
+                    NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+                        [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error];
+                    require(batches != nil && batches.count == 1, error);
+                    NV2AMetalFetchResult *f = batches[0].fetch;
+                    NV2AMetalFetchUniforms proof, raw;
+                    assert([f getSourceUniforms:&raw attributeBuffer:f.attributes
+                             first:0 count:3 commands:commands] &&
+                           [f getReadonlyProofUniforms:&proof attributeBuffer:f.attributes
+                             first:0 count:3 commands:commands] &&
+                           raw.attributes[3].count == components &&
+                           !proof.attributes[3].count &&
+                           !memcmp(proof.attributes[3].inline_value, expected, 16));
+                    assert(![f getReadonlyProofUniforms:&proof attributeBuffer:seed[0].fetch.attributes
+                              first:0 count:3 commands:commands] &&
+                           ![f getReadonlyProofUniforms:&proof attributeBuffer:f.attributes
+                              first:2 count:2 commands:commands]);
+                    NV2AMetalWritableEncoding *candidate = [engine encodeProgram:program
+                        uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                        writeEnable:NO rasterize:YES compactRegisters:YES attributeFetch:f
+                        commands:commands error:&error];
+                    NV2AMetalWritableEncoding *reference = [engine encodeProgram:program
+                        uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                        writeEnable:NO rasterize:YES compactRegisters:NO
+                        commands:commands error:&error];
+                    require(candidate && reference, error);
+                    assert([candidate canUsePendingReadOnlyResultForCommands:commands]);
+                    require([owner completeCurrentSnapshotsWithError:&error] &&
+                            [surfaces submitWithError:&error] &&
+                            [surfaces waitUntilIdleWithError:&error], error);
+                    NV2AMetalWritableResult *actual = [candidate resolveWithError:&error];
+                    NV2AMetalWritableResult *golden = [reference resolveWithError:&error];
+                    require(actual && golden, error);
+                    assert(actual.vertexCount == 3 && golden.vertexCount == 3 &&
+                           actual.vertices.length == golden.vertices.length &&
+                           !memcmp(actual.vertices.contents, golden.vertices.contents, actual.vertices.length) &&
+                           !memcmp(pg->vertex_attributes[3].inline_value, expected, 16) &&
+                           ![f getReadonlyProofUniforms:&proof attributeBuffer:f.attributes
+                               first:0 count:3 commands:commands]);
+                    /* A changed mapping or format cannot borrow the old source value. */
+                    pg->vertex_attributes[3].offset = 16;
+                    [owner getSourcePreview:&preview attributes:1u << 3];
+                    assert(preview.attributes[3].count == components);
+                    pg->vertex_attributes[3].offset = 0;
+                    pg->vertex_attributes[3].stride = 4;
+                    [owner getSourcePreview:&preview attributes:1u << 3];
+                    assert(preview.attributes[3].count == components);
+                    pg->vertex_attributes[3].stride = 0;
+                    cpu_write(dma_a.address, components * 4);
+                    [owner getSourcePreview:&preview attributes:1u << 3];
+                    assert(preview.attributes[3].count == components);
+                    [owner close];
+                    cases++;
+                }
+    printf("Constant Float proof: %u host/GPU-seeded,array/indexed,component/USER-FULL "
+           "cases; bound no-wait admission matches generic GPU vertices,exact Current,"
+           "raw uniforms intact,mapping/stride/write/recording invalidation PASS\n", cases);
+    const uint32_t changed[] = { 0x7fc12345u, 0x447a0000u, 0xbf800000u };
+    cases = 0;
+    for (unsigned value = 0; value < ARRAY_SIZE(changed); value++)
+        for (unsigned access = 0; access < 2; access++) {
+            require([surfaces discardForRestoreWithError:&error], error);
+            reset();
+            PGRAPHState *pg = &state->pgraph;
+            NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+                initWithState:state surfaces:surfaces error:&error];
+            require(owner != nil, error);
+            pg->draw_arrays_length = 1;
+            pg->draw_arrays_count[0] = 3;
+            pg->vertex_attributes[3] = (VertexAttribute){
+                .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+                .size = 4, .count = 4, .stride = 0
+            };
+            cpu_write(dma_a.address, sizeof(data));
+            memcpy(state->vram_ptr + dma_a.address, data, sizeof(data));
+            require([owner encodeIndependentSnapshotsWithError:&error] &&
+                    [owner completeWithError:&error], error);
+            NV2AMetalFetchUniforms preview;
+            [owner getSourcePreview:&preview attributes:1u << 3];
+            assert(!preview.attributes[3].count &&
+                   [program hasFaultFreeReadOnlyAccess:access constants:&u.constants[0][0]
+                                       sourceUniforms:&preview]);
+            cpu_write(dma_a.address, 4);
+            memcpy(state->vram_ptr + dma_a.address, &changed[value], 4);
+            [owner getSourcePreview:&preview attributes:1u << 3];
+            assert(preview.attributes[3].count == 4);
+            NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+                [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error];
+            require(batches != nil, error);
+            NV2AMetalFetchResult *f = batches[0].fetch;
+            NV2AMetalWritableEncoding *candidate = [engine encodeProgram:program
+                uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                writeEnable:NO rasterize:YES compactRegisters:YES attributeFetch:f
+                commands:commands error:&error];
+            NV2AMetalWritableEncoding *reference = [engine encodeProgram:program
+                uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                writeEnable:NO rasterize:YES compactRegisters:NO
+                commands:commands error:&error];
+            require(candidate && reference, error);
+            BOOL valid = value == 2 && access;
+            assert([candidate canUsePendingReadOnlyResultForCommands:commands] == valid);
+            require([owner completeCurrentSnapshotsWithError:&error] &&
+                    [surfaces submitWithError:&error] &&
+                    [surfaces waitUntilIdleWithError:&error], error);
+            error = nil;
+            NV2AMetalWritableResult *actual = [candidate resolveWithError:&error];
+            assert((actual != nil) == valid && (error != nil) == !valid);
+            error = nil;
+            NV2AMetalWritableResult *golden = [reference resolveWithError:&error];
+            assert((golden != nil) == valid && (error != nil) == !valid);
+            if (valid)
+                assert(actual.vertices.length == golden.vertices.length &&
+                       !memcmp(actual.vertices.contents, golden.vertices.contents, actual.vertices.length));
+            [owner getSourcePreview:&preview attributes:1u << 3];
+            assert(!preview.attributes[3].count &&
+                   [program hasFaultFreeReadOnlyAccess:access constants:&u.constants[0][0]
+                                       sourceUniforms:&preview] == valid);
+            [owner close];
+            cases++;
+        }
+    error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    PGRAPHState *pg = &state->pgraph;
+    pg->draw_arrays_length = 1;
+    pg->draw_arrays_count[0] = 3;
+    pg->vertex_attributes[0] = (VertexAttribute){
+        .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        .size = 4, .count = 4, .stride = 0
+    };
+    cpu_write(dma_a.address, sizeof(data));
+    memcpy(state->vram_ptr + dma_a.address, data, sizeof(data));
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner && [owner encodeIndependentSnapshotsWithError:&error] &&
+            [owner completeWithError:&error], error);
+    NV2AMetalFetchUniforms preview;
+    [owner getSourcePreview:&preview attributes:1];
+    assert(!preview.attributes[0].count);
+    require([surfaces prepareGPUWriteAtAddress:dma_a.address length:16 error:&error], error);
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    [surfaces cancel];
+    [owner getSourcePreview:&preview attributes:1];
+    assert(!preview.attributes[0].count);
+    require([surfaces prepareGPUWriteAtAddress:dma_a.address length:16 error:&error] &&
+            [surfaces submitWithError:&error], error);
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    require([surfaces waitUntilIdleWithError:&error] &&
+            [owner encodeIndependentSnapshotsWithError:&error] &&
+            [owner completeWithError:&error], error);
+    pg->vertex_attributes[0].format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K;
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    pg->vertex_attributes[0].format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F;
+    dma_a.address += 16;
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    dma_a.address -= 16;
+    dma_a.limit = 7;
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    dma_a.limit = 65535;
+    NV2AMetalCachedSurface *dirty = index_ranges_writer(0);
+    assert(dirty.dirty);
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    require([surfaces discardForRestoreWithError:&error], error);
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    require([owner encodeIndependentSnapshotsWithError:&error] &&
+            [owner completeWithError:&error], error);
+    NSArray<NV2AMetalPGRAPHFetchBatch *> *cancelled =
+        [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error];
+    require(cancelled != nil, error);
+    [owner cancel];
+    assert(![cancelled[0].fetch getReadonlyProofUniforms:&preview
+                attributeBuffer:cancelled[0].fetch.attributes first:0 count:3 commands:commands]);
+    [owner close];
+    /* A CPU write after the reader retires must not tag old GPU Current
+     * with the newer version observed by the subsequent completion call. */
+    owner = [[NV2AMetalPGRAPHFetch alloc] initWithState:state surfaces:surfaces error:&error];
+    require(owner && [owner encodeIndependentSnapshotsWithError:&error] &&
+            [owner submitWithError:&error] &&
+            [surfaces waitUntilIdleWithError:&error], error);
+    cpu_write(dma_a.address, 4);
+    const float replacement = 2.25f;
+    memcpy(state->vram_ptr + dma_a.address, &replacement, 4);
+    require([owner completeWithError:&error], error);
+    assert(pg->vertex_attributes[0].inline_value[0] == data[0]);
+    [owner getSourcePreview:&preview attributes:1];
+    assert(preview.attributes[0].count == 4);
+    [owner close];
+    printf("Constant Float boundaries: %u changed-source NaN/range/USER-FULL GPU "
+           "agreements; stale preview cannot admit faults,pending/submitted writers,format/DMA/bounds/dirty/restore/"
+           "cancel reject reuse,retired-reader CPU write cannot relabel old Current PASS\n", cases);
+}
+
+static void constant_cmp_components(void)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    PGRAPHState *pg = &state->pgraph;
+    pg->draw_arrays_length = 1;
+    pg->draw_arrays_count[0] = 1;
+    for (unsigned i = 0; i < 16; i++)
+        pg->vertex_attributes[i] = (VertexAttribute){
+            .offset = i * 4, .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP,
+            .size = 4, .count = 1, .stride = 0
+        };
+    NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+        initWithState:state surfaces:surfaces error:&error];
+    require(owner != nil, error);
+    BOOL xSeen[2048] = { 0 }, ySeen[2048] = { 0 }, zSeen[1024] = { 0 };
+    for (unsigned base = 0; base < 2048; base += 16) {
+        uint32_t packed[16];
+        for (unsigned i = 0; i < 16; i++) {
+            unsigned x = base + i, y = (x * 123 + 17) & 2047,
+                     z = (x * 37 + 11) & 1023;
+            packed[i] = x | (y << 11) | (z << 22);
+            xSeen[x] = ySeen[y] = zSeen[z] = YES;
+        }
+        cpu_write(dma_a.address, sizeof(packed));
+        memcpy(state->vram_ptr + dma_a.address, packed, sizeof(packed));
+        NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+            [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error];
+        require(batches != nil, error);
+        NV2AMetalFetchResult *f = batches[0].fetch;
+        NV2AMetalFetchUniforms proof;
+        assert([f getReadonlyProofUniforms:&proof attributeBuffer:f.attributes
+                    first:0 count:1 commands:surfaces.commands]);
+        require([owner completeCurrentSnapshotsWithError:&error] &&
+                [surfaces submitWithError:&error] &&
+                [surfaces waitUntilIdleWithError:&error], error);
+        const NV2AMetalProgramInput *actual = f.attributes.contents;
+        for (unsigned i = 0; i < 16; i++)
+            assert(!proof.attributes[i].count &&
+                   !memcmp(actual->attributes[i], proof.attributes[i].inline_value, 16) &&
+                   !memcmp(pg->vertex_attributes[i].inline_value, actual->attributes[i], 16));
+    }
+    for (unsigned i = 0; i < 2048; i++)
+        assert(xSeen[i] && ySeen[i] && (i >= 1024 || zSeen[i]));
+    [owner close];
+    puts("Constant CMP components: all 2048 X,2048 Y,1024 Z codes covered in "
+         "2048 packed values; all 16 attributes,host proof/Current/GPU Float4 "
+         "bytes identical including negative endpoint clamps PASS");
+}
+
+static void constant_typed_proof_tests(void)
+{
+    enum {
+        D3D = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D,
+        OGL = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL,
+        S1 = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1,
+        RAW = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K,
+        F = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+        CMP = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP
+    };
+    const struct {
+        unsigned format, count;
+        uint32_t bits[4];
+        float first;
+        BOOL nan;
+    } samples[] = {
+        { D3D, 4, { 0x80ff000a }, 10.0f / 255, NO },
+        { OGL, 1, { 255 }, 1, NO },
+        { OGL, 3, { 0x0080ff00 }, 0, NO },
+        { S1, 4, { 0x00008000, 0x7fff4000 }, -1, NO },
+        { S1, 1, { 0x7fff }, 1, NO },
+        { RAW, 4, { 0xffff0001, 0x80007fff }, 1, NO },
+        { RAW, 2, { 0x0000ffff }, -1, NO },
+        { RAW, 3, { 0x7fff }, 32767, NO },
+        { RAW, 1, { 0x8000 }, -32768, NO },
+        { CMP, 1, { (1023u << 11) | (511u << 22) }, 0, NO },
+        { CMP, 1, { 1024u | (1024u << 11) | (512u << 22) }, -1, NO },
+        { CMP, 1, { 511u | (1025u << 11) | (513u << 22) }, 511.0f / 1023, NO },
+        { F, 1, { 0x3f800000 }, 1, NO },
+        { F, 4, { 0x7fc12345, 0, 0, 0x3f800000 }, 0, YES },
+        { F, 3, { 0xbf800000 }, -1, NO },
+    };
+    NSError *error = nil;
+    NV2AMetalCommands *commands = surfaces.commands;
+    NV2AMetalWritableProgram *engine = [[NV2AMetalWritableProgram alloc]
+        initWithDevice:commands.device error:&error];
+    NV2AMetalValidatedProgram *program = constant_read_program(&error);
+    require(engine && program, error);
+    NV2AMetalProgramUniforms u = { 0 };
+    u.surface_size[0] = u.surface_size[1] = 8;
+    u.zmax = 65535;
+    u.point_scale = u.point_size = 1;
+    for (unsigned row = 0; row < 192; row++) {
+        u.constants[row][row % 3] = row + .25f;
+        u.constants[row][3] = 1;
+    }
+    unsigned cases = 0, admitted = 0;
+    for (unsigned sample = 0; sample < ARRAY_SIZE(samples); sample++)
+        for (unsigned hostSeed = 0; hostSeed < 2; hostSeed++)
+            for (unsigned indexed = 0; indexed < 2; indexed++)
+                for (unsigned access = 0; access < 2; access++) {
+                    @autoreleasepool {
+                        const unsigned format = samples[sample].format,
+                                       count = samples[sample].count;
+                        require([surfaces discardForRestoreWithError:&error], error);
+                        reset();
+                        PGRAPHState *pg = &state->pgraph;
+                        pg->vertex_attributes[3] = (VertexAttribute){
+                            .format = format, .count = count, .stride = 0,
+                            .size = format == S1 || format == RAW ? 2 :
+                                    format == D3D || format == OGL ? 1 : 4
+                        };
+                        if (indexed) {
+                            pg->inline_elements_length = 3;
+                            const uint32_t indices[] = { UINT32_MAX, 0, 32767 };
+                            memcpy(pg->inline_elements, indices, sizeof(indices));
+                        } else {
+                            pg->draw_arrays_length = 1;
+                            pg->draw_arrays_start[0] = 9;
+                            pg->draw_arrays_count[0] = 3;
+                        }
+                        cpu_write(dma_a.address, sizeof(samples[sample].bits));
+                        memcpy(state->vram_ptr + dma_a.address, samples[sample].bits,
+                               sizeof(samples[sample].bits));
+                        NV2AMetalPGRAPHFetch *owner = [[NV2AMetalPGRAPHFetch alloc]
+                            initWithState:state surfaces:surfaces error:&error];
+                        require(owner != nil, error);
+                        NSArray *seed = hostSeed ?
+                            [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error] :
+                            [owner encodeIndependentSnapshotsWithError:&error];
+                        require(seed && (hostSeed ? [owner completeCurrentSnapshotsWithError:&error] :
+                                                   [owner completeWithError:&error]), error);
+                        if (hostSeed)
+                            require([surfaces submitWithError:&error] &&
+                                    [surfaces waitUntilIdleWithError:&error], error);
+                        NV2AMetalFetchUniforms preview;
+                        [owner getSourcePreview:&preview attributes:1u << 3];
+                        assert(!preview.attributes[3].count && preview.attributes[3].format == format);
+                        if (samples[sample].nan)
+                            assert(isnan(preview.attributes[3].inline_value[0]));
+                        else
+                            scalar(preview.attributes[3].inline_value[0], samples[sample].first);
+                        /* Equal-width, equal-count F/CMP rebinds still change the source domain. */
+                        pg->vertex_attributes[3].format = format == F ? CMP : F;
+                        [owner getSourcePreview:&preview attributes:1u << 3];
+                        assert(preview.attributes[3].count == count);
+                        pg->vertex_attributes[3].format = format;
+                        NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+                            [owner encodeCurrentSnapshotsWithPrefixes:@[ @0 ] indexedInput:nil error:&error];
+                        require(batches != nil, error);
+                        NV2AMetalFetchResult *f = batches[0].fetch;
+                        NV2AMetalFetchUniforms proof, raw;
+                        assert([f getSourceUniforms:&raw attributeBuffer:f.attributes first:0 count:3 commands:commands] &&
+                               [f getReadonlyProofUniforms:&proof attributeBuffer:f.attributes first:0 count:3 commands:commands] &&
+                               raw.attributes[3].format == format && raw.attributes[3].count == count &&
+                               !proof.attributes[3].count);
+                        NV2AMetalWritableEncoding *candidate = [engine encodeProgram:program
+                            uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                            writeEnable:NO rasterize:YES compactRegisters:YES attributeFetch:f
+                            commands:commands error:&error];
+                        NV2AMetalWritableEncoding *reference = [engine encodeProgram:program
+                            uniforms:&u attributeBuffer:f.attributes first:0 count:3 access:access
+                            writeEnable:NO rasterize:YES compactRegisters:NO
+                            commands:commands error:&error];
+                        require(candidate && reference, error);
+                        BOOL valid = !samples[sample].nan && samples[sample].first <= 95 &&
+                                     samples[sample].first >= (access ? -96 : 0);
+                        assert([candidate canUsePendingReadOnlyResultForCommands:commands] == valid);
+                        require([owner completeCurrentSnapshotsWithError:&error] &&
+                                [surfaces submitWithError:&error] &&
+                                [surfaces waitUntilIdleWithError:&error], error);
+                        const NV2AMetalProgramInput *decoded = f.attributes.contents;
+                        for (unsigned v = 0; v < 3; v++)
+                            assert(!memcmp(decoded[v].attributes[3], proof.attributes[3].inline_value, 16));
+                        assert(!memcmp(pg->vertex_attributes[3].inline_value, proof.attributes[3].inline_value, 16));
+                        error = nil;
+                        NV2AMetalWritableResult *actual = [candidate resolveWithError:&error];
+                        assert((actual != nil) == valid && (error != nil) == !valid);
+                        error = nil;
+                        NV2AMetalWritableResult *golden = [reference resolveWithError:&error];
+                        assert((golden != nil) == valid && (error != nil) == !valid);
+                        if (valid)
+                            assert(actual.vertices.length == golden.vertices.length &&
+                                   !memcmp(actual.vertices.contents, golden.vertices.contents, actual.vertices.length));
+                        [owner close];
+                        error = nil;
+                        cases++;
+                        admitted += valid;
+                    }
+                }
+    printf("Constant typed proof: %u cases,%u admissions; all six formats,"
+           "host/GPU seeds,array/indexed,USER/FULL,CMP clamp,D3D lane order,"
+           "S32K limits,NaN,default lanes,equal-width format rebinds; exact "
+           "decoded GPU bytes and generic XF faults/vertices PASS\n", cases, admitted);
+    constant_cmp_components();
+}
+
+static void index_ranges_tests(void)
+{
+    NSError *error = nil;
+    require([surfaces discardForRestoreWithError:&error], error);
+    reset();
+    NV2AMetalPGRAPHFetch *owner =
+        [[NV2AMetalPGRAPHFetch alloc] initWithState:state
+                                           surfaces:surfaces
+                                              error:&error];
+    require(owner != nil, error);
+    PGRAPHState *pg = &state->pgraph;
+    pg->vertex_attributes[0] =
+        (VertexAttribute){ .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+                           .size = 4,
+                           .count = 4,
+                           .stride = 16 };
+    cpu_write(dma_a.address, 64 * 16);
+    for (unsigned i = 0; i < 64; i++)
+        for (unsigned lane = 0; lane < 4; lane++) {
+            float value = i * 10 + lane + .25f;
+            memcpy(state->vram_ptr + dma_a.address + i * 16 + lane * 4, &value,
+                   4);
+        }
+    pg->inline_elements_length = 128;
+    const uint32_t selection[] = { 0, 1, 4, 7, 8, 15 };
+    for (unsigned i = 0; i < 124; i++)
+        pg->inline_elements[i] = selection[(i * 5) % 6];
+    const uint32_t tail[] = { 15, 7, 4, 0 };
+    memcpy(pg->inline_elements + 124, tail, sizeof(tail));
+    NV2AMetalPendingInput *input =
+        [NV2AMetalPendingInput indexedBytes:pg->inline_elements
+                                      count:128
+                           matchingPrevious:nil];
+    NSData *cached = index_ranges_run(owner, input, 0, NO);
+    assert(cached && cached == index_ranges_run(owner, input, 0, NO));
+    /* Force an existing slice ahead of the indexed suffix in the arena.
+     * Reading from the start of its backing buffer would select vertex 0. */
+    const uint32_t zeros[128] = { 0 };
+    NSUInteger offset = NSUIntegerMax;
+    require([surfaces prepareGPUReadAtAddress:0 length:0 error:&error] &&
+                [surfaces.commands uploadBytes:zeros
+                                        length:sizeof(zeros)
+                                        offset:&offset
+                                         error:&error],
+            error);
+    assert(offset == 0);
+    assert(cached == index_ranges_run(owner, input, 0, YES));
+    NSData *suffix = index_ranges_run(owner, input, 124, NO);
+    assert(suffix != cached && suffix.length == 4 * sizeof(NSRange) &&
+           suffix == index_ranges_run(owner, input, 124, NO));
+
+    /* A warm cache must neither guard nor download a hole in its suffix. */
+    NV2AMetalCachedSurface *dirty = index_ranges_writer(8);
+    unsigned before = notifications;
+    id recording = surfaces.commands.commandBuffer;
+    NV2AMetalSurfaceRecording *token = surfaces.recording;
+    assert(index_ranges_run(owner, input, 124, NO) == suffix && dirty.dirty &&
+           notifications == before && !token.submitted && !token.cancelled &&
+           surfaces.commands.commandBuffer == recording &&
+           surfaces.recording == token);
+
+    /* Equal length and prefix with different indices must protect that hole. */
+    pg->inline_elements[125] = 8;
+    NV2AMetalPendingInput *changed =
+        [NV2AMetalPendingInput indexedBytes:pg->inline_elements
+                                      count:128
+                           matchingPrevious:input];
+    NSData *changedRanges = index_ranges_run(owner, changed, 124, NO);
+    assert(changed != input && changedRanges != suffix && !dirty.dirty &&
+           notifications == before + 1);
+    dirty = index_ranges_writer(4);
+    before = notifications;
+    assert(changedRanges == index_ranges_run(owner, changed, 124, NO) &&
+           !dirty.dirty && notifications == before + 1);
+
+    NSData *last = index_ranges_run(owner, changed, 127, NO);
+    dma_a.limit = 15; /* Current fits; the full input maximum does not. */
+    VertexAttribute saved[16];
+    memcpy(saved, pg->vertex_attributes, sizeof(saved));
+    pg->compressed_attrs = 0x40;
+    error = nil;
+    assert(![owner encodeIndependentSnapshotsWithPrefixes:@[ @127 ]
+                                             indexedInput:changed
+                                                    error:&error] &&
+           error && !memcmp(saved, pg->vertex_attributes, sizeof(saved)) &&
+           pg->compressed_attrs == 0x40 &&
+           [owner valueForKey:@"indexRanges"] == last);
+    dma_a.limit = 65535;
+    assert(index_ranges_run(owner, changed, 127, NO) == last);
+    index_ranges_run(owner, changed, 128, NO);
+    assert(index_ranges_run(owner, changed, 128, YES).length == sizeof(NSRange));
+
+    /* Cancellation preserves pure metadata, not an old read registration. */
+    error = nil;
+    require([owner encodeIndependentSnapshotsWithPrefixes:@[ @124 ]
+                                             indexedInput:changed
+                                                    error:&error] != nil,
+            error);
+    NSData *retry = [owner valueForKey:@"indexRanges"];
+    [owner cancel];
+    assert(retry == index_ranges_run(owner, changed, 124, NO));
+    NV2AMetalPendingInput *equal =
+        [NV2AMetalPendingInput indexedBytes:changed.indices.bytes
+                                      count:128
+                           matchingPrevious:nil];
+    assert(equal != changed &&
+           index_ranges_run(owner, equal, 124, NO) == retry);
+    /* Cross-object reuse is only a range-plan hit. A newly dirty source must
+     * still download before this descriptor's GPU fetch consumes its bytes. */
+    dirty = index_ranges_writer(8);
+    before = notifications;
+    NV2AMetalPendingInput *again = [NV2AMetalPendingInput
+        indexedBytes:equal.indices.bytes count:128 matchingPrevious:nil];
+    assert(index_ranges_run(owner, again, 124, NO) == retry && !dirty.dirty &&
+           notifications == before + 1);
+    assert(!index_ranges_run(owner, nil, 124, NO));
+    pg->inline_elements[125] = 1;
+    assert(!index_ranges_run(owner, nil, 124, NO));
+
+    __weak NV2AMetalPendingInput *weakInput;
+    @autoreleasepool {
+        NV2AMetalPendingInput *temporary =
+            [NV2AMetalPendingInput indexedBytes:pg->inline_elements
+                                          count:128
+                               matchingPrevious:nil];
+        weakInput = temporary;
+        index_ranges_run(owner, temporary, 124, NO);
+    }
+    assert(!weakInput && ![owner valueForKey:@"indexRangesInput"]);
+    NSData *orphan = [owner valueForKey:@"indexRanges"];
+    NV2AMetalPendingInput *replacement = [NV2AMetalPendingInput
+        indexedBytes:pg->inline_elements count:128 matchingPrevious:nil];
+    assert(index_ranges_run(owner, replacement, 124, NO) == orphan);
+
+    /* Constant DMA lanes need one protected element, regardless of indices,
+     * prefix or Current publication mode. Disabled strides do not count. */
+    pg->vertex_attributes[0].stride = 0;
+    pg->vertex_attributes[0].offset = 64;
+    pg->vertex_attributes[15].stride = 64;
+    for (unsigned hooked = 0; hooked < 2; hooked++)
+        for (unsigned host = 0; host < 2; host++)
+            for (unsigned accepted = 0; accepted < 2; accepted++)
+                for (unsigned immutable = 0; immutable < 2; immutable++) {
+                    tcg_allowed = hooked;
+                    assert(!index_ranges_run(owner, immutable ? input : nil,
+                                            accepted ? 128 : 0, host) &&
+                           [owner valueForKey:@"indexRanges"] == orphan);
+                }
+    tcg_allowed = true;
+    dirty = index_ranges_writer(4);
+    before = notifications;
+    assert(!index_ranges_run(owner, input, 0, NO) && !dirty.dirty &&
+           notifications == before + 1);
+    dma_a.limit = 78; /* Offset64 plus a Float4 needs an inclusive limit79. */
+    memcpy(saved, pg->vertex_attributes, sizeof(saved));
+    pg->compressed_attrs = 0x40;
+    error = nil;
+    assert(![owner encodeIndependentSnapshotsWithPrefixes:@[ @0 ]
+        indexedInput:input error:&error] && error &&
+        !memcmp(saved, pg->vertex_attributes, sizeof(saved)) &&
+        pg->compressed_attrs == 0x40);
+    dma_a.limit = 65535;
+    pg->vertex_attributes[0].count = 0;
+    const float inlineValue[4] = { 19, .5f, -2, 1 };
+    memcpy(pg->vertex_attributes[0].inline_value, inlineValue, sizeof(inlineValue));
+    dma_a.dma_class = NV_DMA_IN_MEMORY_CLASS + 1;
+    unsigned loads = dma_loads;
+    error = nil;
+    NSArray<NV2AMetalPGRAPHFetchBatch *> *inlineOnly =
+        [owner encodeIndependentSnapshotsWithPrefixes:@[ @0 ]
+            indexedInput:input error:&error];
+    require(inlineOnly != nil, error);
+    require([owner completeWithError:&error], error);
+    assert(dma_loads == loads && [owner valueForKey:@"indexRanges"] == orphan &&
+           !memcmp(values(inlineOnly[0])[0].attributes[0], inlineValue,
+                   sizeof(inlineValue)));
+    dma_a.dma_class = NV_DMA_IN_MEMORY_CLASS;
+    pg->vertex_attributes[0].count = 4;
+    pg->vertex_attributes[0].stride = 16;
+    pg->vertex_attributes[0].offset = 0;
+    assert(index_ranges_run(owner, replacement, 124, NO) == orphan);
+    puts("Index-independent lanes:16 host/GPU,TCG/fallback,full/suffix,"
+         "immutable/mutable cases skip range plans but protect their source; "
+         "dirty download,invalid DMA bounds,inline-only no-DMA and cached "
+         "plan survives stride changes PASS");
+
+    /* Exercise both sides of the local read-record capacity. The zero-stride
+     * lane is registered once; the nonzero-stride lane has one record per
+     * disjoint index. */
+    pg->vertex_attributes[7] = pg->vertex_attributes[0];
+    pg->vertex_attributes[7].stride = 0;
+    for (unsigned count = 31; count <= 32; count++) {
+        pg->inline_elements_length = count;
+        for (unsigned i = 0; i < count; i++)
+            pg->inline_elements[i] = (count - i - 1) * 2;
+        NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+            [owner encodeIndependentSnapshotsWithPrefixes:@[ @0 ]
+                                              indexedInput:nil error:&error];
+        require(batches != nil, error);
+        NSData *spans = [[owner valueForKey:@"independentReads"]
+            valueForKey:@"spans"];
+        const NV2AMetalVRAMReadPattern *records = spans.bytes;
+        assert(spans.length == (count + 1) * sizeof(*records));
+        assert(records[0].address == dma_a.address && records[0].length == 16);
+        for (unsigned i = 0; i < count; i++)
+            assert(records[i + 1].address == dma_a.address + i * 32 &&
+                   records[i + 1].length == 16 && !records[i + 1].stride);
+        require([owner completeWithError:&error], error);
+        const NV2AMetalProgramInput *decoded = values(batches[0]);
+        for (unsigned i = 0; i < count; i++)
+            assert(!memcmp(decoded[i].attributes[0], state->vram_ptr +
+                               dma_a.address + pg->inline_elements[i] * 16, 16) &&
+                   !memcmp(decoded[i].attributes[7], state->vram_ptr +
+                               dma_a.address, 16));
+    }
+    pg->vertex_attributes[7].count = 0;
+    puts("DMA read record storage: 32 and 33 exact records, disjoint "
+         "indices and zero stride PASS");
+
+    /* Byte strides keep both sides of the metadata budget inside this VRAM. */
+    pg->vertex_attributes[0].stride = 1;
+    for (NSUInteger count = 4096; count <= 4097; count++) {
+        @autoreleasepool {
+            pg->inline_elements_length = count;
+            for (NSUInteger i = 0; i < count; i++)
+                pg->inline_elements[i] = (uint32_t)((count - i - 1) * 2);
+            NV2AMetalPendingInput *large =
+                [NV2AMetalPendingInput indexedBytes:pg->inline_elements
+                                              count:count
+                                   matchingPrevious:nil];
+            NSData *range = index_ranges_run(owner, large, 0, NO);
+            if (count == 4096)
+                assert(range.length == 65536 &&
+                       ![owner valueForKey:@"indexRangesKey"] &&
+                       range == index_ranges_run(owner, large, 0, NO));
+            else
+                assert(!range && !index_ranges_run(owner, large, 0, NO) &&
+                       ![owner valueForKey:@"indexRangesInput"]);
+        }
+    }
+    /* Dense indices leave room for a byte key. The combined budget includes
+     * both its selected input bytes and the immutable range plan. */
+    for (NSUInteger count = 16380; count <= 16381; count++) {
+        @autoreleasepool {
+            pg->inline_elements_length = count;
+            for (NSUInteger i = 0; i < count; i++)
+                pg->inline_elements[i] = (uint32_t)((i * 25173 + 1) % 32);
+            NV2AMetalPendingInput *dense = [NV2AMetalPendingInput
+                indexedBytes:pg->inline_elements count:count matchingPrevious:nil];
+            NSData *range = index_ranges_run(owner, dense, 0, NO);
+            NSData *key = [owner valueForKey:@"indexRangesKey"];
+            assert(range.length == sizeof(NSRange) &&
+                   (count == 16380 ? key.length + range.length == 65536 : !key));
+            NV2AMetalPendingInput *copy = [NV2AMetalPendingInput
+                indexedBytes:pg->inline_elements count:count matchingPrevious:nil];
+            NSData *next = index_ranges_run(owner, copy, 0, NO);
+            assert(count == 16380 ? next == range : next != range);
+        }
+    }
+    pg->inline_elements_length = 128;
+    tcg_allowed = false;
+    NSData *unhooked = index_ranges_run(owner, input, 128, NO);
+    assert(!unhooked.length && [owner valueForKey:@"indexRangesKey"] &&
+           [[owner valueForKey:@"indexRangesFirstRead"] unsignedIntegerValue] == 128);
+    NV2AMetalPendingInput *unhookedCopy = [NV2AMetalPendingInput
+        indexedBytes:input.indices.bytes count:128 matchingPrevious:nil];
+    assert(index_ranges_run(owner, unhookedCopy, 128, NO) == unhooked);
+    tcg_allowed = true;
+    NSData *hooked = index_ranges_run(owner, unhookedCopy, 128, NO);
+    assert(hooked.length == sizeof(NSRange) &&
+           [[owner valueForKey:@"indexRangesFirstRead"] unsignedIntegerValue] == 127);
+    index_ranges_run(owner, input, 124, NO);
+    [owner close];
+    assert(![owner valueForKey:@"indexRanges"] &&
+           ![owner valueForKey:@"indexRangesKey"] &&
+           ![owner valueForKey:@"indexRangesInput"]);
+    require([surfaces discardForRestoreWithError:&error], error);
+    puts("Index range metadata:exact GPU suffix/Current,immutable identity/byte "
+         "and prefix hits/misses,dirty hole and fresh writer protection,full DMA "
+         "rejection/retry,cancel,mutable bypass,weak input,combined 64KiB bound and "
+         "nonzero index upload offset "
+         "PASS");
+}
+
+static unsigned fetch_alias_validations, fetch_alias_disjoint_probes;
+static NV2AMetalCachedSurface *fetch_alias_disjoint_surface;
+static BOOL (*fetch_alias_original_dirty)(id, SEL);
+static BOOL (*fetch_alias_original_validate)(
+    id, SEL, const NV2AMetalVRAMReadPattern *, NSUInteger, NSRange *,
+    NSUInteger *, NSError **);
+
+static BOOL fetch_alias_validate(id object, SEL selector,
+                                 const NV2AMetalVRAMReadPattern *patterns,
+                                 NSUInteger count, NSRange *bounds,
+                                 NSUInteger *nonempty,
+                                 NSError **error)
+{
+    if (object == surfaces)
+        fetch_alias_validations++;
+    return fetch_alias_original_validate(object, selector, patterns, count,
+                                         bounds, nonempty, error);
+}
+
+static BOOL fetch_alias_dirty(id object, SEL selector)
+{
+    if (object == fetch_alias_disjoint_surface)
+        fetch_alias_disjoint_probes++;
+    return fetch_alias_original_dirty(object, selector);
+}
+
+static void fetch_alias_prefix_tests(void)
+{
+    NSError *error = nil;
+    id<MTLDevice> device = surfaces.commands.device;
+    NV2AMetalClear *clear = [[NV2AMetalClear alloc] initWithDevice:device
+                                                           error:&error];
+    require(clear != nil, error);
+    const NSUInteger addresses[] = { 12288, 16896 };
+    const NV2AMetalSurfaceConfig config = {
+        .format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+        .width = 4, .height = 4, .pitch = 16, .scale = 1, .color = YES,
+    };
+    const uint32_t oldColor = 0xff123456;
+    for (unsigned fallback = 0; fallback < 2; fallback++) {
+        require([surfaces discardForRestoreWithError:&error], error);
+        reset();
+        dma_a.address = 0;
+        PGRAPHState *pg = &state->pgraph;
+        pg->draw_arrays_length = pg->draw_arrays_count[0] = 1;
+        NV2AMetalCachedSurface *disjoint =
+            [surfaces prepareSurfaceAtAddress:60000 config:&config frame:1
+                                        error:&error];
+        require(disjoint != nil, error);
+        NV2AMetalCachedSurface *targets[2];
+        for (unsigned i = 0; i < 2; i++) {
+            cpu_write(addresses[i], 64);
+            memcpy(state->vram_ptr + addresses[i], &oldColor, sizeof(oldColor));
+            targets[i] = [surfaces prepareSurfaceAtAddress:addresses[i]
+                                                    config:&config frame:1
+                                                     error:&error];
+            require(targets[i] != nil, error);
+            pg->vertex_attributes[i] = (VertexAttribute){
+                .offset = addresses[i], .count = 4, .size = 1, .stride = 4,
+                .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D,
+            };
+        }
+        require([surfaces submitWithError:&error] &&
+                    [surfaces waitUntilIdleWithError:&error], error);
+        NV2AMetalCommands *readerCommands =
+            [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+        require(readerCommands != nil, error);
+        const NV2AMetalVRAMReadSpan span = { addresses[1], sizeof(oldColor) };
+        NV2AMetalIndependentReads *reader = nil;
+        require([surfaces tryBeginIndependentReads:&span count:1
+                                          commands:readerCommands reads:&reader
+                                             error:&error] && reader, error);
+        id<MTLBuffer> before =
+            [device newBufferWithLength:span.length
+                                options:MTLResourceStorageModeShared];
+        require(before && [readerCommands addResource:before error:&error],
+                error);
+        id<MTL4ComputeCommandEncoder> copy =
+            [readerCommands.commandBuffer computeCommandEncoder];
+        assert(copy);
+        [copy copyFromBuffer:surfaces.vram sourceOffset:span.address
+                   toBuffer:before destinationOffset:0 size:span.length];
+        [copy endEncoding];
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        Ivar ivar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+        id<MTL4CommandQueue> queue = object_getIvar(readerCommands, ivar);
+        assert(gate && queue);
+        [queue waitForEvent:gate value:1];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                         if (!gate.signaledValue)
+                             gate.signaledValue = 2;
+                       });
+        require([surfaces submitIndependentReads:reader error:&error], error);
+        for (unsigned i = 0; i < 2; i++) {
+            NV2AMetalClearConfig color = {
+                .parameter = NV097_CLEAR_SURFACE_COLOR,
+                .rect = { 0, 0, 4, 4 },
+                .uniforms = { .color = { !i, i, 0, 1 } },
+            };
+            require([surfaces prepareSelectedSurface:targets[i]
+                                  discardingContents:YES error:&error] &&
+                        [clear encodeColor:targets[i].transfer.texture zeta:nil
+                                    config:&color commands:surfaces.commands
+                                     error:&error] &&
+                        [surfaces markWritten:targets[i] replacingContents:YES
+                                        error:&error], error);
+        }
+        NV2AMetalSurfaceRecording *prefix = surfaces.recording;
+        require([surfaces checkpointWithError:&error], error);
+        Method validate = class_getInstanceMethod(
+            NV2AMetalSurfaceCache.class,
+            sel_registerName("validateReadPatterns:count:bounds:nonempty:error:"));
+        Method dirty = class_getInstanceMethod(NV2AMetalCachedSurface.class,
+                                               @selector(dirty));
+        assert(validate && dirty);
+        fetch_alias_validations = 0;
+        fetch_alias_disjoint_surface = disjoint;
+        fetch_alias_disjoint_probes = 0;
+        fetch_alias_original_validate =
+            (void *)method_setImplementation(validate, (IMP)fetch_alias_validate);
+        fetch_alias_original_dirty =
+            (void *)method_setImplementation(dirty, (IMP)fetch_alias_dirty);
+        NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
+            fallback ? [adapter encodeIndependentSnapshotsWithError:&error] :
+                       [adapter encodeWithError:&error];
+        method_setImplementation(validate, (IMP)fetch_alias_original_validate);
+        method_setImplementation(dirty, (IMP)fetch_alias_original_dirty);
+        fetch_alias_disjoint_surface = nil;
+        require(batches.count == 1, error);
+        assert(fetch_alias_validations == 1 && fetch_alias_disjoint_probes == 1);
+        NV2AMetalSurfaceRecording *fetch = surfaces.recording;
+        assert(prefix.submitted && fetch && !fetch.submitted &&
+               adapter.encodingCommands == surfaces.commands &&
+               !gate.signaledValue);
+        require([surfaces waitForSubmission:surfaces.commands.lastSubmitted
+                                      error:&error], error);
+        assert(prefix.completed && surfaces.recording == fetch &&
+               !gate.signaledValue);
+        require([adapter submitWithError:&error], error);
+        gate.signaledValue = 1;
+        require([adapter completeWithError:&error] &&
+                    [surfaces completeIndependentReads:reader error:&error],
+                error);
+        assert(!memcmp(before.contents, &oldColor, sizeof(oldColor)));
+        const NV2AMetalProgramInput *decoded = values(batches[0]);
+        scalar(decoded->attributes[0][0], 1);
+        scalar(decoded->attributes[0][1], 0);
+        scalar(decoded->attributes[1][0], 0);
+        scalar(decoded->attributes[1][1], 1);
+        scalar(pg->vertex_attributes[0].inline_value[2], 1);
+        scalar(pg->vertex_attributes[1].inline_value[1], 1);
+    }
+    require([surfaces discardForRestoreWithError:&error], error);
+    puts("Fetch alias prefix: shared and fallback queues submit prior clears "
+         "ahead of the gated second attribute; both decoded values and "
+         "Current match; one DMA batch validation on either path, "
+         "one dirty surface scan PASS");
+    groups++;
+}
+#include "test-metal-array-range-plan.h"
+#include "test-metal-readonly-index-plan.h"
+#include "test-metal-readonly-index-plan-reuse.h"
+#include "test-metal-float-proof-capture.h"
+#include "test-metal-indexed-float-capture.h"
+#include "test-metal-float-summary-memo.h"
+#include "test-metal-array-float-windows.h"
+
 int main(int argc, char **argv)
 {
     @autoreleasepool {
@@ -985,7 +2305,9 @@ int main(int argc, char **argv)
                 didWriteVRAM:^(NSUInteger address, NSUInteger length) {
                   assert(((address == 12288 || address == 16896) &&
                           length == 64) ||
-                         (address == 65520 && length == 16));
+                         ((address == 1088 || address == 1152 ||
+                           address == 65520) &&
+                          length == 16));
                   notifications++;
                 }
                        error:&error];
@@ -994,6 +2316,74 @@ int main(int argc, char **argv)
                                                      surfaces:surfaces
                                                         error:&error];
         require(adapter != nil, error);
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--array-float-windows")))
+            array_float_windows_tests();
+        if (argc == 2 && !strcmp(argv[1], "--array-float-windows"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--readonly-index-plan-reuse")))
+            readonly_index_plan_reuse_tests();
+        if (argc == 2 && !strcmp(argv[1], "--readonly-index-plan-reuse"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--float-summary-memo")))
+            float_summary_memo_tests();
+        if (argc == 2 && !strcmp(argv[1], "--float-summary-memo"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--indexed-float-capture")))
+            indexed_float_capture_tests();
+        if (argc == 2 && !strcmp(argv[1], "--indexed-float-capture"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--float-proof-capture")))
+            float_proof_capture_tests();
+        if (argc == 2 && !strcmp(argv[1], "--float-proof-capture"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--readonly-index-plan")))
+            readonly_index_plan_tests();
+        if (argc == 2 && !strcmp(argv[1], "--readonly-index-plan"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--array-range-plan")))
+            array_range_plan_tests();
+        if (argc == 2 && !strcmp(argv[1], "--array-range-plan"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--readonly-dedupe")))
+            fetch_readonly_dedupe_tests();
+        if (argc == 2 && !strcmp(argv[1], "--readonly-dedupe"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--constant-typed-proof")))
+            constant_typed_proof_tests();
+        if (argc == 2 && !strcmp(argv[1], "--constant-typed-proof"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--constant-float-proof")))
+            constant_float_proof_tests();
+        if (argc == 2 && !strcmp(argv[1], "--constant-float-proof"))
+            goto close;
+        if (argc == 2 && !strcmp(argv[1], "--index-ranges-wide-benchmark")) {
+            index_ranges_wide_benchmark();
+            goto close;
+        }
+        if (argc == 2 &&
+            (!strcmp(argv[1], "--index-ranges-benchmark") ||
+             !strcmp(argv[1], "--index-ranges-zero-stride-benchmark") ||
+             !strcmp(argv[1], "--index-ranges-changing-benchmark"))) {
+            index_ranges_benchmark(!strcmp(argv[1], "--index-ranges-zero-stride-benchmark"),
+                                   !strcmp(argv[1], "--index-ranges-changing-benchmark"));
+            goto close;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--index-range-words")))
+            index_range_word_tests();
+        if (argc == 2 && !strcmp(argv[1], "--index-range-words"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--index-range-radix")))
+            index_range_radix_tests();
+        if (argc == 2 && !strcmp(argv[1], "--index-range-radix"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--index-ranges")))
+            index_ranges_tests();
+        if (argc == 2 && !strcmp(argv[1], "--index-ranges"))
+            goto close;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--current-guard")))
             current_guard_tests();
         if (argc == 2 && !strcmp(argv[1], "--current-guard"))
@@ -1040,6 +2430,7 @@ int main(int argc, char **argv)
             goto close;
         }
         independent_snapshot_tests();
+        fetch_alias_prefix_tests();
         if (argc == 2 && !strcmp(argv[1], "--independent-snapshots"))
             goto close;
         assert(argc == 1);

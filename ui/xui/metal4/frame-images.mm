@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #import "frame-images.h"
 #import "hw/xbox/nv2a/pgraph/metal/scanout-pgraph.h"
+#import "hw/xbox/nv2a/pgraph/metal/shader-library.h"
 #include "frame-images-source.h"
 #include <fpng.h>
 #include <cmath>
@@ -10,16 +11,24 @@
 #include <vector>
 
 static std::mutex capture_lock;
+static NV2AMetalFramebuffer *capture_frame;
 static id<MTLTexture> capture_texture;
 static NV2AMetalDisplayUniforms capture_uniforms;
 static BOOL capture_screen_off;
+/* Retain only the current capture device's immutable RGB module. A capture
+ * keeps its own local reference across compilation; clearing/changing the
+ * published device releases this cache without invalidating an active call. */
+static NV2AMetalShaderLibrary *capture_rgb_module;
 
 void xemu_metal4_set_capture_frame(void *handle)
 {
     @autoreleasepool {
         NV2AMetalFramebuffer *frame = (__bridge NV2AMetalFramebuffer *)handle;
         std::lock_guard<std::mutex> guard(capture_lock);
+        capture_frame = frame;
         capture_texture = frame.texture;
+        if (capture_rgb_module.library.device != capture_texture.device)
+            capture_rgb_module = nil;
         capture_uniforms =
             frame ? frame.displayUniforms : NV2AMetalDisplayUniforms{};
         capture_screen_off = frame.screenOff;
@@ -62,26 +71,28 @@ static bool capture_size(NSUInteger source_width, NSUInteger source_height,
 static id<MTLComputePipelineState> rgb_pipeline(id<MTLDevice> device,
                                                 NSError **error)
 {
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler)
+    NV2AMetalShaderLibrary *module;
+    {
+        std::lock_guard<std::mutex> guard(capture_lock);
+        if (capture_rgb_module.library.device == device)
+            module = capture_rgb_module;
+    }
+    if (!module)
+        module = [NV2AMetalShaderLibrary sharedWithDevice:device
+                                                   source:metal_shader_source
+                                                    error:error];
+    id<MTLComputePipelineState> pipeline =
+        [module computeFunction:@"xemu_capture_rgb" error:error];
+    if (!pipeline)
         return nil;
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    id<MTLLibrary> lib = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!lib)
-        return nil;
-    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-    fn.library = lib;
-    fn.name = @"xemu_capture_rgb";
-    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-    pd.computeFunctionDescriptor = fn;
-    return [compiler newComputePipelineStateWithDescriptor:pd
-                                       compilerTaskOptions:nil
-                                                     error:error];
+    {
+        std::lock_guard<std::mutex> guard(capture_lock);
+        /* An older capture may finish after its frame was withdrawn. Do not
+         * republish its module for an absent or different current device. */
+        if (capture_texture.device == device)
+            capture_rgb_module = module;
+    }
+    return pipeline;
 }
 
 void *xemu_metal4_capture_png(float aspect, uint32_t max_width,
@@ -91,11 +102,13 @@ void *xemu_metal4_capture_png(float aspect, uint32_t max_width,
         return nullptr;
     *size = 0;
     @autoreleasepool {
+        NV2AMetalFramebuffer *frame;
         id<MTLTexture> source;
         NV2AMetalDisplayUniforms u;
         BOOL screen_off;
         {
             std::lock_guard<std::mutex> guard(capture_lock);
+            frame = capture_frame;
             source = capture_texture;
             u = capture_uniforms;
             screen_off = capture_screen_off;
@@ -138,6 +151,7 @@ void *xemu_metal4_capture_png(float aspect, uint32_t max_width,
         u.scale[0] = u.scale[1] = 1;
         if (!target || !rgb || !arguments ||
             ![commands beginWithError:&error] ||
+            ![commands keepAlive:frame error:&error] ||
             ![display encodeWithCommands:commands
                                   source:source
                                   target:target

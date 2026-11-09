@@ -218,6 +218,46 @@ static void programmable_tests(void)
     memcpy(pg->vsh_constants[5], color, 16);
     NV2AMetalPGRAPHVertexState *s = capture();
     assert(s.programmed && s.programBytes.length == 32 && !s.dynamicAddressing);
+    NSError *error = nil;
+    constant(5, 2, .125f);
+    pg->vertex_attributes[0].inline_value[3] = .5f;
+    pg->compressed_attrs = 1;
+    NV2AMetalPGRAPHVertexState *recaptured =
+        [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
+                                     reusingProgramFrom:s
+                                                   error:&error];
+    require(recaptured != nil, error);
+    assert(recaptured.validatedProgram == s.validatedProgram &&
+           recaptured.programUniforms.constants[5][2] == .125f &&
+           s.programUniforms.constants[5][2] == .75f &&
+           recaptured.inlineValues.attributes[0][3] == .5f &&
+           recaptured.compressedAttributes == 1);
+    pg->surface_scale_factor = 0;
+    pg->enable_vertex_program_write = true;
+    NV2AMetalPGRAPHVertexState *rawCapture =
+        [[NV2AMetalPGRAPHVertexState alloc] initRawXFWithState:pg
+                                        reusingProgramFrom:recaptured
+                                                      error:&error];
+    require(rawCapture != nil, error);
+    assert(rawCapture.validatedProgram == s.validatedProgram &&
+           rawCapture.rasterDiscard && rawCapture.writeEnable &&
+           rawCapture.programUniforms.surface_size[0] == 0 &&
+           rawCapture.programUniforms.constants[5][2] == .125f);
+    pg->surface_scale_factor = 2;
+    pg->enable_vertex_program_write = false;
+    mov(10, 0, 0, false, true);
+    NV2AMetalPGRAPHVertexState *shortened =
+        [[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
+                                     reusingProgramFrom:s
+                                                   error:&error];
+    require(shortened != nil, error);
+    assert(shortened.validatedProgram != s.validatedProgram &&
+           shortened.programBytes.length == 16);
+    pg->program_data[10][1] |= 15u << 21;
+    assert(![[NV2AMetalPGRAPHVertexState alloc] initWithState:pg
+                                         reusingProgramFrom:s
+                                                       error:&error] && error);
+    error = nil;
     NV2AMetalProgramInput input = { 0 };
     float position[] = { 1.375f, 2.5625f, 32768, 1 };
     memcpy(input.attributes[0], position, 16);
@@ -238,7 +278,6 @@ static void programmable_tests(void)
     NSMutableData *old = [s.snapshotData mutableCopy];
     ((uint8_t *)old.mutableBytes)[7] = 1;
     ((uint8_t *)old.mutableBytes)[11] &= 15;
-    NSError *error = nil;
     NV2AMetalPGRAPHVertexState *legacy =
         [[NV2AMetalPGRAPHVertexState alloc] initWithSnapshot:old error:&error];
     require(legacy != nil, error);

@@ -18,6 +18,12 @@ static void dma_current_tests(void)
             cpu_write(0, 65536);
             PGRAPHState *pg = &state->pgraph;
             uint32_t before[16][4];
+            unsigned layout = test % 4;
+            if (layout == 3) {
+                pg->dma_vertex_b = pg->dma_vertex_a;
+                dma_b = dma_a;
+            }
+            unsigned expectedLoads = layout == 0 ? 2 : 1;
             for (unsigned a = 0; a < 16; a++) {
                 VertexAttribute *v = &pg->vertex_attributes[a];
                 v->format = formats[(test + a) % 6];
@@ -43,7 +49,8 @@ static void dma_current_tests(void)
                         0 :
                         nv2a_metal_attribute_size(v->format, v->count) + 3;
                 v->offset = 513 + (a / 2) * 256;
-                v->dma_select = a & 1;
+                v->dma_select = layout == 1 ? false :
+                                layout == 2 ? true : a & 1;
                 v->inline_buffer_populated = (a + test) % 3 == 0;
                 for (unsigned k = 0; k < 4; k++)
                     before[a][k] = 0x3f000000 + a * 13 + k;
@@ -92,16 +99,22 @@ static void dma_current_tests(void)
                 prefixes = @[ @(test % 5) ];
             }
             pg->compressed_attrs = 0x8091;
+            unsigned oldLoads = dma_loads;
             NSArray *reference = current_gpu_reference(prefixes, input);
+            assert(dma_loads - oldLoads == expectedLoads);
             unsigned oldReads = reads;
+            oldLoads = dma_loads;
             assert(!surfaces.commands.commandBuffer &&
                    [adapter canCaptureCurrentForInput:input] &&
                    !surfaces.commands.commandBuffer && reads == oldReads);
+            assert(dma_loads - oldLoads == expectedLoads);
+            oldLoads = dma_loads;
             NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
                 [adapter encodeCurrentSnapshotsWithPrefixes:prefixes
                                                indexedInput:input
                                                       error:&error];
             require(batches != nil, error);
+            assert(dma_loads - oldLoads == expectedLoads);
             check_captured_fetch(batches);
             for (unsigned a = 0; a < 16; a++)
                 assert(!memcmp(before[a], pg->vertex_attributes[a].inline_value,
@@ -140,10 +153,10 @@ static void dma_current_tests(void)
                     error);
             unsigned currentRecords = 0;
             for (NV2AMetalPGRAPHFetchBatch *b in reference) {
-                const uint32_t *faults = b.fetch.faults.contents;
-                for (NSUInteger v = 0;
-                     v < b.fetch.vertexCount + b.fetch.hasCurrent; v++)
-                    assert(!faults[v]);
+                if (b.fetch.faults)
+                    assert(!*(const uint32_t *)b.fetch.faults.contents);
+                else
+                    assert(!b.fetch.vertexCount && !b.fetch.hasCurrent);
                 if (b.fetch.hasCurrent) {
                     assert(!memcmp(&captured,
                                    (uint8_t *)b.fetch.attributes.contents +
@@ -160,6 +173,8 @@ static void dma_current_tests(void)
          "selection,prefixes through Current-only,CPU source-write "
          "guards,populated/compressed flags and unchanged Current until "
          "acceptance PASS");
+    puts("DMA Current mappings: each used descriptor loaded once per probe "
+         "or encoding, including aliased banks and independent fetch PASS");
     groups++;
 }
 static void dma_current_guard_tests(void)
@@ -199,15 +214,40 @@ static void dma_current_guard_tests(void)
                      size:16];
     [e endEncoding];
     id recording = surfaces.commands.commandBuffer;
+    SEL selector = @selector(collectCompletedWithError:);
+    Method collect = class_getInstanceMethod(NV2AMetalSurfaceCache.class, selector);
+    assert(collect);
+    BOOL (*original)(id, SEL, NSError **) =
+        (void *)method_getImplementation(collect);
+    __block unsigned collections = 0;
+    NV2AMetalSurfaceCache *cache = surfaces;
+    IMP spy = imp_implementationWithBlock(^BOOL(id owner, NSError **failure) {
+        collections += owner == cache;
+        return original(owner, selector, failure);
+    });
+    method_setImplementation(collect, spy);
     assert(![adapter canCaptureCurrentForInput:nil] &&
            ![adapter encodeCurrentSnapshotsWithPrefixes:@[ @0 ]
                                            indexedInput:nil
                                                   error:NULL] &&
-           surfaces.commands.commandBuffer == recording);
+           surfaces.commands.commandBuffer == recording && !collections);
+    NV2AMetalSurfaceRecording *rawWriter = surfaces.recording;
+    id<MTLSharedEvent> gate = [surfaces.commands.device newSharedEvent];
+    Ivar queueIvar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(surfaces.commands, queueIvar);
+    assert(gate && queue);
+    [queue waitForEvent:gate value:1];
     require([surfaces submitWithError:&error], error);
-    assert(![adapter canCaptureCurrentForInput:nil]);
-    require([surfaces waitUntilIdleWithError:&error], error);
-    assert([adapter canCaptureCurrentForInput:nil]);
+    collections = 0;
+    assert(![adapter canCaptureCurrentForInput:nil] && collections == 1 &&
+           !rawWriter.completed && !gate.signaledValue);
+    gate.signaledValue = 1;
+    require([surfaces.commands waitForSubmission:surfaces.commands.lastSubmitted
+                                          error:&error], error);
+    assert(!rawWriter.completed);
+    collections = 0;
+    assert([adapter canCaptureCurrentForInput:nil] && rawWriter.completed &&
+           collections == 1);
     NV2AMetalSurfaceConfig config = {
         .format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
         .width = 2,
@@ -236,14 +276,19 @@ static void dma_current_guard_tests(void)
                          error:&error] &&
                 [surfaces markWritten:surface error:&error],
             error);
-    assert(![adapter canCaptureCurrentForInput:nil]);
+    collections = 0;
+    assert(![adapter canCaptureCurrentForInput:nil] && !collections);
     require([surfaces prepareGPUReadAtAddress:65520 length:16 error:&error],
             error);
-    assert(![adapter canCaptureCurrentForInput:nil]);
+    collections = 0;
+    assert(![adapter canCaptureCurrentForInput:nil] && !collections);
     require([surfaces submitWithError:&error], error);
-    assert(![adapter canCaptureCurrentForInput:nil]);
-    require([surfaces waitUntilIdleWithError:&error], error);
-    assert([adapter canCaptureCurrentForInput:nil]);
+    require([surfaces.commands waitForSubmission:surfaces.commands.lastSubmitted
+                                          error:&error], error);
+    collections = 0;
+    assert([adapter canCaptureCurrentForInput:nil] && collections == 1);
+    method_setImplementation(collect, (IMP)original);
+    assert(imp_removeBlock(spy));
     require([surfaces discardForRestoreWithError:&error], error);
     assert(notifications == beforeNotifications + 1);
     reset();
@@ -260,6 +305,13 @@ static void dma_current_guard_tests(void)
     assert([adapter canCaptureCurrentForInput:nil]);
     uint32_t before[4];
     memcpy(before, pg->vertex_attributes[0].inline_value, 16);
+    dma_a.limit = 0;
+    assert(![adapter encodeCurrentSnapshotsWithPrefixes:@[ @1 ]
+                                           indexedInput:nil error:&error] &&
+           error && !surfaces.commands.commandBuffer &&
+           !memcmp(before, pg->vertex_attributes[0].inline_value, 16));
+    dma_a.limit = 15;
+    error = nil;
     assert(![adapter encodeCurrentSnapshotsWithPrefixes:@[ @1 ]
                                            indexedInput:nil
                                                   error:&error] &&
@@ -270,6 +322,8 @@ static void dma_current_guard_tests(void)
          "aliases accept;stale eligibility rechecked without cancelling "
          "writer;invalid DMA inside skipped index prefix rejected before "
          "Current changes PASS");
+    puts("DMA Current collection: open writes, dirty surfaces and open downloads "
+         "skip collection; completed submitted writes and downloads requalify PASS");
     groups++;
 }
 static void captured_current_completion_tests(void)

@@ -50,6 +50,7 @@ struct PixelVertex {
     float slope [[flat]];
     float3 line_raster [[flat]];
     uint line_base [[flat]];
+    uint4 line_sources [[flat]];
 };
 
 struct PixelPointVertex {
@@ -65,6 +66,7 @@ struct PixelPointVertex {
     float slope [[flat]];
     float3 line_raster [[flat]];
     uint line_base [[flat]];
+    uint4 line_sources [[flat]];
     float point_size [[point_size]];
 };
 
@@ -92,6 +94,7 @@ static T pixel_vertex(uint id, device const NV2AMetalVertex *vertices)
     out.line_raster =
         float3(v.line_raster[0], v.line_raster[1], v.line_raster[2]);
     out.line_base = id / 6 * 6;
+    out.line_sources = uint4(0);
     return out;
 }
 
@@ -122,12 +125,106 @@ vertex PixelPointVertex nv2a_pixel_point_vertex(
     return out;
 }
 
+constant bool nv2a_indexed_vertices [[function_constant(14)]];
+constant bool nv2a_compact_line_binding [[function_constant(15)]];
+constant bool nv2a_compact_polygon_binding [[function_constant(16)]];
+constant bool nv2a_polygon_projection_binding [[function_constant(17)]];
+
+vertex PixelVertex nv2a_pixel_compact_line_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    constant NV2AMetalPixelStorageInfo &storage [[buffer(2)]],
+    device const NV2AMetalCompactLine *lines [[buffer(6)]])
+{
+    PixelVertex clipped = {};
+    clipped.position = float4(2, 2, 2, 1);
+    uint carrier = id / 6;
+    if (carrier >= u.vertex_capacity / 6)
+        return clipped;
+    device const NV2AMetalCompactLine &line = lines[carrier];
+    if (line.valid != 1 || line.source[0] >= storage.source_vertex_count ||
+        line.source[1] >= storage.source_vertex_count ||
+        line.provoking >= storage.source_vertex_count)
+        return clipped;
+    const uint order[6] = { 0, 1, 2, 2, 1, 3 };
+    uint corner = order[id % 6];
+    uint source = line.source[corner < 2 ? 0 : 1];
+    PixelVertex out = pixel_vertex<PixelVertex>(source, vertices);
+    out.position = float4(line.clip[corner][0], line.clip[corner][1], .5f, 1);
+    out.p0 = combiner_load_device(line.p0);
+    out.p1 = combiner_load_device(line.p1);
+    out.p2 = combiner_load_device(line.p2);
+    out.slope = line.slope;
+    out.face = line.face;
+    out.line_raster = float3(line.width, line.smooth, 1);
+    out.line_base = carrier;
+    out.line_sources =
+        uint4(line.source[0], line.source[1],
+              line.color_smooth ? line.source[0] : line.provoking,
+              line.color_smooth ? line.source[1] : line.provoking);
+    if (!line.color_smooth) {
+        device const NV2AMetalVertex &provoking = vertices[line.provoking];
+        out.diffuse = out.flat_diffuse =
+            combiner_load_device(provoking.color[0]);
+        out.specular = out.flat_specular =
+            combiner_load_device(provoking.color[1]);
+        out.back_diffuse = out.flat_back_diffuse =
+            combiner_load_device(provoking.color[2]);
+        out.back_specular = out.flat_back_specular =
+            combiner_load_device(provoking.color[3]);
+    }
+    return out;
+}
+/* Original attributes stay in source0; compact carriers only bound coverage.
+ * All corners carry identical integer source IDs, including after clipping. */
+vertex PixelVertex nv2a_pixel_compact_polygon_vertex(
+    uint id [[vertex_id]], constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    constant NV2AMetalPixelStorageInfo &storage [[buffer(2)]],
+    device const NV2AMetalCompactPolygon *polygons [[buffer(6)]])
+{
+    PixelVertex clipped = {};
+    clipped.position = float4(2, 2, 2, 1);
+    uint carrier = id / 6;
+    if (carrier >= u.vertex_capacity / 6)
+        return clipped;
+    device const NV2AMetalCompactPolygon &polygon = polygons[carrier];
+    if (polygon.valid != 1 ||
+        polygon.source[0] >= storage.source_vertex_count ||
+        polygon.source[1] >= storage.source_vertex_count ||
+        polygon.source[2] >= storage.source_vertex_count ||
+        polygon.provoking >= storage.source_vertex_count)
+        return clipped;
+    const uint order[6] = { 0, 1, 2, 2, 1, 3 };
+    uint corner = order[id % 6];
+    PixelVertex out = {};
+    out.position =
+        float4(polygon.clip[corner][0], polygon.clip[corner][1], .5f, 1);
+    out.p0 = combiner_load_device(polygon.p0);
+    out.p1 = combiner_load_device(polygon.p1);
+    out.p2 = combiner_load_device(polygon.p2);
+    out.slope = polygon.slope;
+    out.face = polygon.face;
+    out.line_raster = float3(polygon.viewport[0], polygon.viewport[1], 2);
+    out.line_base = carrier;
+    out.line_sources =
+        uint4(polygon.source[0], polygon.source[1], polygon.source[2],
+              polygon.color_smooth ? 0xffffffffu : polygon.provoking);
+    return out;
+}
+
+static uint pixel_source_index(uint logical, device const uint *remap)
+{
+    return nv2a_indexed_vertices ? remap[logical] : logical;
+}
+
 /* True NV2A points do not need a geometry output buffer. This is the point
  * branch of nv2a_expand_geometry, applied to vertex outputs instead. Polygon
  * point mode keeps the original shader and its polygon plane/face/slope. */
 vertex PixelPointVertex nv2a_pixel_direct_point_vertex(
-    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]])
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
 {
+    id = pixel_source_index(id, remap);
     PixelPointVertex out = pixel_vertex<PixelPointVertex>(id, vertices);
     out.point_size = vertices[id].point_size;
     out.face = NV2AMetalFaceFront;
@@ -136,15 +233,18 @@ vertex PixelPointVertex nv2a_pixel_direct_point_vertex(
     return out;
 }
 
-/* Line-list endpoints share the same plane and flat colors. Line strips,
- * wide/smooth lines and W-depth lines keep their compute expansion. */
+/* Endpoint pairs share their plane and flat colors. Wide/smooth raster
+ * lines and W-depth lines retain the full compute expansion. */
 static PixelVertex pixel_direct_line_vertex(
-    uint id, device const NV2AMetalVertex *vertices, bool flat, uint provoking)
+    uint id, device const NV2AMetalVertex *vertices, bool flat, uint provoking,
+    uint2 endpoints, device const uint *remap)
 {
+    id = pixel_source_index(id, remap);
+    endpoints = uint2(pixel_source_index(endpoints.x, remap),
+                      pixel_source_index(endpoints.y, remap));
     PixelVertex out = pixel_vertex<PixelVertex>(id, vertices);
-    uint base = id & ~1u;
-    float4 p0 = combiner_load_device(vertices[base].screen);
-    float4 p1 = combiner_load_device(vertices[base + 1].screen);
+    float4 p0 = combiner_load_device(vertices[endpoints[0]].screen);
+    float4 p1 = combiner_load_device(vertices[endpoints[1]].screen);
     float2 delta = p1.xy - p0.xy;
     out.p0 = p0;
     out.p1 = p1;
@@ -152,7 +252,7 @@ static PixelVertex pixel_direct_line_vertex(
     out.slope = 0;
     out.face = NV2AMetalFaceFront;
     if (flat) {
-        device const NV2AMetalVertex &v = vertices[base + provoking];
+        device const NV2AMetalVertex &v = vertices[endpoints[provoking]];
         out.diffuse = out.flat_diffuse = combiner_load_device(v.color[0]);
         out.specular = out.flat_specular = combiner_load_device(v.color[1]);
         out.back_diffuse = out.flat_back_diffuse = combiner_load_device(v.color[2]);
@@ -161,29 +261,91 @@ static PixelVertex pixel_direct_line_vertex(
     return out;
 }
 vertex PixelVertex nv2a_pixel_direct_line_smooth_vertex(
-    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]])
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
 {
-    return pixel_direct_line_vertex(id, vertices, false, 0);
+    return pixel_direct_line_vertex(id, vertices, false, 0,
+                                     uint2(id & ~1u) + uint2(0, 1), remap);
 }
 vertex PixelVertex nv2a_pixel_direct_line_first_vertex(
-    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]])
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
 {
-    return pixel_direct_line_vertex(id, vertices, true, 0);
+    return pixel_direct_line_vertex(id, vertices, true, 0,
+                                     uint2(id & ~1u) + uint2(0, 1), remap);
 }
 vertex PixelVertex nv2a_pixel_direct_line_last_vertex(
-    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]])
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
 {
-    return pixel_direct_line_vertex(id, vertices, true, 1);
+    return pixel_direct_line_vertex(id, vertices, true, 1,
+                                     uint2(id & ~1u) + uint2(0, 1), remap);
+}
+
+constant uint nv2a_direct_line_options [[function_constant(13)]];
+vertex PixelVertex nv2a_pixel_direct_mapped_line_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
+{
+    uint first = id / 2, last = first + 1;
+    if ((nv2a_direct_line_options & NV2AMetalDirectLineTopologyMask) ==
+            NV2AMetalDirectLineLoop && last == u.vertex_capacity / 2)
+        last = 0;
+    uint2 endpoints(first, last);
+    return pixel_direct_line_vertex(endpoints[id & 1], vertices,
+        !(nv2a_direct_line_options & NV2AMetalDirectLineSmooth),
+        nv2a_direct_line_options & NV2AMetalDirectLineFirst ? 0 : 1,
+        endpoints, remap);
 }
 
 constant uint nv2a_direct_triangle_options [[function_constant(12)]];
 vertex PixelVertex nv2a_pixel_direct_triangle_vertex(
-    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]])
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
 {
-    uint base = id / 3 * 3;
-    float4 a = combiner_load_device(vertices[base].clip);
-    float4 b = combiner_load_device(vertices[base + 1].clip);
-    float4 c = combiner_load_device(vertices[base + 2].clip);
+    uint triangle = id / 3, corner = id % 3;
+    uint3 indices = uint3(3 * triangle) + uint3(0, 1, 2);
+    uint provoking = nv2a_direct_triangle_options & NV2AMetalDirectTriangleFirst ? 0 : 2;
+    uint topology = nv2a_direct_triangle_options & NV2AMetalDirectTriangleTopologyMask;
+    if (topology == NV2AMetalDirectTriangleStrip) {
+        indices = uint3(triangle, triangle + 1 + (triangle & 1),
+                         triangle + 2 - (triangle & 1));
+        provoking = nv2a_direct_triangle_options & NV2AMetalDirectTriangleFirst ? 0 : 2 - (triangle & 1);
+    } else if (topology == NV2AMetalDirectTriangleFan) {
+        indices = uint3(0, triangle + 1, triangle + 2);
+        provoking = nv2a_direct_triangle_options & NV2AMetalDirectTriangleFirst ? 0 : 1;
+    }
+    uint3 face = indices, planeIndices = indices;
+    uint provokingVertex = indices[provoking];
+    if (topology == NV2AMetalDirectTriangleQuads ||
+        topology == NV2AMetalDirectTriangleQuadStrip) {
+        bool strip = topology == NV2AMetalDirectTriangleQuadStrip;
+        uint base = (triangle / 2) * (strip ? 2 : 4);
+        bool second = triangle & 1;
+        if (strip) {
+            indices = base + (second ? uint3(2, 1, 3) : uint3(0, 1, 2));
+            planeIndices = base + (second ? uint3(2, 1, 3) : uint3(2, 0, 1));
+        } else {
+            indices = base + (second ? uint3(2, 3, 0) : uint3(1, 2, 0));
+            planeIndices = base + (second ? uint3(0, 2, 3) : uint3(0, 1, 2));
+        }
+        /* One face and fourth-vertex flat color for the whole quad; preserve
+         * the compute reference's plane order independently of emission. */
+        face = base + uint3(0, 1, 2);
+        provokingVertex = base + 3;
+    }
+    /* Topology and provoking selection use logical IDs; every source load
+     * below addresses the immutable physical vertex buffer. */
+    for (uint i = 0; i < 3; i++) {
+        indices[i] = pixel_source_index(indices[i], remap);
+        face[i] = pixel_source_index(face[i], remap);
+        planeIndices[i] = pixel_source_index(planeIndices[i], remap);
+    }
+    provokingVertex = pixel_source_index(provokingVertex, remap);
+    float4 a = combiner_load_device(vertices[face[0]].clip);
+    float4 b = combiner_load_device(vertices[face[1]].clip);
+    float4 c = combiner_load_device(vertices[face[2]].clip);
     float area = geometry_area(a, b, c);
     bool front =
         nv2a_direct_triangle_options & NV2AMetalDirectTriangleClockwise ?
@@ -196,11 +358,11 @@ vertex PixelVertex nv2a_pixel_direct_triangle_vertex(
         clipped.position = float4(2, 2, 2, 1);
         return clipped;
     }
-    PixelVertex out = pixel_vertex<PixelVertex>(id, vertices);
+    PixelVertex out = pixel_vertex<PixelVertex>(indices[corner], vertices);
     float4x4 plane = geometry_plane(
-        combiner_load_device(vertices[base].screen),
-        combiner_load_device(vertices[base + 1].screen),
-        combiner_load_device(vertices[base + 2].screen),
+        combiner_load_device(vertices[planeIndices[0]].screen),
+        combiner_load_device(vertices[planeIndices[1]].screen),
+        combiner_load_device(vertices[planeIndices[2]].screen),
         nv2a_direct_triangle_options & NV2AMetalDirectTriangleWDepth);
     out.p0 = plane[0];
     out.p1 = plane[1];
@@ -208,9 +370,7 @@ vertex PixelVertex nv2a_pixel_direct_triangle_vertex(
     out.slope = isfinite(plane[3].x) ? plane[3].x : 0;
     out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
     if (!(nv2a_direct_triangle_options & NV2AMetalDirectTriangleSmooth)) {
-        uint provoking =
-            nv2a_direct_triangle_options & NV2AMetalDirectTriangleFirst ? 0 : 2;
-        device const NV2AMetalVertex &v = vertices[base + provoking];
+        device const NV2AMetalVertex &v = vertices[provokingVertex];
         out.diffuse = out.flat_diffuse = combiner_load_device(v.color[0]);
         out.specular = out.flat_specular = combiner_load_device(v.color[1]);
         out.back_diffuse = out.flat_back_diffuse =
@@ -218,6 +378,246 @@ vertex PixelVertex nv2a_pixel_direct_triangle_vertex(
         out.back_specular = out.flat_back_specular =
             combiner_load_device(v.color[3]);
     }
+    return out;
+}
+
+/* Quad point/wire modes preserve the original quad's face, fourth-vertex
+ * flat colors and the compute expansion's independent plane/slope selection.
+ * Topology is assembled before the optional logical-to-physical remap. */
+static uint4 pixel_direct_quad_indices(uint quad, device const uint *remap)
+{
+    bool strip = (nv2a_direct_triangle_options & NV2AMetalDirectTriangleTopologyMask) ==
+                 NV2AMetalDirectTriangleQuadStrip;
+    uint4 indices = quad * (strip ? 2 : 4) + uint4(0, 1, 2, 3);
+    for (uint i = 0; i < 4; i++)
+        indices[i] = pixel_source_index(indices[i], remap);
+    return indices;
+}
+static bool pixel_direct_polygon_front(uint3 indices,
+                                     device const NV2AMetalVertex *vertices)
+{
+    float area = geometry_area(combiner_load_device(vertices[indices[0]].clip),
+                               combiner_load_device(vertices[indices[1]].clip),
+                               combiner_load_device(vertices[indices[2]].clip));
+    return nv2a_direct_triangle_options & NV2AMetalDirectTriangleClockwise ?
+               area < 0 : area > 0;
+}
+static bool pixel_direct_polygon_culled(bool front)
+{
+    return (nv2a_direct_triangle_options &
+        (front ? NV2AMetalDirectTriangleCullFront : NV2AMetalDirectTriangleCullBack)) != 0;
+}
+static float pixel_direct_quad_slope(uint4 indices, bool second,
+                                      device const NV2AMetalVertex *vertices)
+{
+    bool strip = (nv2a_direct_triangle_options & NV2AMetalDirectTriangleTopologyMask) ==
+                 NV2AMetalDirectTriangleQuadStrip;
+    uint3 plane = strip ? (second ? uint3(2, 1, 3) : uint3(2, 0, 1)) :
+                          (second ? uint3(0, 2, 3) : uint3(0, 1, 2));
+    float4x4 value = geometry_plane(
+        combiner_load_device(vertices[indices[plane[0]]].screen),
+        combiner_load_device(vertices[indices[plane[1]]].screen),
+        combiner_load_device(vertices[indices[plane[2]]].screen),
+        nv2a_direct_triangle_options & NV2AMetalDirectTriangleWDepth);
+    return isfinite(value[3].x) ? value[3].x : 0;
+}
+template <typename T>
+static void pixel_direct_polygon_colors(thread T &out, uint provoking,
+                                       device const NV2AMetalVertex *vertices)
+{
+    if (!(nv2a_direct_triangle_options & NV2AMetalDirectTriangleSmooth)) {
+        device const NV2AMetalVertex &v = vertices[provoking];
+        out.diffuse = out.flat_diffuse = combiner_load_device(v.color[0]);
+        out.specular = out.flat_specular = combiner_load_device(v.color[1]);
+        out.back_diffuse = out.flat_back_diffuse = combiner_load_device(v.color[2]);
+        out.back_specular = out.flat_back_specular = combiner_load_device(v.color[3]);
+    }
+}
+vertex PixelPointVertex nv2a_pixel_direct_quad_point_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
+{
+    uint corner = id % 4;
+    uint4 indices = pixel_direct_quad_indices(id / 4, remap);
+    bool front = pixel_direct_polygon_front(indices.xyz, vertices);
+    if (pixel_direct_polygon_culled(front)) {
+        PixelPointVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        clipped.point_size = 1;
+        return clipped;
+    }
+    uint source = indices[corner];
+    PixelPointVertex out = pixel_vertex<PixelPointVertex>(source, vertices);
+    out.point_size = vertices[source].point_size;
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    out.p0 = out.p1 = out.p2 = combiner_load_device(vertices[source].screen);
+    out.slope = pixel_direct_quad_slope(indices, corner == 3, vertices);
+    pixel_direct_polygon_colors(out, indices[3], vertices);
+    return out;
+}
+vertex PixelVertex nv2a_pixel_direct_quad_line_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
+{
+    uint edge = (id % 8) / 2;
+    uint4 indices = pixel_direct_quad_indices(id / 8, remap);
+    bool front = pixel_direct_polygon_front(indices.xyz, vertices);
+    if (pixel_direct_polygon_culled(front)) {
+        PixelVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        return clipped;
+    }
+    bool strip = (nv2a_direct_triangle_options & NV2AMetalDirectTriangleTopologyMask) ==
+                 NV2AMetalDirectTriangleQuadStrip;
+    uint4 edges = strip ? uint4(0, 1, 3, 2) : uint4(0, 1, 2, 3);
+    uint2 endpoints(indices[edges[edge]], indices[edges[(edge + 1) % 4]]);
+    PixelVertex out = pixel_vertex<PixelVertex>(endpoints[id & 1], vertices);
+    out.p0 = combiner_load_device(vertices[endpoints[0]].screen);
+    out.p1 = combiner_load_device(vertices[endpoints[1]].screen);
+    float2 delta = out.p1.xy - out.p0.xy;
+    out.p2 = float4(float2(-delta.y, delta.x) + out.p0.xy, out.p0.zw);
+    out.slope = pixel_direct_quad_slope(indices, strip ? edge == 1 || edge == 2 : edge >= 2,
+                                        vertices);
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    pixel_direct_polygon_colors(out, indices[3], vertices);
+    return out;
+}
+
+/* Point/wire triangles keep the reference's logical strip order and local
+ * provoking slot. Only after assembly may any source index be remapped. */
+static uint3 pixel_direct_polygon_indices(uint triangle, thread uint &provoking,
+                                           device const uint *remap)
+{
+    bool first = nv2a_direct_triangle_options & NV2AMetalDirectTriangleFirst;
+    uint3 indices = 3 * triangle + uint3(0, 1, 2);
+    provoking = first ? 0 : 2;
+    uint topology = nv2a_direct_triangle_options & NV2AMetalDirectTriangleTopologyMask;
+    if (topology == NV2AMetalDirectTriangleStrip) {
+        indices = uint3(triangle, triangle + 1 + (triangle & 1),
+                         triangle + 2 - (triangle & 1));
+        provoking = first ? 0 : 2 - (triangle & 1);
+    } else if (topology == NV2AMetalDirectTriangleFan) {
+        indices = uint3(0, triangle + 1, triangle + 2);
+        provoking = first ? 0 : 1;
+    }
+    for (uint i = 0; i < 3; i++)
+        indices[i] = pixel_source_index(indices[i], remap);
+    return indices;
+}
+static float pixel_direct_polygon_slope(uint3 indices,
+                                         device const NV2AMetalVertex *vertices)
+{
+    float4x4 plane = geometry_plane(
+        combiner_load_device(vertices[indices[0]].screen),
+        combiner_load_device(vertices[indices[1]].screen),
+        combiner_load_device(vertices[indices[2]].screen),
+        nv2a_direct_triangle_options & NV2AMetalDirectTriangleWDepth);
+    return isfinite(plane[3].x) ? plane[3].x : 0;
+}
+vertex PixelPointVertex nv2a_pixel_direct_polygon_point_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
+{
+    uint provoking;
+    uint3 indices = pixel_direct_polygon_indices(id / 3, provoking, remap);
+    bool front = pixel_direct_polygon_front(indices, vertices);
+    if (pixel_direct_polygon_culled(front)) {
+        PixelPointVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        clipped.point_size = 1;
+        return clipped;
+    }
+    uint source = indices[id % 3];
+    PixelPointVertex out = pixel_vertex<PixelPointVertex>(source, vertices);
+    out.point_size = vertices[source].point_size;
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    out.p0 = out.p1 = out.p2 = combiner_load_device(vertices[source].screen);
+    out.slope = pixel_direct_polygon_slope(indices, vertices);
+    pixel_direct_polygon_colors(out, indices[provoking], vertices);
+    return out;
+}
+vertex PixelVertex nv2a_pixel_direct_polygon_line_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]])
+{
+    uint provoking;
+    uint3 indices = pixel_direct_polygon_indices(id / 6, provoking, remap);
+    bool front = pixel_direct_polygon_front(indices, vertices);
+    if (pixel_direct_polygon_culled(front)) {
+        PixelVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        return clipped;
+    }
+    uint edge = (id % 6) / 2;
+    uint2 endpoints(indices[edge], indices[(edge + 1) % 3]);
+    PixelVertex out = pixel_vertex<PixelVertex>(endpoints[id & 1], vertices);
+    out.p0 = combiner_load_device(vertices[endpoints[0]].screen);
+    out.p1 = combiner_load_device(vertices[endpoints[1]].screen);
+    float2 delta = out.p1.xy - out.p0.xy;
+    out.p2 = float4(float2(-delta.y, delta.x) + out.p0.xy, out.p0.zw);
+    out.slope = pixel_direct_polygon_slope(indices, vertices);
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    pixel_direct_polygon_colors(out, indices[provoking], vertices);
+    return out;
+}
+
+/* Genuine polygons use a single whole-boundary face, while fill retains
+ * each fan triangle's own plane and third-corner flat color. These are the
+ * only graphics entry points that declare the optional face binding. */
+vertex PixelVertex nv2a_pixel_direct_polygon_fill_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]],
+    device const uint *polygon_face [[buffer(5)]])
+{
+    uint triangle = id / 3;
+    uint3 indices(0, triangle + 1, triangle + 2);
+    for (uint i = 0; i < 3; i++)
+        indices[i] = pixel_source_index(indices[i], remap);
+    bool front = polygon_face[0] != 0;
+    if (pixel_direct_polygon_culled(front)) {
+        PixelVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        return clipped;
+    }
+    PixelVertex out = pixel_vertex<PixelVertex>(indices[id % 3], vertices);
+    float4x4 plane = geometry_plane(
+        combiner_load_device(vertices[indices[0]].screen),
+        combiner_load_device(vertices[indices[1]].screen),
+        combiner_load_device(vertices[indices[2]].screen),
+        nv2a_direct_triangle_options & NV2AMetalDirectTriangleWDepth);
+    out.p0 = plane[0];
+    out.p1 = plane[1];
+    out.p2 = plane[2];
+    out.slope = isfinite(plane[3].x) ? plane[3].x : 0;
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    pixel_direct_polygon_colors(out, indices[2], vertices);
+    return out;
+}
+vertex PixelVertex nv2a_pixel_direct_polygon_boundary_vertex(
+    uint id [[vertex_id]], device const NV2AMetalVertex *vertices [[buffer(0)]],
+    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    device const uint *remap [[buffer(4), function_constant(nv2a_indexed_vertices)]],
+    device const uint *polygon_face [[buffer(5)]])
+{
+    uint first = id / 2;
+    uint2 endpoints(first, first + 1 == u.vertex_capacity / 2 ? 0 : first + 1);
+    for (uint i = 0; i < 2; i++)
+        endpoints[i] = pixel_source_index(endpoints[i], remap);
+    bool front = polygon_face[0] != 0;
+    if (pixel_direct_polygon_culled(front)) {
+        PixelVertex clipped = {};
+        clipped.position = float4(2, 2, 2, 1);
+        return clipped;
+    }
+    PixelVertex out = pixel_vertex<PixelVertex>(endpoints[id & 1], vertices);
+    out.p0 = combiner_load_device(vertices[endpoints[0]].screen);
+    out.p1 = combiner_load_device(vertices[endpoints[1]].screen);
+    float2 delta = out.p1.xy - out.p0.xy;
+    out.p2 = float4(float2(-delta.y, delta.x) + out.p0.xy, out.p0.zw);
+    out.slope = 0;
+    out.face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    /* Preserve the reference's edge-first flat color, independent of First. */
+    pixel_direct_polygon_colors(out, endpoints[0], vertices);
     return out;
 }
 
@@ -574,14 +974,28 @@ static float polygon_sample(thread const float4 *clips, float2 viewport,
         float2 a = points[i], b = points[(i + 1) % count];
         orientation += a.x * b.y - a.y * b.x;
     }
-    bool full = true;
+    bool full = true, interior = true;
     for (uint i = 0; i < count; i++) {
-        float2 a = points[i], d = points[(i + 1) % count] - a;
+        float2 a = points[i], b = points[(i + 1) % count], d = b - a;
         float sign = orientation > 0 ? 1.0f : -1.0f;
         float minimum =
             sign * (d.y * a.x - d.x * a.y) - .5f * (abs(d.x) + abs(d.y));
         full &= minimum >= 0;
+        /* MSL section 8.2 permits nearest or toward-zero rounding. With
+         * e=2^-23 and M bounding these translated coordinates, translation,
+         * edge differences, products and the final minimum
+         * contribute <e*(25*M*M+9*M+1), including rounded intermediates.
+         * 32*e*(1+M)^2 encloses that error with rounding headroom. Limit M
+         * to keep every intermediate finite. This is only an admission
+         * margin: uncertain edges retain the existing square clipping. */
+        float magnitude = max(max(abs(a.x), abs(a.y)), max(abs(b.x), abs(b.y)));
+        float bound = 0x1p-18f * (1 + magnitude) * (1 + magnitude);
+        interior &= magnitude <= 32768 && isfinite(minimum) && minimum > bound;
     }
+    /* A square strictly inside every edge has unit coverage. The centre
+     * weights already computed above preserve helper-lane derivatives. */
+    if (interior)
+        return 1.0f;
     for (uint side = 0; side < 4 && count; side++) {
         float2 next[12];
         uint n = 0, axis = side / 2;
@@ -720,12 +1134,23 @@ static bool pixel_quad_helpers(uint program, bool legacy_spec_const,
     return false;
 }
 
-static PixelOutput pixel_fragment(
-    PixelVertex in, float2 point, bool front,
-    device const NV2AMetalVertex *vertices, constant NV2AMetalPixelUniforms &u,
-    device const NV2AMetalPolygonProjection *projections, uint projection_count,
-    array<texture2d<float>, 4> t2, array<texture3d<float>, 4> t3,
-    array<texturecube<float>, 4> tc, array<sampler, 4> smp)
+/* Keep derivative helpers together; every lane rejoins before the existing
+ * late window discard and all texture derivatives. */
+static bool pixel_skip_window_polygon(bool window_clipped, bool needs_helpers)
+{
+    if (!needs_helpers)
+        return window_clipped;
+    return quad_or(uint(!window_clipped)) == 0;
+}
+
+static PixelOutput
+pixel_fragment(PixelVertex in, float2 point, bool front,
+               device const NV2AMetalVertex *vertices,
+               constant NV2AMetalPixelUniforms &u,
+               device const NV2AMetalPolygonProjection *projections,
+               uint projection_count, uint source_capacity,
+               array<texture2d<float>, 4> t2, array<texture3d<float>, 4> t3,
+               array<texturecube<float>, 4> tc, array<sampler, 4> smp)
 {
     float coverage = 1;
     bool polygon_discard = false;
@@ -743,9 +1168,20 @@ static PixelOutput pixel_fragment(
     float line_t = 0, perspective_t = 0, perspective_w = 0;
     if (NV2A_PIXEL_RASTER_TAG(in) == 1) {
         float2 a = in.p2.xy, b = in.p2.zw;
-        if (in.line_base > u.vertex_capacity ||
-            u.vertex_capacity - in.line_base < 3 ||
-            !(in.line_raster.x > 0 && in.line_raster.x <= 16384) ||
+        uint source_a = in.line_base, source_b = in.line_base + 2;
+        uint color_a = source_a, color_b = source_b;
+        if (nv2a_compact_line_binding) {
+            if (any(in.line_sources >= source_capacity))
+                discard_fragment();
+            source_a = in.line_sources.x;
+            source_b = in.line_sources.y;
+            color_a = in.line_sources.z;
+            color_b = in.line_sources.w;
+        } else if (in.line_base > u.vertex_capacity ||
+                   u.vertex_capacity - in.line_base < 3) {
+            discard_fragment();
+        }
+        if (!(in.line_raster.x > 0 && in.line_raster.x <= 16384) ||
             !all(isfinite(a)) || !all(isfinite(b)) || all(a == b))
             discard_fragment();
         coverage =
@@ -765,69 +1201,19 @@ static PixelOutput pixel_fragment(
         perspective_w = dot(delta, delta) / denominator;
         if (!isfinite(perspective_t))
             discard_fragment();
-        device const NV2AMetalVertex &va = vertices[in.line_base];
-        device const NV2AMetalVertex &vb = vertices[in.line_base + 2];
-        diffuse = mix(combiner_load_device(va.color[color]),
-                      combiner_load_device(vb.color[color]), perspective_t);
+        device const NV2AMetalVertex &va = vertices[source_a];
+        device const NV2AMetalVertex &vb = vertices[source_b];
+        device const NV2AMetalVertex &ca = vertices[color_a];
+        device const NV2AMetalVertex &cb = vertices[color_b];
+        diffuse = mix(combiner_load_device(ca.color[color]),
+                      combiner_load_device(cb.color[color]), perspective_t);
         specular =
-            mix(combiner_load_device(va.color[color + 1]),
-                combiner_load_device(vb.color[color + 1]), perspective_t);
+            mix(combiner_load_device(ca.color[color + 1]),
+                combiner_load_device(cb.color[color + 1]), perspective_t);
         fog = mix(va.fog, vb.fog, perspective_t);
         for (uint i = 0; i < 4; i++)
             p[i] = mix(combiner_load_device(va.texcoord[i]),
                        combiner_load_device(vb.texcoord[i]), perspective_t);
-    }
-    if (NV2A_PIXEL_RASTER_TAG(in) == 2) {
-        if (in.line_base > u.vertex_capacity ||
-            u.vertex_capacity - in.line_base < 6)
-            discard_fragment();
-        const uint indices[3] = { in.line_base, in.line_base + 2,
-                                  in.line_base + 5 };
-        float4 clips[3];
-        for (uint i = 0; i < 3; i++) {
-            device const NV2AMetalVertex &v = vertices[indices[i]];
-            clips[i] = float4(v.coverage_clip[0], v.coverage_clip[1], 0,
-                              v.line_raster[0]);
-        }
-        device const NV2AMetalVertex &first = vertices[indices[0]];
-        float2 viewport(first.line_raster[1], first.point_size);
-        if (!all(isfinite(viewport)) || any(viewport <= 0) ||
-            any(viewport > 16384))
-            discard_fragment();
-        float3 weights;
-        uint projection_index = in.line_base / 6;
-        if (projection_count && projection_index >= projection_count)
-            discard_fragment();
-        coverage = polygon_sample(clips, viewport, in.position.xy, weights,
-                                  projections +
-                                      (projection_count ? projection_index : 0),
-                                  projection_count != 0);
-        /* Stages without sampling need no helper gradients. Otherwise retain
-         * helper coordinates in every covered quad, but skip fully empty quads
-         * before reconstructing attributes and sampling. Vote before the
-         * per-pixel finite-weight rejection. */
-        if (!pixel_quad_helpers(NV2A_COMBINER_SHADER_STAGE_PROGRAM(u.combiner),
-                                u.legacy_spec_const, u.textures)) {
-            if (!(coverage > 0))
-                discard_fragment();
-        } else if (!quad_or(uint(coverage > 0))) {
-            discard_fragment();
-        }
-        if (!all(isfinite(weights)))
-            discard_fragment();
-        polygon_discard = !(coverage > 0);
-        diffuse = specular = 0;
-        fog = 0;
-        for (uint i = 0; i < 4; i++)
-            p[i] = 0;
-        for (uint i = 0; i < 3; i++) {
-            device const NV2AMetalVertex &v = vertices[indices[i]];
-            diffuse += weights[i] * combiner_load_device(v.color[color]);
-            specular += weights[i] * combiner_load_device(v.color[color + 1]);
-            fog += weights[i] * v.fog;
-            for (uint k = 0; k < 4; k++)
-                p[k] += weights[i] * combiner_load_device(v.texcoord[k]);
-        }
     }
     float2 coordinate = in.position.xy - 0.5f;
     bool contained = false;
@@ -838,7 +1224,84 @@ static PixelOutput pixel_fragment(
                       all(coordinate < float2(region.zw));
         contained |= inside;
     }
-    if (contained == bool(u.window_clip_exclusive)) {
+    bool window_clipped = contained == bool(u.window_clip_exclusive);
+    if (NV2A_PIXEL_RASTER_TAG(in) == 2) {
+        uint indices[3] = { in.line_base, in.line_base + 2, in.line_base + 5 };
+        if (nv2a_compact_polygon_binding) {
+            if (in.line_base >= u.vertex_capacity / 6 ||
+                any(in.line_sources.xyz >= source_capacity) ||
+                (in.line_sources.w != 0xffffffffu &&
+                 in.line_sources.w >= source_capacity))
+                discard_fragment();
+            for (uint i = 0; i < 3; i++)
+                indices[i] = in.line_sources[i];
+        } else if (in.line_base > u.vertex_capacity ||
+                   u.vertex_capacity - in.line_base < 6) {
+            discard_fragment();
+        }
+        float4 clips[3];
+        for (uint i = 0; i < 3; i++) {
+            device const NV2AMetalVertex &v = vertices[indices[i]];
+            clips[i] = nv2a_compact_polygon_binding ?
+                           float4(v.clip[0], v.clip[1], 0, v.clip[3]) :
+                           float4(v.coverage_clip[0], v.coverage_clip[1], 0,
+                                  v.line_raster[0]);
+        }
+        device const NV2AMetalVertex &first = vertices[indices[0]];
+        float2 viewport = nv2a_compact_polygon_binding ?
+                              in.line_raster.xy :
+                              float2(first.line_raster[1], first.point_size);
+        if (!all(isfinite(viewport)) || any(viewport <= 0) ||
+            any(viewport > 16384))
+            discard_fragment();
+        float3 weights;
+        uint projection_index =
+            nv2a_compact_polygon_binding ? in.line_base : in.line_base / 6;
+        if (projection_count && projection_index >= projection_count)
+            discard_fragment();
+        bool needs_helpers = pixel_quad_helpers(
+            NV2A_COMBINER_SHADER_STAGE_PROGRAM(u.combiner), u.legacy_spec_const,
+            u.textures);
+        if (!pixel_skip_window_polygon(window_clipped, needs_helpers)) {
+            coverage = polygon_sample(clips, viewport, in.position.xy, weights,
+                                      projections +
+                                          (projection_count ? projection_index : 0),
+                                      nv2a_polygon_projection_binding);
+            /* Stages without sampling need no helper gradients. Otherwise retain
+             * helper coordinates in every covered quad, but skip fully empty quads
+             * before reconstructing attributes and sampling. Vote before the
+             * per-pixel finite-weight rejection. */
+            if (!needs_helpers) {
+                if (!(coverage > 0))
+                    discard_fragment();
+            } else if (!quad_or(uint(coverage > 0))) {
+                discard_fragment();
+            }
+            if (!all(isfinite(weights)))
+                discard_fragment();
+            polygon_discard = !(coverage > 0);
+            diffuse = specular = 0;
+            fog = 0;
+            for (uint i = 0; i < 4; i++)
+                p[i] = 0;
+            for (uint i = 0; i < 3; i++) {
+                device const NV2AMetalVertex &v = vertices[indices[i]];
+                uint color_index = nv2a_compact_polygon_binding &&
+                                           in.line_sources.w != 0xffffffffu ?
+                                       in.line_sources.w :
+                                       indices[i];
+                device const NV2AMetalVertex &color_vertex = vertices[color_index];
+                diffuse +=
+                    weights[i] * combiner_load_device(color_vertex.color[color]);
+                specular += weights[i] *
+                            combiner_load_device(color_vertex.color[color + 1]);
+                fog += weights[i] * v.fog;
+                for (uint k = 0; k < 4; k++)
+                    p[k] += weights[i] * combiner_load_device(v.texcoord[k]);
+            }
+        }
+    }
+    if (window_clipped) {
         discard_fragment();
     }
 
@@ -1298,7 +1761,8 @@ fragment PixelOutput nv2a_pixel_fragment(
     uint surface_channels = storage.surface_channels;
     PixelOutput out =
         pixel_fragment(in, point, front, vertices, u, projections,
-                       storage.polygon_projection_count, t2, t3, tc, smp);
+                       storage.polygon_projection_count,
+                       storage.source_vertex_count, t2, t3, tc, smp);
     if (surface_channels == NV2AMetalSurfaceStorageB8 ||
         surface_channels == NV2AMetalSurfaceStorageG8B8)
         out.color.r = out.color.b;
@@ -1350,7 +1814,8 @@ static float4 pixel_blend_factor(uint factor, float4 source, float4 dest,
     }
 }
 static float4 pixel_blend(float4 source, float4 dest,
-                          constant NV2AMetalPixelUniforms &u)
+                          constant NV2AMetalPixelUniforms &u,
+                          uint surface_channels)
 {
     source = clamp(source, 0.0f, 1.0f);
     dest = clamp(dest, 0.0f, 1.0f);
@@ -1361,34 +1826,26 @@ static float4 pixel_blend(float4 source, float4 dest,
         return max(source, dest);
     float4 constant_color(u.blend_color[0], u.blend_color[1], u.blend_color[2],
                           u.blend_color[3]);
+    uint sfactor = (u.blend & NV_PGRAPH_BLEND_SFACTOR) >> 4;
+    uint dfactor = (u.blend & NV_PGRAPH_BLEND_DFACTOR) >> 8;
+    /* Xbox Blend_surface DstAlpha/1-DstAlpha captures use opaque destination
+     * alpha for X1/X8. A7 retains its stored seven-bit alpha. Remap only the
+     * two factors; preserve destination color and the other blend inputs. */
+    sfactor = nv2a_metal_surface_blend_factor(sfactor, surface_channels);
+    dfactor = nv2a_metal_surface_blend_factor(dfactor, surface_channels);
     float4 a =
-        source * pixel_blend_factor((u.blend & NV_PGRAPH_BLEND_SFACTOR) >> 4,
-                                    source, dest, constant_color);
+        source * pixel_blend_factor(sfactor, source, dest, constant_color);
     float4 b =
-        dest * pixel_blend_factor((u.blend & NV_PGRAPH_BLEND_DFACTOR) >> 8,
-                                  source, dest, constant_color);
+        dest * pixel_blend_factor(dfactor, source, dest, constant_color);
     return clamp(equation == 0                    ? a - b :
                  (equation == 1 || equation == 5) ? b - a :
                                                     a + b,
                  0.0f, 1.0f);
 }
-fragment PixelOutput nv2a_pixel_logic_fragment(
-    PixelVertex in [[stage_in]], float2 point [[point_coord]],
-    bool front [[front_facing]],
-    float4 destination [[color(0), raster_order_group(0)]],
-    device const NV2AMetalVertex *vertices [[buffer(0)]],
-    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
-    constant NV2AMetalPixelStorageInfo &storage [[buffer(2)]],
-    device const NV2AMetalPolygonProjection *projections [[buffer(3)]],
-    array<texture2d<float>, 4> t2 [[texture(0)]],
-    array<texture3d<float>, 4> t3 [[texture(4)]],
-    array<texturecube<float>, 4> tc [[texture(8)]],
-    array<sampler, 4> smp [[sampler(0)]])
+static PixelOutput pixel_postprocess(PixelOutput out, float4 destination,
+                                      float2 position, uint surface_channels,
+                                      constant NV2AMetalPixelUniforms &u)
 {
-    uint surface_channels = storage.surface_channels;
-    PixelOutput out =
-        pixel_fragment(in, point, front, vertices, u, projections,
-                       storage.polygon_projection_count, t2, t3, tc, smp);
     if (surface_channels == NV2AMetalSurfaceStorageB8 ||
         surface_channels == NV2AMetalSurfaceStorageG8B8)
         out.color.r = out.color.b;
@@ -1411,7 +1868,7 @@ fragment PixelOutput nv2a_pixel_logic_fragment(
     bool logic = u.logic_op >= 1 && u.logic_op <= 16;
     if ((u.dither || surface_channels >= NV2AMetalSurfaceStorageZ1) && !logic &&
         (u.blend & NV_PGRAPH_BLEND_EN))
-        out.color = pixel_blend(out.color, destination, u);
+        out.color = pixel_blend(out.color, destination, u, surface_channels);
     if (logic || u.dither) {
         for (uint i = 0; i < 4; i++) {
             uint bits = u.color_bits[i];
@@ -1419,7 +1876,7 @@ fragment PixelOutput nv2a_pixel_logic_fragment(
                 continue;
             uint mask = (1u << bits) - 1;
             uint quantized = color_quantize(out.color[i], bits, bool(u.dither),
-                                            uint2(in.position.xy));
+                                            uint2(position));
             if (logic) {
                 uint old =
                     uint(round(clamp(destination[i], 0.0f, 1.0f) * mask));
@@ -1436,4 +1893,45 @@ fragment PixelOutput nv2a_pixel_logic_fragment(
                           1 :
                           0;
     return out;
+}
+fragment PixelOutput nv2a_pixel_post_fragment(
+    PixelVertex in [[stage_in]], float2 point [[point_coord]],
+    bool front [[front_facing]],
+    device const NV2AMetalVertex *vertices [[buffer(0)]],
+    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    constant NV2AMetalPixelStorageInfo &storage [[buffer(2)]],
+    device const NV2AMetalPolygonProjection *projections [[buffer(3)]],
+    array<texture2d<float>, 4> t2 [[texture(0)]],
+    array<texture3d<float>, 4> t3 [[texture(4)]],
+    array<texturecube<float>, 4> tc [[texture(8)]],
+    array<sampler, 4> smp [[sampler(0)]])
+{
+    uint surface_channels = storage.surface_channels;
+    PixelOutput out =
+        pixel_fragment(in, point, front, vertices, u, projections,
+                       storage.polygon_projection_count,
+                       storage.source_vertex_count, t2, t3, tc, smp);
+    return pixel_postprocess(out, float4(0), in.position.xy, surface_channels,
+                             u);
+}
+fragment PixelOutput nv2a_pixel_logic_fragment(
+    PixelVertex in [[stage_in]], float2 point [[point_coord]],
+    bool front [[front_facing]],
+    float4 destination [[color(0), raster_order_group(0)]],
+    device const NV2AMetalVertex *vertices [[buffer(0)]],
+    constant NV2AMetalPixelUniforms &u [[buffer(1)]],
+    constant NV2AMetalPixelStorageInfo &storage [[buffer(2)]],
+    device const NV2AMetalPolygonProjection *projections [[buffer(3)]],
+    array<texture2d<float>, 4> t2 [[texture(0)]],
+    array<texture3d<float>, 4> t3 [[texture(4)]],
+    array<texturecube<float>, 4> tc [[texture(8)]],
+    array<sampler, 4> smp [[sampler(0)]])
+{
+    uint surface_channels = storage.surface_channels;
+    PixelOutput out =
+        pixel_fragment(in, point, front, vertices, u, projections,
+                       storage.polygon_projection_count,
+                       storage.source_vertex_count, t2, t3, tc, smp);
+    return pixel_postprocess(out, destination, in.position.xy, surface_channels,
+                             u);
 }

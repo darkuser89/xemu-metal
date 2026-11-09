@@ -31,7 +31,7 @@ static BOOL (*XF_cache_original_submit)(id, SEL, NSError **);
 static unsigned XF_cache_submissions;
 static NV2AMetalEpochEncoding *(*XF_cache_original_encode)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
-    NSUInteger, NV2AMetalCommands *, NSError **);
+    NSUInteger, NV2AMetalFetchResult *, NV2AMetalCommands *, NSError **);
 static BOOL (*XF_cache_original_wait)(id, SEL, NV2AMetalSubmission *,
                                       NSError **);
 static BOOL XF_cache_shared, XF_cache_shared_submitted, XF_cache_shared_probed;
@@ -224,10 +224,11 @@ static void *XF_cache_probe_held(void *opaque)
 static NV2AMetalEpochEncoding *XF_cache_encode_hook(
     id object, SEL selector, NV2AMetalPGRAPHVertexState *captured,
     id<MTLBuffer> attributes, NSUInteger first, NSUInteger count,
-    NV2AMetalCommands *commands, NSError **error)
+    NV2AMetalFetchResult *fetch, NV2AMetalCommands *commands, NSError **error)
 {
-    NV2AMetalEpochEncoding *encoded = XF_cache_original_encode(
-        object, selector, captured, attributes, first, count, commands, error);
+    NV2AMetalEpochEncoding *encoded =
+        XF_cache_original_encode(object, selector, captured, attributes, first,
+                                 count, fetch, commands, error);
     if (XF_cache_enabled) {
         require(encoded != nil, *error);
         assert(XF_cache_raster != captured.rasterDiscard &&
@@ -239,17 +240,17 @@ static NV2AMetalEpochEncoding *XF_cache_encode_hook(
 }
 static NV2AMetalEpochEncoding *(*XF_cache_original_serial)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
-    NSUInteger, NV2AMetalEpochEncoding *, NV2AMetalCommands *, NSError **);
-static NV2AMetalEpochEncoding *
-XF_cache_serial_hook(id object, SEL selector,
-                     NV2AMetalPGRAPHVertexState *captured,
-                     id<MTLBuffer> attributes, NSUInteger first,
-                     NSUInteger count, NV2AMetalEpochEncoding *previous,
-                     NV2AMetalCommands *commands, NSError **error)
+    NSUInteger, NV2AMetalEpochEncoding *, NV2AMetalFetchResult *,
+    NV2AMetalCommands *, NSError **);
+static NV2AMetalEpochEncoding *XF_cache_serial_hook(
+    id object, SEL selector, NV2AMetalPGRAPHVertexState *captured,
+    id<MTLBuffer> attributes, NSUInteger first, NSUInteger count,
+    NV2AMetalEpochEncoding *previous, NV2AMetalFetchResult *fetch,
+    NV2AMetalCommands *commands, NSError **error)
 {
     NV2AMetalEpochEncoding *encoded =
         XF_cache_original_serial(object, selector, captured, attributes, first,
-                                 count, previous, commands, error);
+                                 count, previous, fetch, commands, error);
     if (XF_cache_enabled) {
         require(encoded != nil, *error);
         assert(XF_cache_raster != captured.rasterDiscard &&
@@ -423,8 +424,8 @@ static void XF_cache_concurrent_tests(void)
             method, (IMP)XF_cache_execute_hook);
         Method encodeMethod = class_getInstanceMethod(
             NV2AMetalEpochExecutor.class,
-            @selector(
-                encodeRasterState:attributeBuffer:first:count:commands:error:));
+            @selector(encodeRasterState:attributeBuffer:first:count:
+                      attributeFetch:commands:error:));
         Method waitMethod = class_getInstanceMethod(
             NV2AMetalSurfaceCache.class, @selector(waitForSubmission:error:));
         assert(encodeMethod && waitMethod);
@@ -433,7 +434,7 @@ static void XF_cache_concurrent_tests(void)
         Method serialMethod = class_getInstanceMethod(
             NV2AMetalEpochExecutor.class,
             @selector(encodeSerialRasterState:attributeBuffer:first:count:
-                      previous:commands:error:));
+                      previous:attributeFetch:commands:error:));
         XF_cache_original_serial = (void *)method_setImplementation(
             serialMethod, (IMP)XF_cache_serial_hook);
         XF_cache_original_wait = (void *)method_setImplementation(
@@ -555,7 +556,7 @@ cache_register_isolation_hook(id object, SEL selector,
 static NV2AMetalEpochEncoding *cache_register_encoding_hook(
     id object, SEL selector, NV2AMetalPGRAPHVertexState *captured,
     id<MTLBuffer> attributes, NSUInteger first, NSUInteger count,
-    NV2AMetalCommands *commands, NSError **error)
+    NV2AMetalFetchResult *fetch, NV2AMetalCommands *commands, NSError **error)
 {
     int acquired = qemu_mutex_trylock(&state->pgraph.lock);
     if (!acquired)
@@ -563,7 +564,7 @@ static NV2AMetalEpochEncoding *cache_register_encoding_hook(
     assert(acquired != 0);
     cache_register_calls++;
     return XF_cache_original_encode(object, selector, captured, attributes,
-                                    first, count, commands, error);
+                                    first, count, fetch, commands, error);
 }
 static void cache_register_isolation_test(void)
 {
@@ -576,8 +577,8 @@ static void cache_register_isolation_test(void)
         method, (IMP)cache_register_isolation_hook);
     Method encodeMethod = class_getInstanceMethod(
         NV2AMetalEpochExecutor.class,
-        @selector(
-            encodeRasterState:attributeBuffer:first:count:commands:error:));
+        @selector(encodeRasterState:attributeBuffer:first:count:attributeFetch:
+                  commands:error:));
     assert(encodeMethod);
     XF_cache_original_encode = (void *)method_setImplementation(
         encodeMethod, (IMP)cache_register_encoding_hook);

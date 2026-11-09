@@ -5,16 +5,41 @@
 #import <objc/runtime.h>
 
 static NV2AMetalSurfaceCache *cg_target;
-static unsigned cg_queries;
-static BOOL (*cg_idle_original)(id, SEL, NSUInteger, NSUInteger, BOOL, BOOL *,
-                                NSError **);
-static BOOL cg_idle(id self, SEL selector, NSUInteger address,
-                    NSUInteger length, BOOL write, BOOL *done, NSError **error)
+static unsigned cg_queries, cg_batches;
+static BOOL cg_check_span_reuse;
+static const NV2AMetalVRAMReadSpan *cg_first_spans;
+static NSUInteger cg_first_count;
+static NSUInteger (*cg_writers_original)(id, SEL,
+                                         const NV2AMetalVRAMReadPattern *,
+                                         NSUInteger, NSRange);
+static BOOL (*cg_batch_original)(id, SEL, const NV2AMetalVRAMReadSpan *,
+                                 NSUInteger, BOOL, BOOL *, NSError **);
+static NSUInteger cg_writers(id self, SEL selector,
+                             const NV2AMetalVRAMReadPattern *patterns,
+                             NSUInteger count, NSRange bounds)
 {
-    if (self == cg_target && !write && length)
+    if (self == cg_target)
         cg_queries++;
-    return cg_idle_original(self, selector, address, length, write, done,
-                            error);
+    return cg_writers_original(self, selector, patterns, count, bounds);
+}
+static BOOL cg_batch(id self, SEL selector, const NV2AMetalVRAMReadSpan *spans,
+                     NSUInteger count, BOOL collect, BOOL *done,
+                     NSError **error)
+{
+    if (self == cg_target) {
+        cg_batches++;
+        if (cg_check_span_reuse) {
+            if (cg_batches == 1) {
+                assert(collect);
+                cg_first_spans = spans;
+                cg_first_count = count;
+            } else {
+                assert(cg_batches == 2 && !collect &&
+                       spans == cg_first_spans && count == cg_first_count);
+            }
+        }
+    }
+    return cg_batch_original(self, selector, spans, count, collect, done, error);
 }
 static double cg_clock(void)
 {
@@ -33,8 +58,15 @@ static void current_guard_tests(void)
     NV2AMetalPGRAPHFetch *savedFetch = adapter;
     Method method = class_getInstanceMethod(
         NV2AMetalSurfaceCache.class,
-        @selector(tryIdleCPUAccessAtAddress:length:write:completed:error:));
-    cg_idle_original = (void *)method_setImplementation(method, (IMP)cg_idle);
+        sel_registerName("writerConflictForReadPatterns:count:bounds:"));
+    Method batchMethod = class_getInstanceMethod(
+        NV2AMetalSurfaceCache.class,
+        @selector(tryIdleCPUReadSpans:count:collectCompleted:completed:error:));
+    assert(method && batchMethod);
+    cg_writers_original =
+        (void *)method_setImplementation(method, (IMP)cg_writers);
+    cg_batch_original =
+        (void *)method_setImplementation(batchMethod, (IMP)cg_batch);
     unsigned cases = 0, currentPairs = 0;
     @try {
         for (unsigned kind = 0; kind < 2; kind++)
@@ -112,12 +144,13 @@ static void current_guard_tests(void)
                     [caches[1] cancel];
                     for (unsigned p = 0; p < 2; p++) {
                         cg_target = caches[p];
-                        cg_queries = 0;
+                        cg_queries = cg_batches = 0;
                         assert([fetches[p] canCaptureCurrentForInput:input]);
-                        assert(cg_queries == (p ? count : 1));
+                        assert(cg_batches == 1 && cg_queries == p);
                     }
                     /* Exclude the counting wrapper from timing both paths. */
-                    method_setImplementation(method, (IMP)cg_idle_original);
+                    method_setImplementation(method, (IMP)cg_writers_original);
+                    method_setImplementation(batchMethod, (IMP)cg_batch_original);
                     cg_target = nil;
                     double times[2][9];
                     for (unsigned trial = 0; trial < 11; trial++)
@@ -131,17 +164,18 @@ static void current_guard_tests(void)
                             if (trial >= 2)
                                 times[p][trial - 2] = cg_clock() - start;
                         }
-                    method_setImplementation(method, (IMP)cg_idle);
+                    method_setImplementation(method, (IMP)cg_writers);
+                    method_setImplementation(batchMethod, (IMP)cg_batch);
                     for (unsigned p = 0; p < 2; p++)
                         qsort(times[p], 9, sizeof(double), cg_order);
                     printf(
-                        "Current guard %s/%u attributes:1/%u synchronized "
-                        "queries;2000 eligibility calls median "
+                        "Current guard %s/%u attributes:1 guard acquisition, "
+                        "0/1 writer scans;2000 eligibility calls median "
                         "unwatched/full-watch %.6f/%.6fms "
                         "(2 warmups,9 alternating pairs,native host flags)\n",
-                        kind ? "indexed" : "arrays", count, count,
+                        kind ? "indexed" : "arrays", count,
                         times[0][4] * 1000, times[1][4] * 1000);
-                    /* Even an unwatched first span must validate ownership. */
+                    /* Even a completely unwatched batch validates ownership. */
                     require([queues[0] beginWithError:&error] != nil, error);
                     assert(![fetches[0] canCaptureCurrentForInput:input]);
                     [queues[0] cancel];
@@ -166,11 +200,17 @@ static void current_guard_tests(void)
                     for (unsigned a = 0; a < 16; a++)
                         memcpy(before[a], pg->vertex_attributes[a].inline_value,
                                16);
+                    cg_target = surfaces;
+                    cg_batches = 0;
+                    cg_check_span_reuse = YES;
                     NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
                         [adapter encodeCurrentSnapshotsWithPrefixes:prefixes
                                                        indexedInput:input
                                                               error:&error];
+                    cg_check_span_reuse = NO;
+                    cg_first_spans = NULL;
                     require(batches != nil, error);
+                    assert(cg_batches == 2);
                     check_captured_fetch(batches);
                     for (unsigned a = 0; a < 16; a++)
                         assert(!memcmp(before[a],
@@ -203,17 +243,22 @@ static void current_guard_tests(void)
                     cases++;
                 }
     } @finally {
+        cg_check_span_reuse = NO;
+        cg_first_spans = NULL;
         cg_target = nil;
-        method_setImplementation(method, (IMP)cg_idle_original);
+        method_setImplementation(method, (IMP)cg_writers_original);
+        method_setImplementation(batchMethod, (IMP)cg_batch_original);
         surfaces = savedCache;
         adapter = savedFetch;
         reset();
     }
     assert(cases == 6 && currentPairs == 6);
     puts("Current guard:6 exact native GPU Current pairs;arrays highest/index "
-         "last,1/4/16 attributes,two DMA banks,1 versus1/4/16 full queries;"
-         "first-query cache health,watched GPU writes/cancel and immutable "
+         "last,1/4/16 attributes,two DMA banks,one guard acquisition per batch;"
+         "cache health,watched GPU writes/cancel and immutable "
          "publication preserved;component host timings only PASS");
+    puts("Current read spans: initial and final VRAM checks share one range "
+         "array and preserve collection policy PASS");
     groups++;
 }
 #endif

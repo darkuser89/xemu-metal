@@ -19,6 +19,8 @@ API_AVAILABLE(macos(26.0))
  */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalEpochEncoding : NSObject
+/* Allocation-free admission query; does not imply GPU/fetch completion. */
+- (BOOL)canUsePendingResultForCommands:(NV2AMetalCommands *)commands;
 - (nullable NV2AMetalEpochResult *)resolveWithError:
     (NSError *_Nullable *_Nullable)error;
 /* Fixed context is immutable host metadata and has no XF fault readback.
@@ -41,6 +43,8 @@ API_AVAILABLE(macos(26.0))
  * consume the pending journal, close a primitive, or commit guest commands. */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalEpochExecutor : NSObject
+/* Queue for batching epochs whose input producer has already completed. */
+@property(nonatomic, readonly) NV2AMetalCommands *commands;
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                                   error:(NSError *_Nullable *_Nullable)error;
 - (nullable NV2AMetalEpochResult *)
@@ -79,6 +83,17 @@ API_AVAILABLE(macos(26.0))
                 count:(NSUInteger)count
              commands:(NV2AMetalCommands *)commands
                 error:(NSError *_Nullable *_Nullable)error;
+/* The optional Fetch result must describe the actual immutable input buffer
+ * and range in this recording. Final readonly admission is decided by the
+ * lower program encoder against these inputs and the captured constants. */
+- (nullable NV2AMetalEpochEncoding *)
+    encodeRasterState:(NV2AMetalPGRAPHVertexState *)state
+      attributeBuffer:(id<MTLBuffer>)attributes
+                first:(NSUInteger)first
+                count:(NSUInteger)count
+       attributeFetch:(NV2AMetalFetchResult *_Nullable)fetch
+             commands:(NV2AMetalCommands *)commands
+                error:(NSError *_Nullable *_Nullable)error;
 /* Explicit serial Writable chain. All ranges must share one recording;
  * constants flow on GPU while individual feedback remains immutable. Resolve
  * and publish in range order after Fetch and the recording succeed. */
@@ -88,6 +103,17 @@ API_AVAILABLE(macos(26.0))
                       first:(NSUInteger)first
                       count:(NSUInteger)count
                    previous:(NV2AMetalEpochEncoding *_Nullable)previous
+                   commands:(NV2AMetalCommands *)commands
+                      error:(NSError *_Nullable *_Nullable)error;
+/* The first range may refine independent stores with bound Fetch domains.
+ * GPU predecessor contexts retain the existing conservative admission. */
+- (nullable NV2AMetalEpochEncoding *)
+    encodeSerialRasterState:(NV2AMetalPGRAPHVertexState *)state
+            attributeBuffer:(id<MTLBuffer>)attributes
+                      first:(NSUInteger)first
+                      count:(NSUInteger)count
+                   previous:(NV2AMetalEpochEncoding *_Nullable)previous
+             attributeFetch:(NV2AMetalFetchResult *_Nullable)fetch
                    commands:(NV2AMetalCommands *)commands
                       error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;

@@ -11,6 +11,7 @@
 #pragma clang diagnostic pop
 #import "vertex-pgraph.h"
 #import "vertex-writable.h"
+#import "vertex-fetch.h"
 
 _Static_assert(NV2A_VERTEXSHADER_CONSTANTS == NV2A_METAL_VP_CONSTANTS,
                "Native/QEMU vertex constants");
@@ -134,17 +135,30 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
     _fixedUniforms = source->_fixedUniforms;
     _programBytes = source->_programBytes;
     _validatedProgram = source->_validatedProgram;
-    _faultFreeReadOnlyAccess = source->_faultFreeReadOnlyAccess;
     return self;
 }
 - (instancetype)initWithState:(PGRAPHState *)pg error:(NSError **)error
 {
-    return [self initWithState:pg unbound:NO error:error];
+    return [self initWithState:pg reusingProgramFrom:nil error:error];
+}
+- (instancetype)initWithState:(PGRAPHState *)pg
+           reusingProgramFrom:(NV2AMetalPGRAPHVertexState *)previous
+                        error:(NSError **)error
+{
+    return [self initWithState:pg
+                       unbound:NO
+                 rasterDiscard:NO
+            reusingProgramFrom:previous
+                         error:error];
 }
 - (instancetype)initForTransformOnlyWithState:(PGRAPHState *)pg
                                         error:(NSError **)error
 {
-    return [self initWithState:pg unbound:YES error:error];
+    return [self initWithState:pg
+                       unbound:YES
+                 rasterDiscard:NO
+            reusingProgramFrom:nil
+                         error:error];
 }
 - (instancetype)initRawProgramWithState:(PGRAPHState *)pg
                                   error:(NSError **)error
@@ -159,17 +173,22 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
 }
 - (instancetype)initRawXFWithState:(PGRAPHState *)pg error:(NSError **)error
 {
-    return [self initWithState:pg unbound:YES rasterDiscard:YES error:error];
+    return [self initRawXFWithState:pg reusingProgramFrom:nil error:error];
 }
-- (instancetype)initWithState:(PGRAPHState *)pg
-                      unbound:(BOOL)unbound
-                        error:(NSError **)error
+- (instancetype)initRawXFWithState:(PGRAPHState *)pg
+                reusingProgramFrom:(NV2AMetalPGRAPHVertexState *)previous
+                             error:(NSError **)error
 {
-    return [self initWithState:pg unbound:unbound rasterDiscard:NO error:error];
+    return [self initWithState:pg
+                       unbound:YES
+                 rasterDiscard:YES
+            reusingProgramFrom:previous
+                         error:error];
 }
 - (instancetype)initWithState:(PGRAPHState *)pg
                       unbound:(BOOL)unbound
                 rasterDiscard:(BOOL)rasterDiscard
+           reusingProgramFrom:(NV2AMetalPGRAPHVertexState *)previous
                         error:(NSError **)error
 {
     self = [super init];
@@ -280,25 +299,34 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
             capture_error(error, @"NV2A vertex program start exceeds slots");
             return nil;
         }
+        if (!rasterDiscard &&
+            !nv2a_metal_writable_validate_uniforms(&common, error))
+            return nil;
+        NV2AMetalValidatedProgram *candidate = previous.validatedProgram;
+        NSData *candidateTokens = candidate.tokens;
+        NSUInteger candidateLength = candidateTokens.length;
+        const uint32_t *liveTokens = pg->program_data[start];
+        if (candidateLength &&
+            candidateLength <= (NV2A_METAL_VP_SLOTS - start) * 16 &&
+            !memcmp(candidateTokens.bytes, liveTokens, candidateLength)) {
+            _validatedProgram = candidate;
+            _programBytes = candidateTokens;
+            _dynamicAddressing = previous.dynamicAddressing;
+            return self;
+        }
         unsigned length = 0;
         for (unsigned i = start; i < NV2A_METAL_VP_SLOTS; i++) {
             length++;
             if (pg->program_data[i][3] & 1)
                 break;
         }
-        if (!rasterDiscard &&
-            !nv2a_metal_writable_validate_uniforms(&common, error))
-            return nil;
-        _validatedProgram = [[NV2AMetalValidatedProgram alloc]
-            initWithTokens:pg->program_data[start]
-                    length:length
-                     error:error];
+        _validatedProgram =
+            [[NV2AMetalValidatedProgram alloc] initWithTokens:liveTokens
+                                                       length:length
+                                                        error:error];
         if (!_validatedProgram)
             return nil;
         _programBytes = _validatedProgram.tokens;
-        _faultFreeReadOnlyAccess = [_validatedProgram
-            hasFaultFreeReadOnlyAccess:_fullAccess ? 1 : 0
-                             constants:&_programUniforms.constants[0][0]];
         const uint32_t *tokens = _programBytes.bytes;
         for (unsigned i = 0; i < length; i++) {
             /* ARL can fault on NaN/overflow even with no relative constant
@@ -544,10 +572,44 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
     _swizzleAttributes = swizzle;
     _programBytes =
         _validatedProgram ? _validatedProgram.tokens : [tokens copy];
-    _faultFreeReadOnlyAccess = [_validatedProgram
-        hasFaultFreeReadOnlyAccess:_fullAccess ? 1 : 0
-                         constants:&_programUniforms.constants[0][0]];
     return self;
+}
+- (BOOL)faultFreeReadOnlyAccess
+{
+    return [self mayUseReadonlyFetchPreview:NULL];
+}
+- (BOOL)mayUseReadonlyFetchPreview:
+    (const struct NV2AMetalFetchUniforms *)preview
+{
+    return [_validatedProgram
+        hasFaultFreeReadOnlyAccess:_fullAccess ? 1 : 0
+                         constants:&_programUniforms.constants[0][0]
+                    sourceUniforms:preview];
+}
+- (BOOL)mayAttemptReadonlyFloatProofWithPreview:
+    (const struct NV2AMetalFetchUniforms *)preview
+{
+    if (!_programmed || !_validatedProgram || !preview ||
+        (_writeEnable && _validatedProgram.mayWriteConstants))
+        return NO;
+    uint64_t remaining = _validatedProgram.readonlyProofAttributeLanes64;
+    while (remaining) {
+        unsigned component = __builtin_ctzll(remaining);
+        remaining &= remaining - 1;
+        unsigned lane = component % 4;
+        const NV2AMetalFetchAttribute *a = &preview->attributes[component / 4];
+        if (!a->count || !nv2a_metal_attribute_size(a->format, a->count))
+            continue;
+        BOOL populated =
+            lane < a->count ||
+            (a->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP &&
+             lane < 3);
+        if (populated &&
+            (a->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F ||
+             !a->stride))
+            return YES;
+    }
+    return NO;
 }
 - (NV2AMetalPGRAPHVertexState *)stateByApplyingConstants:(NSData *)constants
                                                  written:(NSData *)written
@@ -601,9 +663,6 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
                        source + row * 16, 16);
         }
     }
-    copy->_faultFreeReadOnlyAccess = [copy->_validatedProgram
-        hasFaultFreeReadOnlyAccess:copy->_fullAccess ? 1 : 0
-                         constants:&copy->_programUniforms.constants[0][0]];
     return copy;
 }
 

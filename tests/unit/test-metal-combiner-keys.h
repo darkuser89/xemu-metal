@@ -186,6 +186,12 @@ static void combiner_key_tests(NV2AMetalCommands *commands,
             NV2AMetalPixelUniforms draws[48];
             for (unsigned i = 0; i < drawCount; i++) {
                 draws[i] = ck_uniforms(stages, family, slot, alpha, reg);
+                /* Only the four low opcodes can change the Metal program. */
+                if (!i)
+                    draws[i].combiner.shader_stage_program |=
+                        1u << (20 + test % 12);
+                if (i == 16)
+                    draws[i].combiner.shader_stage_program |= 0xfff00000u;
                 unsigned flags = (i & 7) ^ (i < 8 ? 7 : 0);
                 draws[i].combiner.control |=
                     ((flags & 1 ? PS_COMBINERCOUNT_UNIQUE_C0 : 0) |
@@ -314,6 +320,7 @@ static void combiner_key_tests(NV2AMetalCommands *commands,
         "Metal combiner keys:190 cases/7648 draws/489472 exact Float4 pixels "
         "versus raw-control GPU interpreter;"
         "1520 raw controls plus4608 inactive-word mutations;"
+        "all 12 unused program bits share pipelines;"
         "178 cold-fixture pipeline requests,%u continuous-cache requests;"
         "144 active-source rejects;0..8 stages,RGB/alpha "
         "MUX,C0/C1 "

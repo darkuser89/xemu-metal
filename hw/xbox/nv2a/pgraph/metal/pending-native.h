@@ -10,7 +10,8 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) NSArray<NSNumber *> *counts;
 /* Validates every resource/offset/length on the CPU before any GPU encoding.
  * Only update.streams are drawn; a preserved hidden last range stays cached.
- * Caller retains immutable buffers and serializes journal operations. */
+ * Resources may be immutable MTLBuffers or NV2AMetalIndexedVertices owners;
+ * span ranges and counts are logical. Caller serializes journal operations. */
 - (nullable instancetype)initWithUpdate:(NV2AMetalPendingUpdate *)update
                                  device:(id<MTLDevice>)device
                                   limit:(NSUInteger)limit
@@ -21,15 +22,15 @@ API_AVAILABLE(macos(26.0))
                             streamLimit:(NSUInteger)streamLimit
                              totalLimit:(NSUInteger)totalLimit
                                   error:(NSError *_Nullable *_Nullable)error;
-/* One immutable GPU buffer per independent stream; use counts, not buffer
+/* One immutable linear GPU buffer per independent stream; use counts, not buffer
  * lengths, for the valid vertex ranges. No vertex readback or journal commit.
  * On any encoding failure caller must abandon the recording, not submit it. */
 - (nullable NSArray<id<MTLBuffer>> *)
     encodeWithCommands:(NV2AMetalCommands *)commands
                  error:(NSError *_Nullable *_Nullable)error;
-/* Drawing variant preserving a contiguous source's nonzero first vertex.
- * Independent streams remain independent; fragmented streams are GPU-joined.
- * Slices retain their immutable buffers; commands keep them resident. */
+/* Drawing variant preserving a contiguous source's nonzero first vertex and
+ * indexed owner. Independent streams remain independent; fragmented streams
+ * are GPU-joined. Slices retain their owners; commands keep resources resident. */
 - (nullable NSArray<NV2AMetalVertexSlice *> *)
     encodeSlicesWithCommands:(NV2AMetalCommands *)commands
                        error:(NSError *_Nullable *_Nullable)error;

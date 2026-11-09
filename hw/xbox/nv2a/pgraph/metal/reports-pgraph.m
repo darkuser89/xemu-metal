@@ -24,8 +24,8 @@ static BOOL report_error(NSError **error, NSString *message)
 @property(nonatomic, readwrite) NSUInteger offset;
 @property(nonatomic, weak) NV2AMetalPGRAPHReports *owner;
 @property(nonatomic, nullable) NV2AMetalSurfaceRecording *token;
-@property(nonatomic) BOOL captured, cancelled, committed;
-@property(nonatomic) uint64_t value;
+@property(nonatomic) BOOL captured, cancelled, committed, zeroSamples;
+@property(nonatomic) uint64_t value, recordingSerial;
 - (instancetype)initWithBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset;
 @end
 @implementation NV2AMetalVisibilityCounter
@@ -47,10 +47,21 @@ static BOOL report_error(NSError **error, NSString *message)
 @property(nonatomic) NSUInteger reportedBuffers;
 - (instancetype)initQuery;
 @end
+static void capture_zero_counter(NV2AMetalVisibilityCounter *counter)
+{
+    NV2AMetalSurfaceRecording *token = counter.token;
+    if (counter.zeroSamples && !counter.captured && !counter.cancelled &&
+        token.completed && !token.cancelled) {
+        counter.value = 0;
+        counter.captured = YES;
+        counter.token = nil;
+    }
+}
 static void compact_query(NV2AMetalPGRAPHQuery *query)
 {
     NSUInteger prefix = 0, reported = query.reportedBuffers;
     for (NV2AMetalVisibilityCounter *counter in query.buffers) {
+        capture_zero_counter(counter);
         if (!counter.captured || counter.cancelled)
             break;
         query.savedCount += counter.value;
@@ -108,6 +119,7 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
     uint32_t _result;
     id<MTLBuffer> _counterBuffer;
     NSMutableArray *_counterSlots;
+    NSMutableIndexSet *_freeCounterSlots;
     NSUInteger _counterCapacity, _counterCursor;
 }
 - (instancetype)initForSnapshotValidation
@@ -134,6 +146,8 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
         _reports = [NSMutableArray new];
         _counterCapacity = capacity;
         _counterSlots = [NSMutableArray arrayWithCapacity:capacity];
+        _freeCounterSlots =
+            [[NSMutableIndexSet alloc] initWithIndexesInRange:NSMakeRange(0, capacity)];
         for (NSUInteger i = 0; i < capacity; i++)
             [_counterSlots addObject:NSNull.null];
     }
@@ -160,12 +174,35 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
     counter.buffer = nil;
     counter.token = nil;
     _counterSlots[index] = NSNull.null;
+    [_freeCounterSlots addIndex:index];
     return YES;
 }
 - (id<MTLBuffer>)visibilityBuffer
 {
     return _counterBuffer;
 }
+
+- (NV2AMetalVisibilityCounter *)reserveCounterAtIndex:(NSUInteger)index
+                                                error:(NSError **)error
+{
+    assert(_counterSlots[index] == NSNull.null);
+    NSUInteger offset = index * sizeof(uint64_t);
+    NV2AMetalVisibilityCounter *counter =
+        [[NV2AMetalVisibilityCounter alloc] initWithBuffer:_counterBuffer
+                                                    offset:offset];
+    if (!counter) {
+        report_error(error, @"Cannot allocate native visibility range");
+        return nil;
+    }
+    uint64_t zero = 0;
+    memcpy((uint8_t *)_counterBuffer.contents + offset, &zero, sizeof(zero));
+    counter.owner = self;
+    _counterSlots[index] = counter;
+    [_freeCounterSlots removeIndex:index];
+    _counterCursor = (index + 1) % _counterCapacity;
+    return counter;
+}
+
 - (NV2AMetalVisibilityCounter *)allocateCounterWithError:(NSError **)error
 {
     if (![_cache collectCompletedWithError:error])
@@ -179,53 +216,93 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
             return nil;
         }
     }
-    for (unsigned attempt = 0; attempt < 2; attempt++) {
-        for (NSUInteger i = 0; i < _counterCapacity; i++) {
-            NSUInteger index = (_counterCursor + i) % _counterCapacity;
-            if (![self retireCounterAtIndex:index])
-                continue;
-            NSUInteger offset = index * sizeof(uint64_t);
-            uint64_t zero = 0;
-            memcpy((uint8_t *)_counterBuffer.contents + offset, &zero,
-                   sizeof(zero));
-            NV2AMetalVisibilityCounter *counter =
-                [[NV2AMetalVisibilityCounter alloc]
-                    initWithBuffer:_counterBuffer
-                            offset:offset];
-            if (!counter) {
-                report_error(error, @"Cannot allocate native visibility range");
-                return nil;
-            }
-            counter.owner = self;
-            _counterSlots[index] = counter;
-            _counterCursor = (index + 1) % _counterCapacity;
-            return counter;
+    /* Free slots need no retirement checks on the busy prefix of the pool. */
+    NSUInteger freeIndex = [_freeCounterSlots indexGreaterThanOrEqualToIndex:
+                                                   _counterCursor];
+    if (freeIndex == NSNotFound)
+        freeIndex = _freeCounterSlots.firstIndex;
+    if (freeIndex != NSNotFound)
+        return [self reserveCounterAtIndex:freeIndex error:error];
+
+    NV2AMetalVisibilityCounter *oldest = nil;
+    NV2AMetalSurfaceRecording *lastPending = nil;
+    NSUInteger oldestIndex = 0;
+    for (NSUInteger i = 0; i < _counterCapacity; i++) {
+        NSUInteger index = (_counterCursor + i) % _counterCapacity;
+        NV2AMetalVisibilityCounter *busy = _counterSlots[index];
+        NV2AMetalSurfaceRecording *token = busy.token;
+        /* Recording state is published by the PGRAPH owner, so it cannot
+         * change between two slots in this scan. */
+        if (!token || token == lastPending)
+            continue;
+        if ([self retireCounterAtIndex:index])
+            return [self reserveCounterAtIndex:index error:error];
+        lastPending = token;
+        if (!oldest || busy.recordingSerial < oldest.recordingSerial) {
+            oldest = busy;
+            oldestIndex = index;
         }
-        if (!attempt) {
-            if (![_cache submitWithError:error])
-                return nil;
-            NV2AMetalSubmission *submission = _cache.commands.lastSubmitted;
-            if (submission && ![_cache waitForSubmission:submission
-                                                   error:error])
-                return nil;
-        }
+    }
+    /* Reservations can be recorded out of slot order. Once the earliest
+     * recording completes, reuse its selected slot directly. */
+    if (oldest) {
+        if (![_cache waitForRecording:oldest.token error:error])
+            return nil;
+        if ([self retireCounterAtIndex:oldestIndex])
+            return [self reserveCounterAtIndex:oldestIndex error:error];
     }
     report_error(error, @"Native visibility pool has unrecorded reservations");
     return nil;
+}
+- (NV2AMetalVisibilityCounter *)allocateZeroSampleCounterWithError:
+    (NSError **)error
+{
+    if (![_cache collectCompletedWithError:error])
+        return nil;
+    NV2AMetalVisibilityCounter *counter =
+        [[NV2AMetalVisibilityCounter alloc] initWithBuffer:nil
+                                                    offset:NSNotFound];
+    if (!counter) {
+        report_error(error,
+                     @"Cannot allocate zero-sample visibility recording");
+        return nil;
+    }
+    counter.owner = self;
+    counter.zeroSamples = YES;
+    return counter;
 }
 - (BOOL)recordCounter:(NV2AMetalVisibilityCounter *)counter
                 error:(NSError **)error
 {
     if (!counter || counter.owner != self || counter.cancelled ||
-        counter.captured || counter.token || counter.buffer != _counterBuffer ||
-        counter.offset % sizeof(uint64_t) ||
-        counter.offset / sizeof(uint64_t) >= _counterCapacity ||
-        _counterSlots[counter.offset / sizeof(uint64_t)] != counter ||
-        !_cache.recording)
+        counter.captured || counter.token || !_cache.recording ||
+        (counter.zeroSamples ?
+             (counter.buffer || counter.offset != NSNotFound) :
+             (counter.buffer != _counterBuffer ||
+              counter.offset % sizeof(uint64_t) ||
+              counter.offset / sizeof(uint64_t) >= _counterCapacity ||
+              _counterSlots[counter.offset / sizeof(uint64_t)] != counter)))
         return report_error(error,
                             @"Invalid native visibility range or recording");
     counter.token = _cache.recording;
+    counter.recordingSerial = _cache.commands.recordingSerial;
     return YES;
+}
+/* Only an unreported zero run can move its completion boundary forward.
+ * Waiting for the newest recording validates its chronological cache prefix.
+ * Frozen prefixes retain their original counters, which are never mutated. */
+- (BOOL)canCoalesceZeroCounter:(NV2AMetalVisibilityCounter *)counter
+                         query:(NV2AMetalPGRAPHQuery *)query
+{
+    NV2AMetalVisibilityCounter *previous = query.buffers.lastObject;
+    return query.open && !query.discarded && counter.zeroSamples &&
+           previous.zeroSamples && counter.owner == self &&
+           previous.owner == self && previous.committed && !counter.cancelled &&
+           !previous.cancelled && counter.token && previous.token &&
+           !counter.token.cancelled && !previous.token.cancelled &&
+           !counter.captured && !previous.captured &&
+           counter.recordingSerial >= previous.recordingSerial &&
+           query.buffers.count > query.reportedBuffers;
 }
 - (void)commitCounter:(NV2AMetalVisibilityCounter *)counter
                 query:(NV2AMetalPGRAPHQuery *)query
@@ -234,7 +311,11 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
            !counter.committed);
     if (!query.discarded) {
         counter.committed = YES;
-        [query.buffers addObject:counter];
+        if (counter.zeroSamples && [self canCoalesceZeroCounter:counter
+                                                          query:query])
+            query.buffers[query.buffers.count - 1] = counter;
+        else
+            [query.buffers addObject:counter];
         compact_query(query);
     }
 }
@@ -245,9 +326,15 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
     counter.cancelled = YES;
     if (counter.token && !counter.token.cancelled && !counter.token.completed)
         return;
+    if (counter.zeroSamples) {
+        counter.token = nil;
+        return;
+    }
     NSUInteger index = counter.offset / sizeof(uint64_t);
-    if (index < _counterCapacity && _counterSlots[index] == counter)
+    if (index < _counterCapacity && _counterSlots[index] == counter) {
         _counterSlots[index] = NSNull.null;
+        [_freeCounterSlots addIndex:index];
+    }
     counter.buffer = nil;
     counter.token = nil;
 }
@@ -310,6 +397,14 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
     NSMutableArray *frozen = [NSMutableArray new];
     NSMutableArray *continuing = [NSMutableArray new];
     for (NV2AMetalPGRAPHQuery *query in _queries) {
+        compact_query(query);
+        if (query.open)
+            [continuing addObject:query];
+        /* A query with no new samples contributes zero at any scale. Its
+         * previously reported buffers belong to an earlier FIFO entry. */
+        if (query.savedCount == query.reportedCount &&
+            query.buffers.count == query.reportedBuffers)
+            continue;
         if (!query.open) {
             [frozen addObject:query];
             continue;
@@ -317,7 +412,6 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
         [frozen addObject:frozen_prefix(query)];
         query.reportedCount = query.savedCount;
         query.reportedBuffers = query.buffers.count;
-        [continuing addObject:query];
     }
     report.queries = frozen;
     _queries = continuing;
@@ -326,37 +420,78 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
 }
 /* Count the frozen prefix, and the part published by an earlier report from
  * this same Begin. Both are raw uint64 counters, including wraparound. */
-static BOOL query_counts(NV2AMetalPGRAPHQuery *query, uint64_t *total,
-                         uint64_t *previous, NSError **error)
+- (BOOL)readCountsForQuery:(NV2AMetalPGRAPHQuery *)query
+                     total:(uint64_t *)total
+                  previous:(uint64_t *)previous
+                     error:(NSError **)error
 {
     *total = query.savedCount;
     *previous = query.reportedCount;
     assert(query.reportedBuffers <= query.buffers.count);
     NSUInteger index = 0;
     for (NV2AMetalVisibilityCounter *counter in query.buffers) {
+        capture_zero_counter(counter);
+        NV2AMetalSurfaceRecording *token = counter.token;
         uint64_t count;
-        if (counter.cancelled || (counter.token && !counter.token.completed))
+        if (counter.cancelled ||
+            (token && (!token.completed || token.cancelled)))
             return report_error(error,
                                 @"Native visibility counter is not complete");
         if (counter.captured)
             count = counter.value;
+        else if (counter.zeroSamples)
+            return report_error(
+                error, @"Zero-sample visibility recording is not complete");
         else if (!counter.buffer || counter.offset > counter.buffer.length ||
                  sizeof(count) > counter.buffer.length - counter.offset)
             return report_error(
                 error, @"Native visibility counter exceeds its buffer");
-        else
+        else if (counter.owner == self) {
+            NSUInteger slot = counter.offset / sizeof(count);
+            if (slot >= _counterCapacity || _counterSlots[slot] != counter ||
+                ![self retireCounterAtIndex:slot])
+                return report_error(error,
+                                    @"Native visibility counter lost its slot");
+            count = counter.value;
+        } else {
             memcpy(&count,
                    (const uint8_t *)counter.buffer.contents + counter.offset,
                    sizeof(count));
+        }
         *total += count;
         if (index++ < query.reportedBuffers)
             *previous += count;
     }
+    /* Frozen reports can share counters with the live query and each other.
+     * The first read owns the value before the GPU slot is made reusable. */
+    compact_query(query);
     return YES;
+}
+- (BOOL)waitForQueries:(NSArray<NV2AMetalPGRAPHQuery *> *)queries
+                error:(NSError **)error
+{
+    NV2AMetalSurfaceRecording *latest = nil;
+    uint64_t latestSerial = 0;
+    for (NV2AMetalPGRAPHQuery *query in queries) {
+        for (NV2AMetalVisibilityCounter *counter in query.buffers) {
+            NV2AMetalSurfaceRecording *token = counter.token;
+            if (token.cancelled)
+                return report_error(error,
+                                    @"Native visibility counter was cancelled");
+            if (token && !token.completed &&
+                (!latest || counter.recordingSerial > latestSerial)) {
+                latest = token;
+                latestSerial = counter.recordingSerial;
+            }
+        }
+    }
+    /* All counters are recorded on this cache. The latest recording's
+     * wait validates its entire feedback prefix, including dependencies. */
+    return !latest || [_cache waitForRecording:latest error:error];
 }
 - (BOOL)processWithError:(NSError **)error
 {
-    BOOL waited = NO;
+    BOOL collected = NO;
     while (_reports.count) {
         NV2AMetalPGRAPHReport *report = _reports[0];
         if (report.clear) {
@@ -369,13 +504,15 @@ static BOOL query_counts(NV2AMetalPGRAPHQuery *query, uint64_t *total,
                 return YES;
             }
         }
-        if (!waited) {
-            if (![_cache submitWithError:error] ||
-                ![_cache waitUntilIdleWithError:error]) {
+        /* The report owns the frozen query prefix. Later surface submissions
+         * only matter if they overlap the CPU destination checked below. */
+        if (!collected) {
+            if (![_cache collectCompletedWithError:error])
                 return NO;
-            }
-            waited = YES;
+            collected = YES;
         }
+        if (![self waitForQueries:report.queries error:error])
+            return NO;
         DMAObject dma = nv_dma_load(_d, _d->pgraph.dma_report);
         NSUInteger base = dma.address & 0x07ffffff;
         NSUInteger offset = GET_MASK(report.parameter, NV097_GET_REPORT_OFFSET);
@@ -386,31 +523,49 @@ static BOOL query_counts(NV2AMetalPGRAPHQuery *query, uint64_t *total,
             return report_error(error,
                                 @"NV2A report exceeds DMA or VRAM bounds");
         }
+        NSUInteger destination = base + offset;
         /* Report destinations may alias a dirty render target. Preserve its
          * untouched pixels and invalidate both surface and texture sources. */
-        if (![_cache prepareCPUAccessAtAddress:base + offset
+        BOOL ready;
+        if (![_cache tryIdleCPUAccessAtAddress:destination
                                         length:16
                                          write:YES
-                                         error:error]) {
+                                     completed:&ready
+                                         error:error] ||
+            (!ready && ![_cache resolveCPUAccessAtAddress:destination
+                                                   length:16
+                                                    write:YES
+                                                    error:error])) {
             return NO;
         }
         unsigned scale = _d->pgraph.surface_scale_factor;
         if (!scale || scale > 16384) {
             return report_error(error, @"Invalid report surface scale");
         }
+        uint32_t result = _result;
+        uint32_t divisor = scale * scale;
         for (NV2AMetalPGRAPHQuery *query in report.queries) {
             uint64_t total, previous;
-            if (!query_counts(query, &total, &previous, error))
+            if (![self readCountsForQuery:query total:&total previous:&previous
+                                     error:error])
                 return NO;
             /* Preserve the existing GLuint-wrap and per-Begin scale policy.
              * Rounding each report's delta would lose fractional samples. */
-            uint32_t divisor = scale * scale;
-            _result += (uint32_t)total / divisor - (uint32_t)previous / divisor;
+            result += (uint32_t)total / divisor - (uint32_t)previous / divisor;
         }
-        pgraph_write_zpass_pixel_cnt_report(_d, report.parameter, _result);
-        memory_region_set_client_dirty(_d->vram, base + offset, 16,
+        _result = result;
+        /* Publish to the validated DMA span. Resolving the DMA object again
+         * could redirect the write after the coherence check. Match the
+         * shared PGRAPH report's timestamp, count and done fields. */
+        uint8_t *data = (uint8_t *)_cache.vram.contents + destination;
+        stq_le_p(data, UINT64_C(0x0011223344556677));
+        stl_le_p(data + 8, _result);
+        stl_le_p(data + 12, 0);
+        NV2A_DPRINTF("Report result %" PRIu32 " @%" HWADDR_PRIx, _result,
+                     (hwaddr)offset);
+        memory_region_set_client_dirty(_d->vram, destination, 16,
                                        DIRTY_MEMORY_VGA);
-        memory_region_set_client_dirty(_d->vram, base + offset, 16,
+        memory_region_set_client_dirty(_d->vram, destination, 16,
                                        DIRTY_MEMORY_NV2A_TEX);
         [_reports removeObjectAtIndex:0];
     }
@@ -435,9 +590,6 @@ static void append64(NSMutableData *data, uint64_t value)
         report_error(error, @"Invalid snapshot surface scale");
         return nil;
     }
-    if (![_cache submitWithError:error] ||
-        ![_cache waitUntilIdleWithError:error])
-        return nil;
     NSMutableArray<NV2AMetalPGRAPHQuery *> *queries = [NSMutableArray new];
     NSMapTable *ids = [NSMapTable strongToStrongObjectsMapTable];
     void (^add)(NV2AMetalPGRAPHQuery *) = ^(NV2AMetalPGRAPHQuery *q) {
@@ -469,6 +621,9 @@ static void append64(NSMutableData *data, uint64_t value)
                      @"Native report snapshot exceeds host format limit");
         return nil;
     }
+    if (![_cache collectCompletedWithError:error] ||
+        ![self waitForQueries:queries error:error])
+        return nil;
     NSMutableData *data = [NSMutableData new];
     append32(data, 0x4d345250); /* M4RP, host wire format, not a register. */
     append32(data, 3);
@@ -483,7 +638,8 @@ static void append64(NSMutableData *data, uint64_t value)
     append32(data, scale);
     for (NV2AMetalPGRAPHQuery *q in queries) {
         uint64_t total, previous;
-        if (!query_counts(q, &total, &previous, error))
+        if (![self readCountsForQuery:q total:&total previous:&previous
+                                 error:error])
             return nil;
         append64(data, total);
         append64(data, previous);

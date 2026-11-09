@@ -61,12 +61,25 @@ static BOOL imgui_error(NSError **error, NSString *message)
     }
     _device = device;
     _pixelFormat = pixelFormat;
+    _context = ImGui::GetCurrentContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.BackendRendererUserData = (__bridge void *)self;
+    io.BackendRendererName = "xemu_metal4";
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+    return self;
+}
+
+- (BOOL)prepareDrawPipelineWithError:(NSError **)error
+{
+    if (_pipeline) {
+        return YES;
+    }
     MTL4CompilerDescriptor *compilerDescriptor = [MTL4CompilerDescriptor new];
     compilerDescriptor.label = @"xemu ImGui compiler";
     id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:compilerDescriptor error:error];
+        [_device newCompilerWithDescriptor:compilerDescriptor error:error];
     if (!compiler) {
-        return nil;
+        return NO;
     }
     MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
     libraryDescriptor.source = @(metal_shader_source);
@@ -76,7 +89,7 @@ static BOOL imgui_error(NSError **error, NSString *message)
     id<MTLLibrary> library =
         [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
     if (!library) {
-        return nil;
+        return NO;
     }
     MTL4LibraryFunctionDescriptor *vertex = [MTL4LibraryFunctionDescriptor new];
     vertex.library = library;
@@ -103,18 +116,18 @@ static BOOL imgui_error(NSError **error, NSString *message)
         MTLPrimitiveTopologyClassTriangle;
     MTL4RenderPipelineColorAttachmentDescriptor *color =
         pipelineDescriptor.colorAttachments[0];
-    color.pixelFormat = pixelFormat;
+    color.pixelFormat = _pixelFormat;
     color.blendingState = MTL4BlendStateEnabled;
     color.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
     color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     color.sourceAlphaBlendFactor = MTLBlendFactorOne;
     color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    _pipeline =
+    id<MTLRenderPipelineState> pipeline =
         [compiler newRenderPipelineStateWithDescriptor:pipelineDescriptor
                                    compilerTaskOptions:nil
                                                  error:error];
-    if (!_pipeline) {
-        return nil;
+    if (!pipeline) {
+        return NO;
     }
     MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
     sampler.supportArgumentBuffers = YES;
@@ -122,23 +135,21 @@ static BOOL imgui_error(NSError **error, NSString *message)
     sampler.magFilter = MTLSamplerMinMagFilterLinear;
     sampler.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    _sampler = [device newSamplerStateWithDescriptor:sampler];
+    id<MTLSamplerState> state = [_device newSamplerStateWithDescriptor:sampler];
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 2;
     arguments.maxTextureBindCount = 1;
     arguments.maxSamplerStateBindCount = 1;
     arguments.initializeBindings = YES;
-    _arguments = [device newArgumentTableWithDescriptor:arguments error:error];
-    if (!_sampler || !_arguments) {
-        imgui_error(error, @"Could not allocate ImGui bindings");
-        return nil;
+    id<MTL4ArgumentTable> table =
+        [_device newArgumentTableWithDescriptor:arguments error:error];
+    if (!state || !table) {
+        return imgui_error(error, @"Could not allocate ImGui bindings");
     }
-    _context = ImGui::GetCurrentContext();
-    ImGuiIO &io = ImGui::GetIO();
-    io.BackendRendererUserData = (__bridge void *)self;
-    io.BackendRendererName = "xemu_metal4";
-    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
-    return self;
+    _sampler = state;
+    _arguments = table;
+    _pipeline = pipeline;
+    return YES;
 }
 
 - (BOOL)newFrameWithError:(NSError **)error
@@ -223,6 +234,16 @@ static BOOL imgui_error(NSError **error, NSString *message)
                 target:(id<MTLTexture>)target
                  error:(NSError **)error
 {
+    return [self encodeDrawData:drawData commands:commands target:target
+                           clear:NO error:error];
+}
+
+- (BOOL)encodeDrawData:(const ImDrawData *)drawData
+              commands:(NV2AMetalCommands *)commands
+                target:(id<MTLTexture>)target
+                 clear:(BOOL)clear
+                 error:(NSError **)error
+{
     if (!_context || _context != ImGui::GetCurrentContext() || !drawData ||
         commands.device != _device || !commands.commandBuffer ||
         target.device != _device || target.pixelFormat != _pixelFormat ||
@@ -237,79 +258,120 @@ static BOOL imgui_error(NSError **error, NSString *message)
         !std::isfinite(drawData->DisplayPos.y)) {
         return imgui_error(error, @"Invalid ImGui viewport");
     }
-    if (width < 1 || height < 1 || drawData->CmdListsCount == 0) {
+    BOOL hasDraws = width >= 1 && height >= 1 && drawData->CmdListsCount != 0;
+    if (!hasDraws && !clear) {
         return YES;
     }
-    if (drawData->DisplaySize.x <= 0 || drawData->DisplaySize.y <= 0 ||
-        width > target.width || height > target.height) {
+    if (hasDraws && (drawData->DisplaySize.x <= 0 ||
+                     drawData->DisplaySize.y <= 0 || width > target.width ||
+                     height > target.height)) {
         return imgui_error(error, @"ImGui viewport exceeds its Metal target");
     }
-    float projection[] = { 2.0f / drawData->DisplaySize.x,
-                           -2.0f / drawData->DisplaySize.y, 0, 0 };
-    projection[2] = -1.0f - drawData->DisplayPos.x * projection[0];
-    projection[3] = 1.0f - drawData->DisplayPos.y * projection[1];
-    id<MTLBuffer> constants =
-        [_device newBufferWithBytes:projection
-                             length:sizeof(projection)
-                            options:MTLResourceStorageModeShared];
-    if (!constants) {
-        return imgui_error(error, @"Could not allocate ImGui projection");
+    int listCount = hasDraws ? drawData->CmdListsCount : 0;
+    /* Backend-owned vertex/index data and projection are immutable CPU
+     * uploads. Only fragment textures/attachments depend on prior GPU work.
+     * Opaque callbacks may encode their own vertex work; keep their original
+     * entry/exit scope. ResetRenderState only restores our own bindings. */
+    MTLStages stages = MTLStageFragment;
+    BOOL needsPipeline = NO;
+    for (int i = 0; i < listCount; i++) {
+        const ImDrawList *list = drawData->CmdLists[i];
+        if (!list->VtxBuffer.Size || !list->IdxBuffer.Size) {
+            continue;
+        }
+        for (const ImDrawCmd &draw : list->CmdBuffer) {
+            if (draw.UserCallback) {
+                if (draw.UserCallback != ImDrawCallback_ResetRenderState) {
+                    stages |= MTLStageVertex;
+                }
+            } else if (draw.ElemCount) {
+                needsPipeline = YES;
+            }
+        }
+        if (needsPipeline && (stages & MTLStageVertex)) {
+            break;
+        }
     }
-    if (![commands addResource:target error:error] ||
-        ![commands addResource:constants error:error] ||
-        ![commands keepAlive:self error:error]) {
+    if (needsPipeline && ![self prepareDrawPipelineWithError:error]) {
         return NO;
     }
-    [_arguments setAddress:constants.gpuAddress atIndex:1];
-    [_arguments setSamplerState:_sampler.gpuResourceID atIndex:0];
+    if (![commands addResource:target error:error]) {
+        return NO;
+    }
+    if (needsPipeline) {
+        float projection[] = { 2.0f / drawData->DisplaySize.x,
+                               -2.0f / drawData->DisplaySize.y, 0, 0 };
+        projection[2] = -1.0f - drawData->DisplayPos.x * projection[0];
+        projection[3] = 1.0f - drawData->DisplayPos.y * projection[1];
+        NSUInteger constantsOffset = 0;
+        id<MTLBuffer> constants = [commands uploadBytes:projection
+                                                 length:sizeof(projection)
+                                                 offset:&constantsOffset
+                                                  error:error];
+        if (!constants || ![commands keepAlive:self error:error]) {
+            return NO;
+        }
+        [_arguments setAddress:constants.gpuAddress + constantsOffset
+                       atIndex:1];
+        [_arguments setSamplerState:_sampler.gpuResourceID atIndex:0];
+    }
     MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
     pass.colorAttachments[0].texture = target;
-    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].loadAction =
+        clear ? MTLLoadActionClear : MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     id<MTL4RenderCommandEncoder> encoder =
         [commands.commandBuffer renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
         return imgui_error(error, @"Could not create ImGui render encoder");
     }
     [encoder barrierAfterQueueStages:MTLStageAll
-                        beforeStages:MTLStageVertex | MTLStageFragment
+                        beforeStages:stages
                    visibilityOptions:MTL4VisibilityOptionDevice];
-    [self setupEncoder:encoder
-                 width:(NSUInteger)width
-                height:(NSUInteger)height];
+    if (needsPipeline) {
+        [self setupEncoder:encoder
+                     width:(NSUInteger)width
+                    height:(NSUInteger)height];
+    }
     BOOL success = YES;
-    for (int listIndex = 0; success && listIndex < drawData->CmdListsCount;
+    for (int listIndex = 0; success && listIndex < listCount;
          listIndex++) {
         const ImDrawList *list = drawData->CmdLists[listIndex];
         if (list->VtxBuffer.Size == 0 || list->IdxBuffer.Size == 0) {
             continue;
         }
-        id<MTLBuffer> vertices =
-            [_device newBufferWithBytes:list->VtxBuffer.Data
-                                 length:(NSUInteger)list->VtxBuffer.Size *
-                                        sizeof(ImDrawVert)
-                                options:MTLResourceStorageModeShared];
-        id<MTLBuffer> indices =
-            [_device newBufferWithBytes:list->IdxBuffer.Data
-                                 length:(NSUInteger)list->IdxBuffer.Size *
-                                        sizeof(ImDrawIdx)
-                                options:MTLResourceStorageModeShared];
-        if (!vertices || !indices) {
-            success = imgui_error(error, @"Could not allocate ImGui geometry");
-            break;
+        NSUInteger indexBytes = 0, indexOffset = 0;
+        id<MTLBuffer> indices = nil;
+        if (needsPipeline) {
+            NSUInteger vertexBytes = (NSUInteger)list->VtxBuffer.Size *
+                                     sizeof(ImDrawVert);
+            indexBytes = (NSUInteger)list->IdxBuffer.Size * sizeof(ImDrawIdx);
+            NSUInteger vertexOffset;
+            id<MTLBuffer> vertices = [commands uploadBytes:list->VtxBuffer.Data
+                                                   length:vertexBytes
+                                                   offset:&vertexOffset
+                                                    error:error];
+            if (vertices) {
+                indices = [commands uploadBytes:list->IdxBuffer.Data
+                                         length:indexBytes
+                                         offset:&indexOffset
+                                          error:error];
+            }
+            if (!indices) {
+                success = NO;
+                break;
+            }
+            [_arguments setAddress:vertices.gpuAddress + vertexOffset atIndex:0];
         }
-        if (![commands addResource:vertices error:error] ||
-            ![commands addResource:indices error:error]) {
-            success = NO;
-            break;
-        }
-        [_arguments setAddress:vertices.gpuAddress atIndex:0];
         for (const ImDrawCmd &draw : list->CmdBuffer) {
             if (draw.UserCallback) {
                 if (draw.UserCallback == ImDrawCallback_ResetRenderState) {
-                    [self setupEncoder:encoder
-                                 width:(NSUInteger)width
-                                height:(NSUInteger)height];
+                    if (needsPipeline) {
+                        [self setupEncoder:encoder
+                                     width:(NSUInteger)width
+                                    height:(NSUInteger)height];
+                    }
                 } else {
                     draw.UserCallback(list, &draw);
                 }
@@ -374,14 +436,15 @@ static BOOL imgui_error(NSError **error, NSString *message)
                                  indexType:sizeof(ImDrawIdx) == 2 ?
                                                MTLIndexTypeUInt16 :
                                                MTLIndexTypeUInt32
-                               indexBuffer:indices.gpuAddress + offset
-                         indexBufferLength:indices.length - offset
+                               indexBuffer:indices.gpuAddress + indexOffset +
+                                           offset
+                         indexBufferLength:indexBytes - offset
                              instanceCount:1
                                 baseVertex:draw.VtxOffset
                               baseInstance:0];
         }
     }
-    [encoder barrierAfterStages:MTLStageVertex | MTLStageFragment
+    [encoder barrierAfterStages:stages
               beforeQueueStages:MTLStageAll
               visibilityOptions:MTL4VisibilityOptionDevice];
     [encoder endEncoding];

@@ -67,6 +67,39 @@ static void cpu_deferred_write_tests(id<MTLDevice> device)
             error);
     assert(same > after);
 
+    const NV2AMetalVRAMReadSpan split[] = { { 4096, 4 }, { 200 * 4096, 4 } };
+    assert(nv2a_metal_try_cpu_access(guard, 8 * 4096, 4, YES));
+    assert(nv2a_metal_try_cpu_access(guard, 200 * 4096, 4, YES));
+    uint64_t splitVersion = 0, farVersion = 0, gapVersion = 0;
+    require([cache sourceVersionForReadSpans:split
+                                      count:sizeof(split) / sizeof(*split)
+                                    version:&splitVersion error:&error] &&
+                [cache sourceVersionAtAddress:200 * 4096 length:4
+                                       version:&farVersion error:&error] &&
+                [cache sourceVersionAtAddress:8 * 4096 length:4
+                                       version:&gapVersion error:&error],
+            error);
+    assert(splitVersion == farVersion && splitVersion > same &&
+           gapVersion > splitVersion);
+    require([cache sourceVersionForReadSpans:NULL count:0
+                                    version:&gapVersion error:&error], error);
+    assert(!gapVersion);
+
+    uint64_t versions[2];
+    assert(nv2a_metal_try_cpu_access(guard, 4096, 4, YES));
+    require([cache sourceVersionsForReadSpans:split
+                                       count:sizeof(split) / sizeof(*split)
+                                    versions:versions firstSurface:NULL
+                                       error:&error], error);
+    assert(versions[0] > farVersion && versions[1] == farVersion);
+    uint64_t nearVersion = versions[0];
+    assert(nv2a_metal_try_cpu_access(guard, 200 * 4096, 4, YES));
+    require([cache sourceVersionsForReadSpans:split
+                                       count:sizeof(split) / sizeof(*split)
+                                    versions:versions firstSurface:NULL
+                                       error:&error], error);
+    assert(versions[0] == nearVersion && versions[1] > nearVersion);
+
     id<MTLBuffer> copied = encode_vram_copy(cache, 4 * 4096, 32);
     assert(!nv2a_metal_try_cpu_access(guard, 4 * 4096, 4, YES));
     assert(nv2a_metal_try_cpu_access(guard, 8 * 4096, 4, YES));
@@ -105,7 +138,9 @@ static void cpu_deferred_write_tests(id<MTLDevice> device)
     assert(!nv2a_metal_try_cpu_access(guard, 127 * 4096, 1, YES));
     assert(!nv2a_metal_try_cpu_access(guard, 128 * 4096, 1, YES));
     require([cache discardForRestoreWithError:&error], error);
-    assert(!nv2a_metal_try_cpu_access(guard, 128 * 4096, 1, YES));
+    /* Restore removed the valid binding and drained its download. The source
+     * watch remains; a fast write now only publishes deferred dirty state. */
+    assert(nv2a_metal_try_cpu_access(guard, 128 * 4096, 1, YES));
 
     NSObject *lock = [cache valueForKey:@"stateLock"];
     dispatch_semaphore_t held = dispatch_semaphore_create(0);
@@ -237,13 +272,15 @@ static void cpu_read_guard_tests(id<MTLDevice> device)
     assert(pixel == 0xffff0000);
     require([cache invalidateAddress:surfaceAddress length:1 error:&error],
             error);
-    assert(!nv2a_metal_untracked_cpu_access(guard, surfaceAddress, 4, NO));
+    /* The removed surface has completed its download; no active target
+     * remains on either formerly occupied page. */
+    assert(nv2a_metal_untracked_cpu_access(guard, surfaceAddress, 4, NO));
     require([cache prepareGPUWriteAtAddress:128 * 4096 - 1
                                      length:8194
                                       error:&error],
             error);
     for (unsigned page = 0; page < 256; page++) {
-        BOOL watched = page == 63 || page == 64 || (page >= 127 && page <= 130);
+        BOOL watched = page >= 127 && page <= 130;
         assert(nv2a_metal_untracked_cpu_access(guard, page * 4096, 4096, NO) ==
                !watched);
     }
@@ -278,9 +315,10 @@ static void cpu_read_guard_tests(id<MTLDevice> device)
     assert(nv2a_metal_untracked_cpu_access(guard, 8192, 16, NO));
     [cache cancel];
     assert(!nv2a_metal_untracked_cpu_access(guard, 8192, 16, YES));
-    assert(!nv2a_metal_untracked_cpu_access(guard, 128 * 4096, 1, NO));
+    /* The unsubmitted raw write was cancelled; source-watch bits persist. */
+    assert(nv2a_metal_untracked_cpu_access(guard, 128 * 4096, 1, NO));
     require([cache discardForRestoreWithError:&error], error);
-    assert(!nv2a_metal_untracked_cpu_access(guard, 128 * 4096, 1, NO));
+    assert(nv2a_metal_untracked_cpu_access(guard, 128 * 4096, 1, NO));
     NSObject *lock = [cache valueForKey:@"stateLock"];
     dispatch_semaphore_t held = dispatch_semaphore_create(0);
     dispatch_semaphore_t release = dispatch_semaphore_create(0);

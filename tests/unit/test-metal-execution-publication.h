@@ -227,6 +227,10 @@ static void execution_publication_tests(id<MTLDevice> device)
         IndependentReadReceipt *second = [IndependentReadReceipt new];
         second.nativeSubmission = later.lastSubmitted;
         [b setValue:second forKey:@"submission"];
+        /* Exercise rollback within one batch: the suffix is already open
+         * when it acquires the second dependency. */
+        require([cache prepareGPUReadAtAddress:0 length:0 error:&error],
+                error);
         gpu_dep_write(cache, 40000, UINT64_C(0x8888888888888888));
         NV2AMetalSurfaceRecording *cancelled = cache.recording;
         assert([[cache valueForKey:@"pendingReadWitnesses"] count] == 2);

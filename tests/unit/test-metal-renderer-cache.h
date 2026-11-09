@@ -102,6 +102,9 @@ static void renderer_cache_contract_test(void)
     NV2AMetalLRUCache *cache = [draw valueForKey:@"pixels"];
     assert([cache isKindOfClass:NV2AMetalLRUCache.class]);
     [cache removeAllObjects];
+    /* Prior tests can still retain a pipeline cache through command slots. */
+    NSMapTable *pipelineIndex = [draw valueForKey:@"pixelPipelineCaches"];
+    [pipelineIndex removeAllObjects];
     uint64_t hits = cache.hitCount, misses = cache.missCount,
              evictions = cache.evictionCount;
     NV2AMetalCommands *commands =
@@ -142,6 +145,13 @@ static void renderer_cache_contract_test(void)
                                             config:&config
                                              error:&error];
     require(raster != nil, error);
+    config.control[0] |= NV_PGRAPH_CONTROL_0_ZENABLE |
+                         NV_PGRAPH_CONTROL_0_ZWRITEENABLE | 1 << 16;
+    NV2AMetalDrawState *depthRaster =
+        [[NV2AMetalDrawState alloc] initWithDevice:commands.device
+                                            config:&config
+                                             error:&error];
+    require(depthRaster != nil, error);
     NSMutableArray *outputs = [NSMutableArray new];
     NSHashTable *owners = [NSHashTable weakObjectsHashTable];
     __weak NV2AMetalPixelShader *hot = nil;
@@ -175,7 +185,8 @@ static void renderer_cache_contract_test(void)
                 if (format == 1 && z == 0)
                     oldest = pixel;
                 [owners addObject:pixel];
-                renderer_encode(pixel, commands, vertices, query, raster,
+                renderer_encode(pixel, commands, vertices, query,
+                                z ? depthRaster : raster,
                                 format, depths[z], outputs);
                 maxCached = MAX(maxCached, cache.count);
                 assert(cache.count <= 32);
@@ -190,7 +201,8 @@ static void renderer_cache_contract_test(void)
                 NV2AMetalPixelShader *pixel =
                     renderer_select(format, depths[z]);
                 assert(cache.missCount == previousMisses);
-                renderer_encode(pixel, commands, vertices, query, raster,
+                renderer_encode(pixel, commands, vertices, query,
+                                z ? depthRaster : raster,
                                 format, depths[z], outputs);
             }
         }
@@ -204,14 +216,21 @@ static void renderer_cache_contract_test(void)
            cache.evictionCount - evictions == 8);
     unsigned pipelineMisses = 0, pipelineHits = 0;
     @autoreleasepool {
+        NSMutableSet<NV2AMetalLRUCache *> *pipelineCaches = [NSMutableSet new];
         for (NV2AMetalPixelShader *pixel in owners) {
             NV2AMetalLRUCache *pipeline =
                 [pixel valueForKey:@"fragmentPipelines"];
+            [pipelineCaches addObject:pipeline];
+        }
+        assert(pipelineCaches.count == 6);
+        for (NV2AMetalLRUCache *pipeline in pipelineCaches) {
+            assert(pipeline.count == 1);
             pipelineMisses += pipeline.missCount;
             pipelineHits += pipeline.hitCount;
         }
     }
-    assert(pipelineMisses == 40 && pipelineHits == 56);
+    assert(pipelineMisses == 6 && pipelineHits == 90);
+    __weak id sharedFallbacks;
     @autoreleasepool {
         NV2AMetalShaderLibrary *pixelModule =
             [hot valueForKey:@"sharedLibrary"];
@@ -268,8 +287,11 @@ static void renderer_cache_contract_test(void)
         if (priorDownload)
             assert([transfer valueForKey:@"download"] == priorDownload);
         NSMutableSet *arguments = [NSMutableSet new];
+        sharedFallbacks = [hot valueForKey:@"fallbacks"];
+        assert(sharedFallbacks);
         for (NV2AMetalPixelShader *pixel in owners) {
             assert([pixel valueForKey:@"sharedLibrary"] == pixelModule);
+            assert([pixel valueForKey:@"fallbacks"] == sharedFallbacks);
             [arguments addObject:[pixel valueForKey:@"arguments"]];
         }
         assert(arguments.count == 40);
@@ -322,17 +344,20 @@ static void renderer_cache_contract_test(void)
     @autoreleasepool {
         assert(recreated && !hot && cache.count == 0 &&
                owners.allObjects.count == 0);
+        assert(sharedFallbacks &&
+               [recreated valueForKey:@"fallbacks"] == sharedFallbacks);
     }
     [commands cancel];
     assert(!recreated);
     qemu_mutex_unlock(&state->pgraph.lock);
     printf(
         "Metal renderer cache: 40 format/depth variants, 56 renderer hits, "
-        "8 selective evictions, peak32 cached/40 recording-retained; 40 "
-        "complete pipeline builds and56 pipeline hits; %u exact "
+        "8 selective evictions, peak32 cached/40 recording-retained; 6 "
+        "complete pipeline builds and 90 pipeline hits; %u exact "
         "color pixels/6144 GPU samples; failed construction, evicted "
         "recreation, completion/clear/cancel lifetime; one shared compiler, "
-        "transfer library/one pipeline on first compute use,40 private "
+        "transfer library/one pipeline on first compute use,one shared "
+        "fallback set,40 private "
         "argument tables PASS\n",
         pixels);
     groups++;

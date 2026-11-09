@@ -36,11 +36,11 @@ API_AVAILABLE(macos(26.0))
 /* Requires pg.lock and the live VRAM cache owned by the surface adapter.
  * NV2AState/VRAM outlive this object. TCG CPU hooks and NV2ATEX dirty pages
  * maintain source versions; other hosts reject GPU/CPU ownership conflicts.
- * Palette decodes submit and wait before return so faults cannot
- * reach a draw; prepare render attachments AFTER this call, since that wait
- * ends a recording. Other sources stay asynchronous on the same native command
- * queue. Flush cache content on save/restore/scale teardown along with surface
- * flush. This adapter is not an active renderer registration. */
+ * Short-palette decodes submit and wait for their producers before return so
+ * faults cannot reach a draw; prepare render attachments AFTER this call,
+ * since that wait ends a recording. Other sources stay asynchronous on the
+ * same native command queue. Flush cache content on save/restore/scale teardown
+ * along with surface flush. This adapter is not an active renderer registration. */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalPGRAPHTextures : NSObject
 @property(nonatomic, readonly) NV2AMetalTextureCache *cache;

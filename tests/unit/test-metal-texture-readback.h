@@ -35,6 +35,76 @@ static unsigned test_texture_swizzle_index(MTLTextureSwizzle swizzle)
     abort();
 }
 
+/* Read through Metal's format/swizzle contract, independently of the
+ * capture's raw blit and portable byte serialization. */
+static id<MTLBuffer> test_metal_read_2d_texture(NV2AMetalCommands *commands,
+                                                 id<MTLTexture> texture,
+                                                 unsigned level)
+{
+    static id<MTLComputePipelineState> pipeline;
+    static id<MTL4ArgumentTable> arguments;
+    NSError *error = nil;
+    assert(texture.textureType == MTLTextureType2D && texture.sampleCount == 1);
+    if (!pipeline) {
+        id<MTL4Compiler> compiler = [commands.device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        test_texture_require(compiler != nil, error);
+        MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
+        ld.source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void read_2d(texture2d<float,access::read> t [[texture(0)]],"
+            "device float4 *out [[buffer(0)]], constant uint2 &s [[buffer(1)]],"
+            "uint2 p [[thread_position_in_grid]]) { "
+            "if(p.x<t.get_width(s.y)&&p.y<t.get_height(s.y)) "
+            "out[p.y*s.x+p.x]=t.read(p,s.y); }";
+        ld.options = [MTLCompileOptions new];
+        ld.options.languageVersion = MTLLanguageVersion4_0;
+        ld.options.mathMode = MTLMathModeSafe;
+        id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:&error];
+        test_texture_require(library != nil, error);
+        MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
+        fn.library = library;
+        fn.name = @"read_2d";
+        MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
+        pd.computeFunctionDescriptor = fn;
+        pipeline = [compiler newComputePipelineStateWithDescriptor:pd
+                                             compilerTaskOptions:nil error:&error];
+        test_texture_require(pipeline != nil, error);
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+        ad.maxBufferBindCount = 2;
+        ad.maxTextureBindCount = 1;
+        ad.initializeBindings = YES;
+        arguments = [commands.device newArgumentTableWithDescriptor:ad error:&error];
+        test_texture_require(arguments != nil, error);
+    }
+    NSUInteger width = MAX(1ul, texture.width >> level);
+    NSUInteger height = MAX(1ul, texture.height >> level);
+    NSUInteger row = (width * 16 + 255) & ~(NSUInteger)255;
+    id<MTLBuffer> out = [commands.device newBufferWithLength:row * height
+                                                   options:MTLResourceStorageModeShared];
+    const uint32_t shape[] = {(uint32_t)(row / 16), level};
+    id<MTLBuffer> uniforms = [commands.device newBufferWithBytes:shape length:sizeof(shape)
+                                                       options:MTLResourceStorageModeShared];
+    assert(out && uniforms && pipeline.device == commands.device);
+    test_texture_require([commands addResource:texture error:&error] &&
+                            [commands addResource:out error:&error] &&
+                            [commands addResource:uniforms error:&error], error);
+    id<MTL4ComputeCommandEncoder> e = [commands.commandBuffer computeCommandEncoder];
+    assert(e);
+    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    [arguments setTexture:texture.gpuResourceID atIndex:0];
+    [arguments setAddress:out.gpuAddress atIndex:0];
+    [arguments setAddress:uniforms.gpuAddress atIndex:1];
+    [e setComputePipelineState:pipeline];
+    [e setArgumentTable:arguments];
+    [e dispatchThreads:MTLSizeMake(width, height, 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
+        visibilityOptions:MTL4VisibilityOptionDevice];
+    [e endEncoding];
+    return out;
+}
+
 /* Preserve the tests' float4 row layout without interpreting RGBA bytes as
  * float bits. Float textures remain raw blits (including NaN payloads).
  * UNORM and half texels are expanded on the GPU after the raw subresource
@@ -47,6 +117,10 @@ test_metal_read_texture_decoded(NV2AMetalCommands *commands,
                                 id<MTLTexture> texture, unsigned level,
                                 unsigned face, unsigned unsignedHalfMask)
 {
+    if (texture.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+        assert(!face && !unsignedHalfMask);
+        return test_metal_read_2d_texture(commands, texture, level);
+    }
     static id<MTLDevice> pipelineDevice;
     static id<MTLComputePipelineState> pipeline;
     static id<MTL4ArgumentTable> arguments;
@@ -61,11 +135,15 @@ test_metal_read_texture_decoded(NV2AMetalCommands *commands,
     unsigned floatLanes = texture.pixelFormat == MTLPixelFormatR32Float  ? 1 :
                           texture.pixelFormat == MTLPixelFormatRG32Float ? 2 :
                                                                            0;
-    BOOL compact = half4 || snorm8 || packed16 || floatLanes ||
+    unsigned byteLanes = texture.pixelFormat == MTLPixelFormatR8Unorm  ? 1 :
+                         texture.pixelFormat == MTLPixelFormatRG8Unorm ? 2 :
+                                                                         0;
+    BOOL compact = half4 || snorm8 || packed16 || floatLanes || byteLanes ||
                    texture.pixelFormat == MTLPixelFormatRGBA8Unorm;
     unsigned rawBytes = packed16   ? 2 :
                         half4      ? 8 :
                         floatLanes ? 4 * floatLanes :
+                        byteLanes  ? byteLanes :
                                      4;
     assert(compact || texture.pixelFormat == MTLPixelFormatRGBA32Float);
     assert(!unsignedHalfMask || (half4 && unsignedHalfMask < 15));
@@ -104,6 +182,10 @@ test_metal_read_texture_decoded(NV2AMetalCommands *commands,
              "uint4 bits; if(s[5]==7){"
              "bits=as_type<uint4>(max(float4(((device const char4*)src)[index])"
              "/127.0f,float4(-1)));"
+             "} else if (s[5] >= 8) { uint lanes=s[5]-7; "
+             "float v[6]={float(src[index*lanes])/255.0f,"
+             "lanes==2 ? float(src[index*lanes+1])/255.0f : 0,0,1,0,1}; "
+             "bits=as_type<uint4>(float4(v[s[6]],v[s[7]],v[s[8]],v[s[9]])); "
              "}else if(s[5]>=4){uint v=((device const "
              "ushort*)src)[index];"
              "float4 color=s[5]==4 ? float4(float(v>>11)/31.0f,"
@@ -168,6 +250,7 @@ test_metal_read_texture_decoded(NV2AMetalCommands *commands,
             packed1555 ? 5 :
             packed4444 ? 6 :
             floatLanes ? floatLanes + 1 :
+            byteLanes  ? byteLanes + 7 :
                          half4,
             test_texture_swizzle_index(swizzle.red),
             test_texture_swizzle_index(swizzle.green),

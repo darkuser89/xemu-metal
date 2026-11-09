@@ -62,6 +62,14 @@ metal4_pixel_source = custom_target('nv2a-metal4-pixel-shader-source',
     capture: true,
 )
 
+metal4_pixel_interpreter_source = custom_target('nv2a-metal4-pixel-interpreter-source',
+    input: files('pixel-interpreter-prefix.metal', '../../nv2a_regs.h', '../psh_regs.h', 'pixel-combiner-types.h', 'texture-sampler-types.h', 'pixel-shader-types.h',
+                 'geometry-types.h', 'geometry-math.metal', 'polygon-coverage.metal', 'color-quantize.metal', 'pixel-specialization.metal', 'pixel-combiner.metal', 'texture-sample.metal', 'pixel-shader.metal'),
+    output: 'pixel-interpreter-source.h',
+    command: [python, files('shader-source.py'), '@INPUT@'],
+    capture: true,
+)
+
 metal4_texture_source = custom_target('nv2a-metal4-texture-upload-source',
     input: files('../../nv2a_regs.h', 'texture-upload-types.h', 'texture-upload.metal'),
     output: 'texture-upload-source.h',
@@ -114,9 +122,9 @@ metal4_vga_source = custom_target('nv2a-metal4-vga-source',
 # Build the native components independently until the PGRAPH callbacks and
 # window integration are complete. Do not select an incomplete renderer.
 nv2a_metal4 = static_library('nv2a-metal4',
-    sources: [files('command.m', 'lru-cache.m', 'shader-library.m', 'display.m', 'geometry.m', 'vertex-program.m', 'vertex-state.m', 'vertex-writable.m', 'vertex-epoch.m', 'pending-journal.m', 'pending-archive.m', 'archive-native.m', 'pending-native.m', 'vertex-stream.m', 'vertex-fixed.m', 'vertex-fetch.m', 'pixel-combiner.m', 'pixel-shader.m', 'texture-upload.m', 'texture-sampler.m', 'texture-snapshot.m', 'texture-snapshot-pgraph.m', 'draw-state.m', 'surface-transfer.m', 'surface-cache.m', 'clear.m', 'texture-cache.m', 'blit.m', 'scanout.m', 'vga.m'),
+    sources: [files('command.m', 'lru-cache.m', 'shader-library.m', 'pipeline-compiler.m', 'display.m', 'geometry.m', 'vertex-program.m', 'vertex-state.m', 'vertex-writable.m', 'vertex-epoch.m', 'pending-journal.m', 'pending-archive.m', 'archive-native.m', 'pending-native.m', 'vertex-stream.m', 'vertex-fixed.m', 'vertex-fetch.m', 'pixel-combiner.m', 'pixel-shader.m', 'texture-upload.m', 'texture-sampler.m', 'texture-snapshot.m', 'texture-snapshot-pgraph.m', 'draw-state.m', 'surface-transfer.m', 'surface-cache.m', 'clear.m', 'texture-cache.m', 'blit.m', 'scanout.m', 'vga.m'),
               metal4_display_source, metal4_geometry_source, metal4_program_source, metal4_context_source,
-              metal4_fixed_source, metal4_fetch_source, metal4_combiner_source, metal4_pixel_source, metal4_texture_source, metal4_surface_source, metal4_clear_source, metal4_texture_cache_source, metal4_blit_source, metal4_scanout_source, metal4_vga_source],
+              metal4_fixed_source, metal4_fetch_source, metal4_combiner_source, metal4_pixel_source, metal4_pixel_interpreter_source, metal4_texture_source, metal4_surface_source, metal4_clear_source, metal4_texture_cache_source, metal4_blit_source, metal4_scanout_source, metal4_vga_source],
     objc_args: metal4_objc_args,
     dependencies: metal4_frameworks,
 )

@@ -188,6 +188,36 @@ static void rtt_color_at(id<MTLBuffer> out, unsigned width, unsigned x,
     else
         color_at(out, width, x, y, r, g, b, a);
 }
+static void reject_first_capture_allocation(NV2AMetalTextureSource *source)
+{
+    assert(![textures valueForKey:@"capture"] &&
+           ![textures valueForKey:@"arguments"]);
+    Method allocation = class_getInstanceMethod(
+        object_getClass(commands.device),
+        @selector(newTextureWithDescriptor:));
+    assert(allocation);
+    IMP injected = imp_implementationWithBlock(
+        ^id<MTLTexture>(id<MTLDevice> device, MTLTextureDescriptor *descriptor) {
+          assert(device == commands.device &&
+                 descriptor.pixelFormat == MTLPixelFormatBGR5A1Unorm &&
+                 descriptor.storageMode == MTLStorageModePrivate &&
+                 descriptor.usage == MTLTextureUsageShaderRead);
+          return nil;
+        });
+    IMP original = method_setImplementation(allocation, injected);
+    NV2AMetalSurfaceRecording *pending = surfaces.recording;
+    NSUInteger count = textures.count;
+    NV2AMetalSamplerConfig sampler = policy();
+    NSError *error = nil;
+    assert(![textures prepareSource:source sampler:&sampler frame:1 error:&error] &&
+           error);
+    method_setImplementation(allocation, original);
+    assert(imp_removeBlock(injected));
+    assert(pending && !surfaces.recording && pending.cancelled &&
+           !pending.submitted && textures.count == count &&
+           ![textures valueForKey:@"capture"] && ![textures valueForKey:@"arguments"]);
+}
+
 static void rtt_tests(void)
 {
     NSError *error = nil;
@@ -227,6 +257,14 @@ static void rtt_tests(void)
                                                                 frame:1
                                                                 error:&error];
         require(s != nil, error);
+        NV2AMetalTextureSource src =
+            source(address, texture_formats[f], 4, 4 * bytes);
+        if (!f) {
+            reject_first_capture_allocation(&src);
+            s = [surfaces prepareSurfaceAtAddress:address config:&layout
+                                            frame:1 error:&error];
+            require(s != nil, error);
+        }
         NV2AMetalClearConfig c = { .parameter = NV097_CLEAR_SURFACE_COLOR,
                                    .rect = { 0, 0, 8, 8 },
                                    .uniforms = { .color = { 1, 0, 0, 0 },
@@ -236,13 +274,15 @@ static void rtt_tests(void)
         c.uniforms.color[0] = 0;
         c.uniforms.color[2] = 1;
         clear(s, c);
-        NV2AMetalTextureSource src =
-            source(address, texture_formats[f], 4, 4 * bytes);
         unsigned before = notifications;
         NV2AMetalCachedTexture *t = prepare(src);
+        assert(![textures valueForKey:@"capture"] &&
+               ![textures valueForKey:@"arguments"]);
         assert(t.scale == 2 && t.binding.texture.width == 8 && s.dirty);
         assert(t.binding.texture.pixelFormat == (bytes == 4 ?
-            MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA32Float));
+            MTLPixelFormatBGRA8Unorm :
+            surface_formats[f] == 3 ? MTLPixelFormatB5G6R5Unorm :
+                                     MTLPixelFormatBGR5A1Unorm));
         id<MTLBuffer> out = read_texture(t);
         finish();
         require([t validateCompletedWithError:&error], error);
@@ -352,7 +392,7 @@ static void compact_rtt_tests(void)
                 src.length = 1024;
                 unsigned before = notifications;
                 NV2AMetalCachedTexture *t = prepare(src);
-                assert(t.binding.texture.pixelFormat == MTLPixelFormatRGBA8Unorm);
+                assert(t.binding.texture.pixelFormat == MTLPixelFormatBGRA8Unorm);
                 assert(t.scale == scale && t.binding.texture.width == 16 * scale);
                 NV2AMetalCachedTexture *hit = prepare(src);
                 assert(hit.binding.texture == t.binding.texture);
@@ -378,6 +418,11 @@ static void compact_rtt_tests(void)
                 require(snapshot != nil, error);
                 unsigned width = 16 * scale;
                 assert(snapshot.length == 40 + width * width * 4);
+                const uint8_t *header = snapshot.bytes;
+                unsigned storage = f < 2 ? 21 : permutation == 0 ? 20 :
+                                   permutation == 1 ? 22 : 23;
+                assert(header[39] == storage && !header[36] &&
+                       !header[37] && !header[38]);
                 const uint8_t *bytes = (const uint8_t *)snapshot.bytes + 40;
                 NSUInteger row = (width * 16 + 255) & ~(NSUInteger)255;
                 for (unsigned y = 0; y < width; y++) {
@@ -386,6 +431,7 @@ static void compact_rtt_tests(void)
                         const uint8_t rgba[] = { i, 255 - i, i * 71,
                                                 f < 2 ? 255 : i * 29 + 7 };
                         const uint8_t replacement[] = { 255, 0, 0, f < 2 ? 255 : 0 };
+                        const uint8_t raw[] = { i * 71, 255 - i, i, i * 29 + 7 };
                         const float *a = (const float *)((uint8_t *)original.contents +
                                                        y * row + x * 16);
                         const float *b = (const float *)((uint8_t *)old.contents +
@@ -396,7 +442,7 @@ static void compact_rtt_tests(void)
                             uint8_t expected = rgba[order[permutation][k]];
                             assert(a[k] == expected / 255.f && b[k] == a[k]);
                             assert(n[k] == replacement[order[permutation][k]] / 255.f);
-                            assert(bytes[(y * width + x) * 4 + k] == expected);
+                            assert(bytes[(y * width + x) * 4 + k] == raw[k]);
                             channels++;
                         }
                     }
@@ -404,10 +450,19 @@ static void compact_rtt_tests(void)
                 id<MTLTexture> restored =
                     nv2a_metal_texture_restore(snapshot, commands, &error);
                 require(restored != nil, error);
-                assert(restored.pixelFormat == MTLPixelFormatRGBA8Unorm);
+                assert(restored.pixelFormat == MTLPixelFormatBGRA8Unorm);
                 NSData *again = nv2a_metal_texture_snapshot(restored, commands, &error);
                 require(again != nil, error);
                 assert([snapshot isEqualToData:again]);
+                require([commands beginWithError:&error] != nil, error);
+                id<MTLBuffer> restoredPixels =
+                    test_metal_read_texture(commands, restored, 0, 0);
+                require([commands submitWithError:&error] &&
+                            [commands waitUntilIdleWithError:&error], error);
+                for (unsigned y = 0; y < width; y++)
+                    assert(!memcmp((uint8_t *)restoredPixels.contents + y * row,
+                                   (uint8_t *)original.contents + y * row,
+                                   width * 16));
                 if (f == 4 && scale == 2 && !permutation) {
                     MTLTextureDescriptor *td = [MTLTextureDescriptor
                         texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
@@ -425,7 +480,7 @@ static void compact_rtt_tests(void)
     }
     printf("Metal4 compact RTT: %u captures/cache hits/old-new isolation/"
            "restore-resave cycles, %u exact channels and raw snapshot bytes; "
-           "32x32 allocation RGBA8/Float32 %lu/%lu bytes PASS\n",
+           "32x32 allocation BGRA8/Float32 %lu/%lu bytes PASS\n",
            captures, channels, (unsigned long)compactAllocation,
            (unsigned long)floatAllocation);
     checks++;
@@ -492,6 +547,7 @@ static void rtt_layout_and_channel_tests(void)
                     unsigned before = notifications;
                     NV2AMetalCachedTexture *t = prepare(src);
                     BOOL direct = swizzle != linear && (linear || order == 0);
+                    BOOL captured = swizzle != linear;
                     assert(t.scale == (direct ? scale : 1));
                     id<MTLBuffer> out = read_texture(t);
                     finish();
@@ -517,9 +573,12 @@ static void rtt_layout_and_channel_tests(void)
                                                   argb[2],
                                      order == 2 ? argb[3] : argb[0]);
                         }
-                    if (direct)
+                    if (captured) {
                         assert(s.dirty && notifications == before);
-                    else {
+                        const unsigned char *raw = surfaces.vram.contents;
+                        for (unsigned i = 0; i < 64; i++)
+                            assert(raw[address + i] == 0);
+                    } else {
                         assert(!s.dirty && notifications == before + 1);
                         const unsigned char *raw = surfaces.vram.contents;
                         for (unsigned i = 0; i < 16; i++) {
@@ -892,6 +951,7 @@ static void signed_channel_cache_tests(void)
 
 @interface NSObject (MetalTextureKeyTest)
 - (instancetype)initWithKeyWords:(const uint64_t *)words;
+- (void)setLookupWords:(const uint64_t *)words;
 @end
 static void key_identity_tests(void)
 {
@@ -918,9 +978,21 @@ static void key_identity_tests(void)
         }
     }
     assert(![first isEqual:@[]]);
+    id probe = [[keyClass alloc] initWithKeyWords:NULL];
+    [probe setLookupWords:words];
+    assert([probe isEqual:first] && [probe hash] == [first hash]);
+    [map removeAllObjects];
+    map[probe] = @1;
+    words[0] ^= 1;
+    [probe setLookupWords:words];
+    assert(!map[probe] && [map[first] isEqual:@1]);
+    map[probe] = @2;
+    words[0] ^= 1;
+    [probe setLookupWords:words];
+    assert(map.count == 2 && [map[probe] isEqual:@1]);
     checks++;
     puts("Texture key identity: 1280 full-width field/bit distinctions, "
-         "equal-copy dictionary lookup PASS");
+         "equal-copy dictionary lookup and mutable probe isolation PASS");
 }
 
 static void deferred_source_tests(void)
@@ -980,6 +1052,15 @@ static void deferred_source_tests(void)
 }
 
 #include "test-metal-texture-hit-cache.h"
+#include "test-metal-content-epoch.h"
+#include "test-metal-packed-rtt.h"
+#include "test-metal-byte-rtt.h"
+#include "test-metal-cpu-prefix-comparison.h"
+#include "test-metal-rtt-prefix.h"
+#include "test-metal-rtt-capture-kernel.h"
+#include "test-metal-x8-rtt.h"
+#include "test-metal-swizzled-rtt.h"
+#include "test-metal-packed1555-rtt.h"
 
 int main(int argc, char **argv)
 {
@@ -987,8 +1068,10 @@ int main(int argc, char **argv)
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        NSUInteger vramLength =
+            argc == 2 && !strcmp(argv[1], "--byte-rtt") ? 262144 : 131072;
         id<MTLBuffer> vram =
-            [commands.device newBufferWithLength:131072
+            [commands.device newBufferWithLength:vramLength
                                          options:MTLResourceStorageModeShared];
         assert(vram);
         memset(vram.contents, 0, vram.length);
@@ -1008,6 +1091,57 @@ int main(int argc, char **argv)
         clearer = [[NV2AMetalClear alloc] initWithDevice:commands.device
                                                    error:&error];
         require(clearer != nil, error);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--packed1555-rtt")))
+            packed1555_rtt_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--packed1555-rtt"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--swizzled-rtt")))
+            swizzled_rtt_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--swizzled-rtt"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--x8-rtt")))
+            x8_rtt_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--x8-rtt"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--rtt-capture-kernel")))
+            rtt_capture_kernel_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--rtt-capture-kernel"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--rtt-prefix")))
+            rtt_prefix_tests();
+        if (argc == 2 && !strcmp(argv[1], "--rtt-prefix"))
+            return 0;
+        if (argc == 2 && !strcmp(argv[1], "--cpu-prefix-comparison")) {
+            cpu_prefix_comparison_tests();
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--byte-rtt")) {
+            byte_rtt_tests();
+            byte_rtt_fallback_tests();
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--packed-rtt")) {
+            packed_rtt_tests();
+            assert(![textures valueForKey:@"capture"] &&
+                   ![textures valueForKey:@"arguments"]);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--native-rtt")) {
+            compact_rtt_tests();
+            assert(![textures valueForKey:@"capture"] &&
+                   ![textures valueForKey:@"arguments"]);
+            puts("Native RTT: BGRA copies, immutable channel/alpha swizzles, "
+                 "zero capture pipeline/argument tables PASS");
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--content-epoch-cost")) {
+            texture_content_epoch_costs();
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--content-epoch")) {
+            texture_content_epoch_tests();
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--CPU-dirty-source")) {
             deferred_source_tests();
             return 0;
@@ -1016,7 +1150,10 @@ int main(int argc, char **argv)
         if (argc == 2 && !strcmp(argv[1], "--hit-cache"))
             return 0;
         ordinary_and_cancel_tests();
+        cpu_prefix_comparison_tests();
         rtt_tests();
+        puts("RTT startup: DMA and native captures skip shader setup; failed "
+             "texture allocation cancels the recording and retry restores sources PASS");
         compact_rtt_tests();
         rtt_layout_and_channel_tests();
         alias_tests();
@@ -1025,6 +1162,8 @@ int main(int argc, char **argv)
         lru_and_reject_tests();
         key_identity_tests();
         signed_channel_cache_tests();
+        texture_content_epoch_tests();
+        packed_rtt_tests();
         [textures removeAllTextures];
         require([surfaces flushWithError:&error], error);
         printf(

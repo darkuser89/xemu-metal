@@ -5,8 +5,9 @@
 static void inline_current_tests(void)
 {
     NSError *error = nil;
-    NSMutableArray *results = [NSMutableArray new],
-                   *expected = [NSMutableArray new];
+    NSMutableArray<NV2AMetalFetchResult *> *results = [NSMutableArray new];
+    NSMutableArray<NSData *> *expected = [NSMutableArray new];
+    NSMutableArray<NV2AMetalFetchResult *> *captured = [NSMutableArray new];
     const uint32_t special[] = { 0,          0x80000000, 1,          0x80000001,
                                  0x007fffff, 0x00800000, 0x3f800000, 0x7f7fffff,
                                  0xff7fffff, 0x7f800000, 0xff800000, 0x7fc12345,
@@ -38,36 +39,45 @@ static void inline_current_tests(void)
         check_captured_fetch(batches);
         assert(batches.count == 1 &&
                adapter.encodingCommands == surfaces.commands);
-        NV2AMetalProgramInput bits;
-        for (unsigned a = 0; a < 16; a++)
-            memcpy(bits.attributes[a],
-                   pg->vertex_attributes[a].inline_buffer_populated ?
-                       source[a][2] :
-                       before[a],
-                   16);
+        NV2AMetalProgramInput bits[3];
+        for (unsigned v = 0; v < 3; v++)
+            for (unsigned a = 0; a < 16; a++)
+                memcpy(bits[v].attributes[a],
+                       pg->vertex_attributes[a].inline_buffer_populated ?
+                           source[a][v] : before[a],
+                       16);
         memset(source, 0xa5, sizeof(source));
         require([adapter completeInlineCurrentSnapshotsWithError:&error],
                 error);
         assert(!adapter.encodingCommands && !pg->compressed_attrs);
         for (unsigned a = 0; a < 16; a++) {
             assert(!memcmp(pg->vertex_attributes[a].inline_value,
-                           bits.attributes[a], 16));
+                           bits[2].attributes[a], 16));
             assert(!pg->vertex_attributes[a].inline_buffer_populated);
         }
         assert(![adapter completeInlineCurrentSnapshotsWithError:&error]);
         [results addObject:((NV2AMetalPGRAPHFetchBatch *)reference[0]).fetch];
-        [expected addObject:[NSData dataWithBytes:&bits length:sizeof(bits)]];
+        [captured addObject:batches[0].fetch];
+        [expected addObject:[NSData dataWithBytes:bits length:sizeof(bits)]];
         require([surfaces checkpointWithError:&error], error);
     }
     require([surfaces submitWithError:&error], error);
     require([surfaces waitUntilIdleWithError:&error], error);
     for (unsigned i = 0; i < results.count; i++) {
         NV2AMetalFetchResult *r = results[i];
-        NSData *bits = expected[i];
+        NV2AMetalFetchResult *suffix = captured[i];
+        const NV2AMetalProgramInput *bits = expected[i].bytes;
+        unsigned prefix = i % 4;
+        assert(suffix.vertexCount == 3 - prefix);
+        if (suffix.vertexCount) {
+            assert(!memcmp(suffix.attributes.contents, bits + prefix,
+                           suffix.vertexCount * sizeof(*bits)));
+            assert(!*(const uint32_t *)suffix.faults.contents);
+        }
         assert(!memcmp((const uint8_t *)r.attributes.contents +
-                           r.vertexCount * sizeof(NV2AMetalProgramInput),
-                       bits.bytes, bits.length));
-        assert(!((uint32_t *)r.faults.contents)[r.vertexCount]);
+                           r.vertexCount * sizeof(*bits),
+                       bits + 2, sizeof(*bits)));
+        assert(!*(const uint32_t *)r.faults.contents);
     }
     reset();
     assert(![adapter encodeInlineCurrentSnapshotsWithPrefixes:@[]
@@ -85,7 +95,8 @@ static void inline_current_tests(void)
          "attributes, "
          "mixed populated masks, prefixes0..3, signed "
          "zero/subnormal/infinity/NaN payloads, "
-         "immutable source mutation, repeated completion and invalid sources "
+         "exact captured suffix after source mutation, repeated completion "
+         "and invalid sources "
          "PASS");
     groups++;
 }

@@ -4,20 +4,24 @@
 #define TEST_METAL_INLINE_PRODUCER_H
 static id<MTLSharedEvent> ip_gate;
 static id<MTLBuffer> ip_source, ip_destination;
+static NV2AMetalSubmission *ip_submission;
 static BOOL ip_enabled;
 static BOOL ip_clean_alias;
 static unsigned ip_encodes, ip_resolves;
 static NSTimeInterval ip_gate_started;
 static NSArray *(*ip_original_encode)(id, SEL, NSArray<NSNumber *> *,
-                                      NV2AMetalPendingInput *, NSError **);
+                                      NV2AMetalPendingInput *, BOOL, uint64_t,
+                                      NSError **);
 static NV2AMetalEpochResult *(*ip_original_resolve)(id, SEL, NSError **);
 
 static NSArray *ip_encode(id object, SEL selector,
                           NSArray<NSNumber *> *prefixes,
-                          NV2AMetalPendingInput *input, NSError **error)
+                          NV2AMetalPendingInput *input, BOOL readonly,
+                          uint64_t proofLanes, NSError **error)
 {
     if (!ip_enabled)
-        return ip_original_encode(object, selector, prefixes, input, error);
+        return ip_original_encode(object, selector, prefixes, input, readonly,
+                                  proofLanes, error);
     NV2AMetalCommands *surface = surfaces.cache.commands;
     if (ip_clean_alias) {
         NV2AMetalSurfaceConfig c = {
@@ -36,8 +40,7 @@ static NSArray *ip_encode(id object, SEL selector,
         require(alias != nil, *error);
         assert(!alias.dirty);
     }
-    require([surfaces.cache prepareGPUReadAtAddress:0 length:0 error:error],
-            *error);
+    require([surfaces.cache beginRecordingWithError:error], *error);
     Ivar queueIvar =
         class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
     assert(queueIvar);
@@ -58,6 +61,8 @@ static NSArray *ip_encode(id object, SEL selector,
                      size:4];
     [e endEncoding];
     require([surfaces.cache submitWithError:error], *error);
+    ip_submission = surface.lastSubmitted;
+    require(ip_submission != nil, nil);
     id<MTLSharedEvent> gate = ip_gate;
     ip_gate_started = NSProcessInfo.processInfo.systemUptime;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
@@ -65,8 +70,8 @@ static NSArray *ip_encode(id object, SEL selector,
                      if (!gate.signaledValue)
                          gate.signaledValue = 2;
                    });
-    NSArray *batches =
-        ip_original_encode(object, selector, prefixes, input, error);
+    NSArray *batches = ip_original_encode(object, selector, prefixes, input,
+                                          readonly, proofLanes, error);
     require(batches != nil, *error);
     NV2AMetalCommands *producer = [object encodingCommands];
     assert(producer && producer != surface && producer.commandBuffer &&
@@ -82,6 +87,7 @@ static NV2AMetalEpochResult *ip_resolve(id object, SEL selector,
     if (!ip_enabled)
         return result;
     require(result != nil, *error);
+    assert(ip_submission && ip_encodes == ip_resolves + 1);
     if (ip_gate.signaledValue || *(uint32_t *)ip_destination.contents)
         fprintf(stderr,
                 "Independent producer gate: encode%u resolve%u value%llu "
@@ -102,7 +108,8 @@ static void inline_producer_tests(void)
 {
     Method encode = class_getInstanceMethod(
         NV2AMetalPGRAPHFetch.class,
-        @selector(encodeIndependentSnapshotsWithPrefixes:indexedInput:error:));
+        @selector(encodeIndependentSnapshotsWithPrefixes:indexedInput:
+                  deduplicateReadonly:proofAttributeLanes:error:));
     Method resolve = class_getInstanceMethod(NV2AMetalEpochEncoding.class,
                                              @selector(resolveWithError:));
     assert(encode && resolve);
@@ -159,6 +166,7 @@ static void inline_producer_tests(void)
                 }
                 id<MTLDevice> device = surfaces.cache.commands.device;
                 uint32_t value = 0x12345678;
+                ip_submission = nil;
                 ip_gate = [device newSharedEvent];
                 ip_source =
                     [device newBufferWithBytes:&value
@@ -186,6 +194,10 @@ static void inline_producer_tests(void)
                 }
                 qemu_mutex_unlock(&pg->lock);
                 read_vram(1024, 256);
+                /* Complete the private copy by its exact immutable receipt. */
+                require([surfaces.cache.commands waitForSubmission:ip_submission
+                                                             error:&error],
+                        error);
                 assert(*(uint32_t *)ip_destination.contents == value);
                 color(1, 1, 0xff00ff00);
                 color(7, 7, 0xffff0000);
@@ -196,9 +208,10 @@ static void inline_producer_tests(void)
     ip_clean_alias = NO;
     ip_gate = nil;
     ip_source = ip_destination = nil;
+    ip_submission = nil;
     puts("Independent producer:12 required-feedback gated surface-queue cases;"
          "InlineBuffer/InlineArray/DrawArrays/InlineElements,constant-writing "
-         "XF,standalone/Begin-End,including12 clean surface alias cases;"
+         "XF,standalone/Begin-End,including clean surface aliases;"
          "Current and XF complete before gate release,context and raster "
          "readback PASS");
 }

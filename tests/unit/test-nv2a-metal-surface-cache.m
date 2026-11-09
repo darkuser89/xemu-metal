@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 
 #import "hw/xbox/nv2a/pgraph/metal/surface-cache.h"
+#import <objc/runtime.h>
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -168,6 +169,24 @@ static void coherence_tests(NV2AMetalCommands *commands, id<MTLBuffer> vram)
     uint64_t captured_generation = s.generation;
     assert([cache surfaceContainingAddress:255] == s);
     assert(![cache surfaceContainingAddress:256]);
+    NV2AMetalVRAMReadSpan spans[] = { { 255, 1 }, { 64, 1 } };
+    uint64_t versions[2];
+    NV2AMetalCachedSurface *firstSurface = nil;
+    require([cache sourceVersionsForReadSpans:spans
+                                       count:2
+                                    versions:versions
+                                firstSurface:&firstSurface
+                                       error:&error], error);
+    assert(firstSurface == s && versions[0] == captured_generation &&
+           versions[1] == captured_generation);
+    spans[0] = (NV2AMetalVRAMReadSpan){ 63, 2 };
+    require([cache sourceVersionsForReadSpans:spans
+                                       count:2
+                                    versions:versions
+                                firstSurface:&firstSurface
+                                       error:&error], error);
+    assert(!firstSurface && versions[0] == captured_generation &&
+           versions[1] == captured_generation);
     clear_surface(cache, s, MTLClearColorMake(1, 0, 1, 1), 0, 0);
     assert(s.dirty && s.generation > captured_generation);
     captured_generation = s.generation;
@@ -604,6 +623,7 @@ static void rejection_tests(NV2AMetalCommands *commands, id<MTLBuffer> vram)
 @property(nonatomic) BOOL failSubmit, failCompletion;
 @property(nonatomic) BOOL omitCompletionError;
 @property(nonatomic) id pollReceipt;
+@property(nonatomic) id<MTLSharedEvent> completionGate;
 @end
 @implementation CacheFailureCommands
 - (NV2AMetalSubmission *)lastSubmitted
@@ -641,6 +661,7 @@ static void rejection_tests(NV2AMetalCommands *commands, id<MTLBuffer> vram)
 }
 - (BOOL)waitForSubmission:(NV2AMetalSubmission *)submission error:(NSError **)error
 {
+    _completionGate.signaledValue = 1;
     if (![super waitForSubmission:submission error:error])
         return NO;
     if (!_failCompletion)
@@ -1026,6 +1047,11 @@ static void cpu_write_range_tests(NV2AMetalCommands *commands,
     id<MTLBuffer> first = encode_vram_copy(cache, 128, 32);
     id<MTLBuffer> second = encode_vram_copy(cache, 256, 32);
     id<MTLBuffer> third = nil;
+    id<MTLSharedEvent> gate = [commands.device newSharedEvent];
+    id<MTL4CommandQueue> queue = object_getIvar(
+        commands, class_getInstanceVariable(NV2AMetalCommands.class, "_queue"));
+    assert(gate && queue);
+    [queue waitForEvent:gate value:1];
     const NSUInteger spans[][2] = {
         { 0, 1 },   { 127, 1 },  { 127, 2 },  { 128, 1 },  { 159, 1 },
         { 160, 1 }, { 160, 96 }, { 160, 97 }, { 255, 2 },  { 256, 32 },
@@ -1039,6 +1065,7 @@ static void cpu_write_range_tests(NV2AMetalCommands *commands,
         if (phase == 2)
             third = encode_vram_copy(cache, 512, 32);
         if (phase == 3) {
+            gate.signaledValue = 1;
             require([cache submitWithError:&error], error);
             require([cache waitUntilIdleWithError:&error], error);
         }
@@ -1097,6 +1124,7 @@ static void cpu_write_range_tests(NV2AMetalCommands *commands,
 
     encode_vram_copy(cache, 1024, 16);
     NV2AMetalSurfaceRecording *submitted = cache.recording;
+    [queue waitForEvent:gate value:2];
     require([cache submitWithError:&error], error);
     encode_vram_copy(cache, 2048, 16);
     NV2AMetalSurfaceRecording *cancelled = cache.recording;
@@ -1117,6 +1145,7 @@ static void cpu_write_range_tests(NV2AMetalCommands *commands,
                                        error:&error],
             error);
     assert(completed);
+    gate.signaledValue = 2;
     require([cache waitUntilIdleWithError:&error], error);
     require([cache tryIdleCPUAccessAtAddress:1024
                                       length:1
@@ -1460,12 +1489,20 @@ static void submission_retirement_tests(id<MTLDevice> device)
     assert([firstReceipt completedWithError:&error] && !error);
     assert(!first.completed && !notifications);
     [queue waitForEvent:secondGate value:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!secondGate.signaledValue)
+                         secondGate.signaledValue = 2;
+                   });
     require([cache submitWithError:&error], error);
     NV2AMetalSubmission *secondReceipt = commands.lastSubmitted;
     assert(![secondReceipt completedWithError:&error]);
     assert(!nv2a_metal_try_cpu_access(cache.cpuAccessGuard, 4096, 4, YES));
-    require([cache waitForSubmission:firstReceipt error:&error], error);
-    assert(first.completed && !second.completed && notifications == 1);
+    require([cache evictBeforeFrame:5 error:&error], error);
+    assert(!surface.valid && first.completed && !second.completed &&
+           !secondGate.signaledValue && notifications == 1);
+    puts("Surface retirement prefix: eviction waits for its submitted "
+         "writeback while a newer submission stays gated PASS");
     /* A third recording must remain protected during repeated collection. */
     require([cache prepareGPUReadAtAddress:16384 length:4 error:&error], error);
     NV2AMetalSurfaceRecording *pending = cache.recording;
@@ -1543,6 +1580,220 @@ static void submission_retirement_tests(id<MTLDevice> device)
 
 #include "test-metal-submission-prefix.h"
 
+static void submitted_hazard_storage_tests(id<MTLDevice> device)
+{
+    NSError *error = nil;
+    NV2AMetalCommands *commands = [[NV2AMetalCommands alloc]
+        initWithDevice:device error:&error];
+    id<MTLBuffer> ram = [device newBufferWithLength:65536
+        options:MTLResourceStorageModeShared];
+    require(commands && ram, error);
+    memset(ram.contents, 0x5a, ram.length);
+    for (unsigned i = 0; i < 32; i++)
+        ((uint32_t *)ram.contents)[i * 128 / 4] = 0x12340000u + i;
+    NV2AMetalSurfaceCache *cache = [[NV2AMetalSurfaceCache alloc]
+        initWithCommands:commands vram:ram didWriteVRAM:nil error:&error];
+    require(cache != nil, error);
+    NSMutableArray *entries = [NSMutableArray new],
+                   *tokens = [NSMutableArray new], *receipts = [NSMutableArray new],
+                   *expectedReads = [NSMutableArray new],
+                   *expectedWrites = [NSMutableArray new],
+                   *copies = [NSMutableArray new];
+    for (unsigned i = 0; i < 32; i++) {
+        [copies addObject:encode_vram_copy(cache, i * 128, 4)];
+        if (i % 2)
+            encode_raw_copy(cache, i * 128, i * 128 + 64);
+        NSData *reads = [cache valueForKey:@"pendingReads"],
+               *writes = [cache valueForKey:@"pendingWrites"];
+        [expectedReads addObject:[reads copy]];
+        [expectedWrites addObject:[writes copy]];
+        [tokens addObject:cache.recording];
+        require([cache submitWithError:&error], error);
+        id entry = [[cache valueForKey:@"submissions"] lastObject];
+        assert([entry valueForKey:@"readSpans"] == reads);
+        assert(writes.length ? [entry valueForKey:@"writeSpans"] == writes :
+            [cache valueForKey:@"pendingWrites"] == writes);
+        /* Native slots can rotate, but delayed publication must preserve the
+         * exact hazards belonging to all 32 otherwise completed submissions. */
+        require([commands waitForSubmission:commands.lastSubmitted
+                                     error:&error], error);
+        IndependentReadReceipt *receipt = [IndependentReadReceipt new];
+        receipt.nativeSubmission = commands.lastSubmitted;
+        [entry setValue:receipt forKey:@"submission"];
+        [entries addObject:entry];
+        [receipts addObject:receipt];
+    }
+    require([cache prepareGPUReadAtAddress:8192 length:16 error:&error], error);
+    require([cache prepareGPUWriteAtAddress:12288 length:16 error:&error], error);
+    [cache cancel];
+    for (unsigned released = 0; released <= 32; released += 16) {
+        if (released) {
+            for (unsigned i = released - 16; i < released; i++)
+                ((IndependentReadReceipt *)receipts[i]).ready = YES;
+            require([cache collectCompletedWithError:&error], error);
+        }
+        assert([[cache valueForKey:@"submissions"] count] == 32 - released);
+        for (unsigned i = 0; i < 32; i++) {
+            id entry = entries[i];
+            NV2AMetalSurfaceRecording *token = tokens[i];
+            assert(token.completed == (i < released));
+            if (i < released) {
+                assert(![entry valueForKey:@"readSpans"] &&
+                       ![entry valueForKey:@"writeSpans"]);
+            } else {
+                assert([[entry valueForKey:@"readSpans"]
+                           isEqualToData:expectedReads[i]] &&
+                       [[entry valueForKey:@"writeSpans"]
+                           isEqualToData:expectedWrites[i]]);
+            }
+            BOOL ready = NO;
+            require([cache tryIdleCPUAccessAtAddress:i * 128 length:4
+                write:YES completed:&ready error:&error], error);
+            assert(ready == (i < released));
+            NV2AMetalVRAMReadPattern pattern = { i * 128 + 64, 4, 0, 0 };
+            require([cache tryIdleGPUReadPatterns:&pattern count:1
+                completed:&ready error:&error], error);
+            assert(ready == (i < released || !(i % 2)));
+            assert(*(uint32_t *)((id<MTLBuffer>)copies[i]).contents ==
+                   0x12340000u + i);
+            if (i % 2)
+                assert(((uint32_t *)ram.contents)[(i * 128 + 64) / 4] ==
+                       0x12340000u + i);
+        }
+    }
+    puts("Metal submitted hazard storage: 32 mixed receipts retain exact "
+         "transferred ranges across slot rotation and suffix cancellation; "
+         "two scoped prefixes release only their own CPU/GPU hazards and "
+         "range storage, exact GPU bytes PASS");
+}
+
+static NSUInteger submitted_download_count(NV2AMetalSurfaceCache *cache)
+{
+    NSUInteger count = 0;
+    for (id entry in [cache valueForKey:@"submissions"])
+        count += [[entry valueForKey:@"downloads"] count];
+    assert(count == [[cache valueForKey:@"submittedDownloadCount"]
+                         unsignedIntegerValue]);
+    return count;
+}
+
+static void download_retirement_tests(id<MTLDevice> device)
+{
+    unsigned cases = 0;
+    for (unsigned mode = 0; mode < 3; mode++)
+        for (unsigned count = 1; count <= 128; count *= 8) {
+            @autoreleasepool {
+                NSError *error = nil;
+                NV2AMetalCommands *commands = [[NV2AMetalCommands alloc]
+                    initWithDevice:device error:&error];
+                id<MTLBuffer> ram = [device newBufferWithLength:65536
+                    options:MTLResourceStorageModeShared];
+                require(commands && ram, error);
+                memset(ram.contents, 0x6d, ram.length);
+                __block unsigned notifications = 0;
+                __block NSUInteger remaining = 2;
+                __block __weak NV2AMetalSurfaceCache *weakCache = nil;
+                NV2AMetalVRAMWriteHandler handler =
+                    ^(NSUInteger address, NSUInteger length) {
+                      NV2AMetalSurfaceCache *live = weakCache;
+                      assert(address == notifications * 256 && length == 192);
+                      /* Every notification must see consistent receipt and
+                       * download metadata, including the still-gated suffix. */
+                      assert(submitted_download_count(live) == remaining);
+                      NV2AMetalVRAMReadPattern pattern = {
+                          count * 256, 1, 0, 0
+                      };
+                      BOOL ready = NO;
+                      NSError *failure = nil;
+                      require([live tryIdleGPUReadPatterns:&pattern count:1
+                          completed:&ready error:&failure], failure);
+                      assert(ready == !remaining);
+                      notifications++;
+                    };
+                NV2AMetalSurfaceCache *cache = [[NV2AMetalSurfaceCache alloc]
+                    initWithCommands:commands vram:ram
+                    didWriteVRAM:mode ? handler : nil error:&error];
+                require(cache != nil, error);
+                weakCache = cache;
+                NV2AMetalSurfaceConfig c = config(
+                    NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+                    YES, 4, 1, NO);
+                id<MTLSharedEvent> firstGate = [device newSharedEvent];
+                id<MTLSharedEvent> laterGate = [device newSharedEvent];
+                id<MTL4CommandQueue> queue = object_getIvar(commands,
+                    class_getInstanceVariable(NV2AMetalCommands.class,
+                                              "_queue"));
+                assert(queue && firstGate && laterGate);
+                NV2AMetalSurfaceRecording *first = nil, *later = nil;
+                NV2AMetalSubmission *receipt = nil;
+                NSMutableArray *entries = [NSMutableArray new];
+                for (unsigned batch = 0; batch < 2; batch++) {
+                    unsigned start = batch ? count : 0;
+                    unsigned end = batch ? count + 2 : count;
+                    for (unsigned i = start; i < end; i++) {
+                        NV2AMetalCachedSurface *surface =
+                            [cache prepareSurfaceAtAddress:i * 256 config:&c
+                                frame:0 error:&error];
+                        require(surface != nil, error);
+                        clear_surface(cache, surface,
+                                      MTLClearColorMake(1, 0, 0, 1), 0, 0);
+                        require([cache prepareGPUReadAtAddress:i * 256
+                            length:128 error:&error], error);
+                    }
+                    if (!batch) {
+                        first = cache.recording;
+                        [queue waitForEvent:firstGate value:1];
+                    } else {
+                        later = cache.recording;
+                        firstGate.signaledValue = 1;
+                        require([commands waitForSubmission:receipt
+                            error:&error], error);
+                        [queue waitForEvent:laterGate value:1];
+                        id<MTLSharedEvent> watchdog = laterGate;
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     10 * NSEC_PER_SEC),
+                            dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                              if (!watchdog.signaledValue)
+                                  watchdog.signaledValue = 2;
+                            });
+                    }
+                    NSArray *pending = [cache valueForKey:@"pendingDownloads"];
+                    require([cache submitWithError:&error], error);
+                    id entry = [[cache valueForKey:@"submissions"] lastObject];
+                    assert([entry valueForKey:@"downloads"] == pending &&
+                           pending.count == end - start);
+                    [entries addObject:entry];
+                    if (!batch)
+                        receipt = commands.lastSubmitted;
+                }
+                require(mode == 2 ? [cache collectCompletedWithError:&error] :
+                    [cache waitForRecording:first error:&error], error);
+                assert(first.completed && !later.completed &&
+                       notifications == (mode ? count : 0) &&
+                       submitted_download_count(cache) == 2 &&
+                       ![entries[0] valueForKey:@"downloads"] &&
+                       [[entries[1] valueForKey:@"downloads"] count] == 2 &&
+                       !laterGate.signaledValue);
+                remaining = 0;
+                laterGate.signaledValue = 1;
+                require([cache waitForRecording:later error:&error], error);
+                assert(later.completed &&
+                       notifications == (mode ? count + 2 : 0) &&
+                       !submitted_download_count(cache) &&
+                       ![entries[1] valueForKey:@"downloads"]);
+                for (unsigned i = 0; i < count + 2; i++)
+                    check_region(ram, i * 256, c, 0xffff0000, 0x6d);
+                require([cache collectCompletedWithError:&error], error);
+                assert(notifications == (mode ? count + 2 : 0));
+                cases++;
+            }
+        }
+    printf("Metal download retirement: %u batch/callback/collection cases, "
+           "exact VRAM and ordered once-only notifications, consistent "
+           "transferred download lists, released prefix storage, consistent "
+           "metadata during callbacks and gated suffix preserved PASS\n", cases);
+}
+
 static void specific_wait_failure_test(id<MTLDevice> device)
 {
     for (unsigned missingError = 0; missingError < 2; missingError++) {
@@ -1562,6 +1813,12 @@ static void specific_wait_failure_test(id<MTLDevice> device)
         require(cache != nil, error);
         require([cache prepareGPUReadAtAddress:0 length:4 error:&error], error);
         NV2AMetalSurfaceRecording *submitted = cache.recording;
+        commands.completionGate = [device newSharedEvent];
+        id<MTL4CommandQueue> queue = object_getIvar(
+            commands, class_getInstanceVariable(NV2AMetalCommands.class,
+                                                "_queue"));
+        assert(queue && commands.completionGate);
+        [queue waitForEvent:commands.completionGate value:1];
         require([cache submitWithError:&error], error);
         NV2AMetalSubmission *receipt = commands.lastSubmitted;
         require([cache prepareGPUReadAtAddress:4096 length:4 error:&error],
@@ -1586,12 +1843,146 @@ static void specific_wait_failure_test(id<MTLDevice> device)
 }
 
 #include "test-metal-cache-checkpoints.h"
+
+static void same_queue_visibility_test(id<MTLDevice> device)
+{
+    NSError *error = nil;
+    const uint32_t expected = 0x1c37b2a5;
+    for (unsigned pending = 0; pending < 2; pending++) {
+        NV2AMetalCommands *commands =
+            [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+        require(commands != nil, error);
+        id<MTL4CommandQueue> queue = [commands valueForKey:@"queue"];
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        SEL selector = @selector(waitForEvent:value:);
+        Method method = class_getInstanceMethod(object_getClass(queue), selector);
+        assert(queue && gate && method);
+        IMP original = method_getImplementation(method);
+        void (*waitForEvent)(id, SEL, id<MTLEvent>, uint64_t) = (void *)original;
+        __block unsigned waits = 0;
+        IMP spy = imp_implementationWithBlock(
+            ^void(id object, id<MTLEvent> event, uint64_t value) {
+                if (object == queue && event != gate)
+                    waits++;
+                waitForEvent(object, selector, event, value);
+            });
+        method_setImplementation(method, spy);
+        id<MTLBuffer> source =
+            [device newBufferWithBytes:&expected length:sizeof(expected)
+                               options:MTLResourceStorageModeShared];
+        id<MTLBuffer> intermediate =
+            [device newBufferWithLength:sizeof(expected)
+                                options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> result =
+            [device newBufferWithLength:sizeof(expected)
+                                options:MTLResourceStorageModeShared];
+        assert(source && intermediate && result);
+        if (pending)
+            [queue waitForEvent:gate value:1];
+        for (unsigned i = 0; i < 2; i++) {
+            id<MTLBuffer> read = i ? intermediate : source;
+            id<MTLBuffer> write = i ? result : intermediate;
+            require([commands beginWithError:&error] != nil, error);
+            require([commands addResource:read error:&error] &&
+                        [commands addResource:write error:&error], error);
+            id<MTL4ComputeCommandEncoder> encoder =
+                [commands.commandBuffer computeCommandEncoder];
+            assert(encoder);
+            [encoder copyFromBuffer:read sourceOffset:0 toBuffer:write
+                  destinationOffset:0 size:sizeof(expected)];
+            [encoder endEncoding];
+            require([commands submitWithError:&error], error);
+            if (!i && !pending)
+                require([commands waitForSubmission:commands.lastSubmitted
+                                              error:&error], error);
+        }
+        assert(waits == pending);
+        method_setImplementation(method, original);
+        assert(imp_removeBlock(spy));
+        if (pending)
+            gate.signaledValue = 1;
+        require([commands waitUntilIdleWithError:&error], error);
+        assert(!memcmp(result.contents, &expected, sizeof(expected)));
+    }
+    puts("Metal same-queue visibility: exact private-buffer producer/consumer "
+         "bytes with gated event and completed feedback PASS");
+}
+
+static void residency_suffix_rollback_test(NV2AMetalCommands *commands)
+{
+    NSError *error = nil;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:8 height:8 mipmapped:YES];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget |
+                       MTLTextureUsagePixelFormatView;
+    id<MTLTexture> parent =
+        [commands.device newTextureWithDescriptor:descriptor];
+    id<MTLTexture> view =
+        [parent newTextureViewWithPixelFormat:descriptor.pixelFormat
+                                  textureType:MTLTextureType2D
+                                       levels:NSMakeRange(1, 1)
+                                       slices:NSMakeRange(0, 1)];
+    id<MTLBuffer> extra = [commands.device newBufferWithLength:4096
+                                                      options:MTLResourceStorageModeShared];
+    assert(parent && view.parentTexture == parent && extra);
+    for (unsigned reverse = 0; reverse < 2; reverse++) {
+        id<MTLTexture> prefix = reverse ? view : parent;
+        id<MTLTexture> suffix = reverse ? parent : view;
+        require([commands beginWithError:&error] != nil, error);
+        require([commands addResource:prefix error:&error], error);
+        MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
+        pass.colorAttachments[0].texture = prefix;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
+        id<MTL4RenderCommandEncoder> encoder =
+            [commands.commandBuffer renderCommandEncoderWithDescriptor:pass];
+        assert(encoder);
+        [encoder endEncoding];
+        require([commands sealWithError:&error], error);
+        require([commands beginWithError:&error] != nil, error);
+        require([commands addResource:suffix error:&error] &&
+                    [commands addResource:extra error:&error], error);
+        id<MTLResidencySet> residency =
+            [[commands valueForKey:@"batch"] valueForKey:@"residency"];
+        assert(residency.allocationCount == 3);
+        [commands cancelUnsealed];
+        assert(residency.allocationCount == 1 &&
+               [residency containsAllocation:prefix] &&
+               ![residency containsAllocation:suffix] &&
+               ![residency containsAllocation:extra]);
+        require([commands submitWithError:&error], error);
+        require([commands waitUntilIdleWithError:&error], error);
+        uint8_t pixel[4];
+        [prefix getBytes:pixel bytesPerRow:4
+               fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+        const uint8_t green[] = { 0, 255, 0, 255 };
+        assert(!memcmp(pixel, green, sizeof(green)));
+    }
+    puts("Metal residency suffix rollback: parent/view in both orders, "
+         "sealed allocation and exact GPU pixels preserved PASS");
+}
 #include "test-metal-surface-capture.h"
 #include "test-metal-parallel-surface-readers.h"
 #include "test-metal-gpu-write-dependencies.h"
 #include "test-metal-execution-publication.h"
 #include "test-metal-reader-publication.h"
 #include "test-metal-strided-reads.h"
+#include "test-metal-color-depth-identity.h"
+#include "test-metal-surface-producer-prefix.h"
+#include "test-metal-cpu-prefix.h"
+#include "test-metal-upload-prefix.h"
+#include "test-metal-direct-z16-cache.h"
+#include "test-metal-watch-registration.h"
+#include "test-metal-surface-pool-cache.h"
+#include "test-metal-target-retirement.h"
+#include "test-metal-surface-negative-gate.h"
+#include "test-metal-download-prefix.h"
+#include "test-metal-completed-download.h"
+#include "test-metal-raster-texture-upload.h"
+#include "test-metal-completed-texture-upload.h"
 
 int main(int argc, char **argv)
 {
@@ -1600,6 +1991,80 @@ int main(int argc, char **argv)
         NV2AMetalCommands *commands =
             [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--completed-texture-upload"))) {
+            completed_texture_upload_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--raster-texture-upload"))) {
+            raster_texture_upload_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--completed-download"))) {
+            completed_download_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--download-prefix"))) {
+            download_prefix_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--surface-negative-gate"))) {
+            surface_negative_gate_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--target-retirement"))) {
+            target_retirement_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--surface-pool-cache"))) {
+            surface_pool_cache_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--watch-registration"))) {
+            watch_registration_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--direct-z16-cache"))) {
+            direct_z16_cache_tests(commands.device);
+            if (argc == 2)
+                return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--upload-prefix")) {
+            upload_prefix_tests(commands.device);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--cpu-prefix")) {
+            cpu_prefix_tests(commands.device);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--surface-producer-prefix")) {
+            surface_producer_prefix_tests(commands.device);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--color-depth-identity")) {
+            color_depth_identity_tests(commands.device);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--submitted-hazard-storage")) {
+            submitted_hazard_storage_tests(commands.device);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--download-retirement")) {
+            download_retirement_tests(commands.device);
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--strided-reads")) {
             strided_read_tests(commands.device);
             return 0;
@@ -1625,6 +2090,8 @@ int main(int argc, char **argv)
             return 0;
         }
         if (argc == 2 && !strcmp(argv[1], "--checkpoints")) {
+            same_queue_visibility_test(commands.device);
+            residency_suffix_rollback_test(commands);
             cache_checkpoint_tests(commands.device);
             return 0;
         }
@@ -1659,9 +2126,15 @@ int main(int argc, char **argv)
         parallel_surface_reader_tests(commands.device);
         strided_read_tests(commands.device);
         surface_capture_tests(commands.device);
+        same_queue_visibility_test(commands.device);
+        residency_suffix_rollback_test(commands);
+        surface_producer_prefix_tests(commands.device);
+        cpu_prefix_tests(commands.device);
         cache_checkpoint_tests(commands.device);
         retirement_failure_test(commands.device);
         submission_retirement_tests(commands.device);
+        download_retirement_tests(commands.device);
+        submitted_hazard_storage_tests(commands.device);
         specific_wait_failure_test(commands.device);
         submission_prefix_tests(commands.device);
         cpu_read_guard_tests(commands.device);
@@ -1678,6 +2151,7 @@ int main(int argc, char **argv)
         replacement_tests(commands, vram);
         eviction_and_restore_tests(commands, vram);
         format_tests(commands, vram);
+        color_depth_identity_tests(commands.device);
         rejection_tests(commands, vram);
         failure_and_lifetime_tests(commands.device);
         cache_idle_guard_tests(commands.device);

@@ -6,12 +6,18 @@
 @property(nonatomic) BOOL ready;
 @property(nonatomic) NSError *failure;
 @property(nonatomic) NV2AMetalSubmission *nativeSubmission;
+@property(nonatomic) BOOL waitForNativeFeedback;
 - (BOOL)completedWithError:(NSError **)error;
+- (BOOL)hasSeparateProducerFeedback;
 - (BOOL)belongsToOwner:(NV2AMetalCommands *)owner;
 - (id<MTLEvent>)signalEvent;
 - (uint64_t)signalValue;
 @end
 @implementation IndependentReadReceipt
+- (BOOL)hasSeparateProducerFeedback
+{
+    return NO;
+}
 - (BOOL)belongsToOwner:(NV2AMetalCommands *)owner
 {
     return [owner ownsSubmission:_nativeSubmission];
@@ -32,6 +38,27 @@
     return _ready;
 }
 @end
+
+@interface CountedIndependentReadReceipt : IndependentReadReceipt
+@property(nonatomic) unsigned polls;
+@end
+@implementation CountedIndependentReadReceipt
+- (BOOL)completedWithError:(NSError **)error
+{
+    _polls++;
+    return [super completedWithError:error];
+}
+@end
+
+@interface NV2AMetalSurfaceCache (IndependentReadPrefixTest)
+- (NSArray<NV2AMetalIndependentReads *> *)
+    independentReadDependenciesMatching:
+        (NS_NOESCAPE BOOL (^)(NV2AMetalIndependentReads *))matches
+                                   error:(NSError **)error;
+- (BOOL)orderAfterIndependentReadsAtAddress:(NSUInteger)address
+                                     length:(NSUInteger)length
+                                      error:(NSError **)error;
+@end
 @interface IndependentReadCommands : NV2AMetalCommands
 @property(nonatomic) id<MTLSharedEvent> gate;
 @property(nonatomic) unsigned waits;
@@ -49,17 +76,23 @@
                     error:(NSError **)error
 {
     _waits++;
+    IndependentReadReceipt *receipt = nil;
     if ([(id)submission isKindOfClass:IndependentReadReceipt.class]) {
-        IndependentReadReceipt *receipt = (id)submission;
+        receipt = (id)submission;
+        submission = receipt.nativeSubmission;
+    }
+    if (!receipt || receipt.waitForNativeFeedback) {
+        if (_gate && !_gate.signaledValue && !_manualGate)
+            _gate.signaledValue = 1;
+        if (![super waitForSubmission:submission error:error])
+            return NO;
+    }
+    if (receipt) {
         receipt.ready = YES;
         if (error)
             *error = receipt.failure;
         return !receipt.failure;
     }
-    if (_gate && !_gate.signaledValue && !_manualGate)
-        _gate.signaledValue = 1;
-    if (![super waitForSubmission:submission error:error])
-        return NO;
     if (!_failWait)
         return YES;
     if (error && !_omitWaitError)
@@ -197,19 +230,299 @@ static unsigned independent_completion_prefix_tests(id<MTLDevice> device)
             assert(
                 nv2a_metal_try_cpu_access(cache.cpuAccessGuard, 32764, 8, YES));
             /* Collection may already have retired the requested scope. */
+            waits = producer.waits;
             require([cache completeIndependentReads:first error:&error], error);
-            assert(!producer.idleWaits);
+            assert(producer.waits == waits && !producer.idleWaits);
             cases++;
         }
     puts("Independent completion prefix: six VRAM/copied cases preserve later "
          "recorded/submitted/cancelled work behind a GPU gate, exact bytes, "
          "CPU write guards, delayed feedback and retired receipts; zero drains "
+         "or repeat waits for confirmed readers "
          "PASS");
     return cases;
 }
 
+static void independent_cpu_access_scope_test(id<MTLDevice> device)
+{
+    NSError *error = nil;
+    NV2AMetalCommands *surface =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    IndependentReadCommands *reader =
+        [[IndependentReadCommands alloc] initWithDevice:device error:&error];
+    IndependentReadCommands *unrelated =
+        [[IndependentReadCommands alloc] initWithDevice:device error:&error];
+    NV2AMetalCommands *recording =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    id<MTLBuffer> ram =
+        [device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+    require(surface && reader && unrelated && recording && ram, error);
+    memset(ram.contents, 0x37, ram.length);
+    NV2AMetalSurfaceCache *cache =
+        [[NV2AMetalSurfaceCache alloc] initWithCommands:surface
+                                                   vram:ram
+                                           didWriteVRAM:nil
+                                                  error:&error];
+    require(cache != nil, error);
+    const NV2AMetalVRAMReadSpan span = { 32764, 8 }, other = { 16384, 8 },
+                               open = { 49152, 8 };
+    NV2AMetalIndependentReads *prefix = nil, *reads = nil, *next = nil;
+    NV2AMetalIndependentReads *others = nil, *pending = nil;
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    for (IndependentReadCommands *producer in @[ reader, unrelated ]) {
+        producer.gate = [device newSharedEvent];
+        id<MTL4CommandQueue> queue = object_getIvar(producer, queueIvar);
+        assert(queue && producer.gate);
+        [queue waitForEvent:producer.gate value:1];
+    }
+    require([cache tryBeginIndependentReads:&other count:1 commands:reader
+                                      reads:&prefix error:&error] && prefix &&
+                [cache submitIndependentReads:prefix error:&error],
+            error);
+    require([cache tryBeginIndependentReads:&span count:1 commands:reader
+                                      reads:&reads error:&error] && reads,
+            error);
+    id<MTLBuffer> readback = independent_read_copy(reader, ram);
+    require([cache submitIndependentReads:reads error:&error], error);
+    require([cache tryBeginIndependentReads:&span count:1 commands:reader
+                                      reads:&next error:&error] && next,
+            error);
+    id<MTLBuffer> nextReadback = independent_read_copy(reader, ram);
+    require([cache submitIndependentReads:next error:&error], error);
+    require([cache tryBeginIndependentReads:&other count:1 commands:unrelated
+                                      reads:&others error:&error] && others &&
+                [cache submitIndependentReads:others error:&error],
+            error);
+    require([cache tryBeginIndependentReads:&open count:1 commands:recording
+                                      reads:&pending error:&error] && pending,
+            error);
+    id<MTL4CommandBuffer> pendingBuffer = recording.commandBuffer;
+    assert(pendingBuffer);
+
+    /* Count discovery polls independently of registration and submission,
+     * which also check for feedback arriving after this pass. */
+    NSArray *readers = @[ prefix, reads, next, others ];
+    NSMutableArray<CountedIndependentReadReceipt *> *receipts =
+        [NSMutableArray new];
+    for (NV2AMetalIndependentReads *item in readers) {
+        CountedIndependentReadReceipt *receipt = [CountedIndependentReadReceipt new];
+        receipt.nativeSubmission = [item valueForKey:@"submission"];
+        [item setValue:receipt forKey:@"submission"];
+        [receipts addObject:receipt];
+    }
+    NSArray *dependencies =
+        [cache independentReadDependenciesMatching:
+          ^BOOL(NV2AMetalIndependentReads *reader) {
+          NSData *spans = [reader valueForKey:@"spans"];
+          const NV2AMetalVRAMReadPattern *pattern = spans.bytes;
+          return spans.length == sizeof(*pattern) &&
+                 pattern->address == span.address;
+        } error:&error];
+    NSArray *expected = @[ prefix, reads, next ];
+    assert([dependencies isEqualToArray:expected]);
+    for (unsigned i = 0; i < receipts.count; i++) {
+        assert(receipts[i].polls == (i < 3));
+        [readers[i] setValue:receipts[i].nativeSubmission forKey:@"submission"];
+    }
+    puts("GPU VRAM reader prefix: each selected receipt checked once, "
+         "same-queue disjoint prefix included and other queues skipped PASS");
+
+    id<MTLBuffer> surfaceCopy = encode_vram_copy(cache, 60000, 4);
+    NV2AMetalSurfaceRecording *token = cache.recording;
+    require([cache prepareCPUAccessAtAddress:span.address length:span.length
+                                       write:NO error:&error],
+            error);
+    assert(token.completed && !reader.waits && !unrelated.waits &&
+           !reader.gate.signaledValue && !unrelated.gate.signaledValue &&
+           recording.commandBuffer == pendingBuffer &&
+           ![unrelated.lastSubmitted completedWithError:&error] && !error &&
+           *(uint32_t *)surfaceCopy.contents == 0x37373737);
+    /* Keep the selected callbacks pending until their waits, regardless of
+     * how quickly the real GPU reaches the later copies after the first gate. */
+    for (unsigned i = 0; i < 3; i++) {
+        receipts[i].waitForNativeFeedback = YES;
+        [readers[i] setValue:receipts[i] forKey:@"submission"];
+    }
+    require([cache prepareCPUAccessAtAddress:span.address length:span.length
+                                       write:YES error:&error],
+            error);
+    memset((uint8_t *)ram.contents + span.address, 0x94, span.length);
+    assert(reader.waits == 3 && !unrelated.waits &&
+           !unrelated.gate.signaledValue &&
+           recording.commandBuffer == pendingBuffer &&
+           ![unrelated.lastSubmitted completedWithError:&error] && !error &&
+           *(uint64_t *)readback.contents == UINT64_C(0x3737373737373737) &&
+           *(uint64_t *)nextReadback.contents == UINT64_C(0x3737373737373737));
+    [cache cancelIndependentReads:pending];
+    unrelated.gate.signaledValue = 1;
+    require([cache completeIndependentReads:others error:&error], error);
+    puts("CPU VRAM reader scope: read shares GPU source, write waits only "
+         "overlap, unrelated submitted and open readers survive PASS");
+    puts("CPU VRAM reader prefix: two overlapping submissions share three "
+         "ordered waits including their disjoint queue prefix PASS");
+}
+
+static void clean_surface_retirement_tests(id<MTLDevice> device)
+{
+    const uint32_t value = 0xff267ade;
+    for (unsigned rebind = 0; rebind < 2; rebind++) {
+        NSError *error = nil;
+        IndependentReadCommands *commands =
+            [[IndependentReadCommands alloc] initWithDevice:device error:&error];
+        id<MTLBuffer> ram =
+            [device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+        require(commands && ram, error);
+        memcpy(ram.contents, &value, sizeof(value));
+        NV2AMetalSurfaceCache *cache = [[NV2AMetalSurfaceCache alloc]
+            initWithCommands:commands vram:ram didWriteVRAM:nil error:&error];
+        require(cache != nil, error);
+        NV2AMetalSurfaceConfig c =
+            config(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, YES, 4, 1, NO);
+        NV2AMetalCachedSurface *old = [cache prepareSurfaceAtAddress:0
+                                                              config:&c frame:0
+                                                               error:&error];
+        require(old != nil, error);
+        id<MTLBuffer> pixels =
+            [device newBufferWithLength:old.transfer.sourceLength
+                                options:MTLResourceStorageModeShared];
+        require(pixels && [old.transfer encodeDownloadToBuffer:pixels offset:0
+                                                       swizzle:YES flip:NO
+                                                      downscale:YES
+                                                       commands:commands
+                                                          error:&error], error);
+        commands.gate = [device newSharedEvent];
+        Ivar ivar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+        id<MTL4CommandQueue> queue = object_getIvar(commands, ivar);
+        assert(queue && commands.gate);
+        [queue waitForEvent:commands.gate value:1];
+        require([cache submitWithError:&error], error);
+        NV2AMetalSubmission *submitted = commands.lastSubmitted;
+        assert(!old.dirty);
+
+        require([cache prepareGPUReadAtAddress:8192 length:4 error:&error], error);
+        NV2AMetalSurfaceRecording *sealed = cache.recording;
+        require([cache checkpointWithError:&error] &&
+                    [cache prepareGPUReadAtAddress:12288 length:4 error:&error],
+                error);
+        NV2AMetalSurfaceRecording *open = cache.recording;
+        if (rebind) {
+            c.format = NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8;
+            NV2AMetalCachedSurface *replacement =
+                [cache selectSurfaceAtAddress:0 config:&c frame:5 error:&error];
+            require(replacement != nil, error);
+            assert(replacement != old && replacement.valid &&
+                   replacement.needsUpload);
+        } else {
+            require([cache evictBeforeFrame:5 error:&error], error);
+        }
+        assert(!old.valid && cache.count == rebind && !commands.waits &&
+               !commands.gate.signaledValue && commands.lastSubmitted == submitted &&
+               commands.sealedBufferCount == 1 && !sealed.submitted &&
+               cache.recording == open);
+        old = nil;
+        BOOL ready = YES;
+        require([cache tryIdleCPUAccessAtAddress:0 length:4 write:YES
+                                       completed:&ready error:&error], error);
+        assert(!ready);
+        commands.gate.signaledValue = 1;
+        require([cache waitForSubmission:submitted error:&error], error);
+        assert(!memcmp(pixels.contents, &value, sizeof(value)) &&
+               cache.recording == open && !sealed.submitted);
+        [cache cancel];
+        require([cache flushWithError:&error], error);
+        assert(open.cancelled && sealed.completed);
+    }
+    puts("Clean surface retirement: eviction and format rebind keep gated "
+         "uploads, VRAM guards and unrelated recording state intact PASS");
+    checks++;
+}
+
+static void guarded_surface_writeback_tests(id<MTLDevice> device)
+{
+    const uint32_t initial = 0x12274269, cleared = 0xffff0000;
+    for (unsigned rebind = 0; rebind < 2; rebind++) {
+        NSError *error = nil;
+        IndependentReadCommands *commands =
+            [[IndependentReadCommands alloc] initWithDevice:device error:&error];
+        id<MTLBuffer> ram =
+            [device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+        require(commands && ram, error);
+        memcpy(ram.contents, &initial, sizeof(initial));
+        __block unsigned watches = 0, notifications = 0;
+        NV2AMetalSurfaceCache *cache = [[NV2AMetalSurfaceCache alloc]
+            initWithCommands:commands vram:ram
+            didWriteVRAM:^(NSUInteger address, NSUInteger length) {
+              assert(!address && length);
+              notifications++;
+            } error:&error];
+        require(cache != nil, error);
+        cache.willWatchVRAM = ^(NSUInteger address, NSUInteger length) {
+          assert(!address && length == 4096);
+          watches++;
+        };
+        NV2AMetalSurfaceConfig c =
+            config(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8, YES, 4, 1, NO);
+        NV2AMetalCachedSurface *old = [cache prepareSurfaceAtAddress:0
+                                                              config:&c frame:0
+                                                               error:&error];
+        require(old != nil, error);
+        clear_surface(cache, old, MTLClearColorMake(1, 0, 0, 1), 0, 0);
+        NV2AMetalSurfaceRecording *writeback = cache.recording;
+        commands.gate = [device newSharedEvent];
+        Ivar ivar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+        id<MTL4CommandQueue> queue = object_getIvar(commands, ivar);
+        assert(queue && commands.gate);
+        [queue waitForEvent:commands.gate value:1];
+        if (rebind)
+            c.format = NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8;
+        else
+            require([cache evictBeforeFrame:5 error:&error], error);
+        NV2AMetalCachedSurface *next = [cache prepareSurfaceAtAddress:0
+                                                               config:&c frame:5
+                                                                error:&error];
+        require(next != nil, error);
+        assert(next != old && !old.valid && writeback.submitted &&
+               !writeback.completed && !commands.waits &&
+               !commands.gate.signaledValue && !notifications && watches == 1);
+        assert(!memcmp(ram.contents, &initial, sizeof(initial)));
+        for (unsigned write = 0; write < 2; write++) {
+            BOOL ready = YES;
+            require([cache tryIdleCPUAccessAtAddress:0 length:4 write:write
+                                           completed:&ready error:&error], error);
+            assert(!ready);
+        }
+        NV2AMetalCommands *reader =
+            [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+        require(reader != nil, error);
+        NV2AMetalVRAMReadSpan span = { 0, sizeof(initial) };
+        NV2AMetalIndependentReads *reads = nil;
+        require([cache tryBeginIndependentReads:&span count:1 commands:reader
+                                          reads:&reads error:&error], error);
+        assert(!reads && !reader.commandBuffer);
+        NV2AMetalSurfaceRecording *upload = cache.recording;
+        commands.gate.signaledValue = 1;
+        require([cache resolveCPUAccessAtAddress:0 length:4 write:NO
+                                           error:&error], error);
+        assert(upload && cache.recording == upload && !upload.submitted &&
+               writeback.completed && notifications == 1 &&
+               !memcmp(ram.contents, &cleared, sizeof(cleared)));
+        id<MTLBuffer> pixels = gpu_pixels(cache, next);
+        assert(writeback.completed && notifications == 1 &&
+               !memcmp(ram.contents, &cleared, sizeof(cleared)) &&
+               !memcmp(pixels.contents, &cleared, sizeof(cleared)));
+    }
+    puts("Guarded surface writeback: retirement submits while the queue is "
+         "gated; CPU and independent reads stay protected and the replacement "
+         "sees the exact pixels PASS");
+    checks++;
+}
+
 static void independent_vram_tests(id<MTLDevice> device)
 {
+    clean_surface_retirement_tests(device);
+    guarded_surface_writeback_tests(device);
+    independent_cpu_access_scope_test(device);
     NSError *error = nil;
     unsigned cases = independent_completion_prefix_tests(device);
     for (unsigned action = 0; action < 8; action++) {
@@ -549,6 +862,12 @@ static void independent_vram_tests(id<MTLDevice> device)
                                           error:&error],
                 error);
         assert(![cache completeIndependentReads:reads error:&error] && error);
+        producer.gate = [device newSharedEvent];
+        id<MTL4CommandQueue> queue = object_getIvar(
+            producer, class_getInstanceVariable(NV2AMetalCommands.class,
+                                                "_queue"));
+        assert(queue && producer.gate);
+        [queue waitForEvent:producer.gate value:1];
         independent_read_copy(producer, ram);
         require([cache submitIndependentReads:reads error:&error], error);
         producer.failWait = YES;

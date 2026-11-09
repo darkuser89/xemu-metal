@@ -49,17 +49,26 @@ static BOOL native_error(NSError **error, NSString *message)
         if (!stream)
             return nil;
         for (NV2AMetalPendingSpan *span in spans) {
-            if (![span.resource conformsToProtocol:@protocol(MTLBuffer)] ||
+            BOOL indexed =
+                [span.resource isMemberOfClass:NV2AMetalIndexedVertices.class];
+            if ((!indexed &&
+                 ![span.resource conformsToProtocol:@protocol(MTLBuffer)]) ||
                 span.count > totalLimit - total) {
                 native_error(
                     error,
                     @"Invalid native pending resource or aggregate count");
                 return nil;
             }
-            if (![stream appendVertices:(id<MTLBuffer>)span.resource
-                                  first:span.first
-                                  count:span.count
-                                  error:error])
+            BOOL appended =
+                indexed ? [stream appendIndexedVertices:span.resource
+                                                  first:span.first
+                                                  count:span.count
+                                                  error:error] :
+                          [stream appendVertices:(id<MTLBuffer>)span.resource
+                                           first:span.first
+                                           count:span.count
+                                           error:error];
+            if (!appended)
                 return nil;
             total += span.count;
         }

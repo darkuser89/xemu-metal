@@ -5,12 +5,19 @@
 #import "command.h"
 #include "vga-types.h"
 NS_ASSUME_NONNULL_BEGIN
+typedef id<MTLTexture> _Nullable (^NV2AMetalVGATargetAllocator)(
+    MTLTextureDescriptor *descriptor);
+
 /* Rows and palette are captured metadata. Only the GPU reads/converts pixels.
  * memory_mask retains VGA wrapping; plane modes also retain its 256KiB window.
  * Output RGBA8 has top-left row0 and opaque alpha, like VGA's XRGB surface. */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalVGA : NSObject
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                                  error:(NSError *_Nullable *_Nullable)error;
+/* The optional allocator supplies an exclusive target after validation. */
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                        targetAllocator:(nullable NV2AMetalVGATargetAllocator)allocator
                                   error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;

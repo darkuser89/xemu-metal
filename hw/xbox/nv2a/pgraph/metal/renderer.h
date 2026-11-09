@@ -16,10 +16,15 @@ extern "C" {
 void pgraph_metal4_init(NV2AState *d, Error **errp);
 void pgraph_metal4_register_renderer(void);
 void pgraph_metal4_finalize(NV2AState *d);
-/* Host request under renderer_lock, not pg/pfifo locks. Returns an owned
- * NV2AMetalFramebuffer ObjC handle, or NULL without a cached color source.
+/* Host requests under renderer_lock, outside pg/pfifo locks. Return an
+ * owned NV2AMetalFramebuffer ObjC handle, or NULL with no completed image.
+ * Copy queues a presentation refresh and returns the latest completed frame.
+ * If the FIFO lock is busy, the refresh remains pending for service or a
+ * wakeup from a subsequent UI poll.
+ * Capture waits for a fresh image.
  * Release once after retaining its texture/metadata for UI GPU commands. */
 void *pgraph_metal4_copy_framebuffer(NV2AState *d);
+void *pgraph_metal4_capture_framebuffer(NV2AState *d);
 void pgraph_metal4_release_framebuffer(void *handle);
 void pgraph_metal4_draw_begin(NV2AState *d);
 void pgraph_metal4_flush_draw(NV2AState *d);
@@ -61,7 +66,7 @@ unsigned int pgraph_metal4_get_surface_scale_factor(NV2AState *d);
 /* Borrowed internal draw handle, valid while the renderer is initialized. */
 void *pgraph_metal4_draw_handle(NV2AState *d);
 
-#define NV2A_METAL_PENDING_CAPTURE_MAX (32u + 1250u * 16u + 524287u * 248u)
+#define NV2A_METAL_PENDING_CAPTURE_MAX (32u + 1250u * 24u + 524287u * 252u)
 bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size);
 
 void pgraph_metal4_vertex_state_change(NV2AState *d);

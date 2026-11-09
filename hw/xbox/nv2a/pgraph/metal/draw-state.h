@@ -18,6 +18,8 @@ typedef struct NV2AMetalDrawConfig {
     unsigned int viewport_width, viewport_height;
 } NV2AMetalDrawConfig;
 
+enum { NV2AMetalDrawPipelineWriteMaskShift = 17 };
+
 /* CPU-only validation shared by creation and portable snapshot decoding. */
 BOOL nv2a_metal_draw_config_validate(
     const NV2AMetalDrawConfig *_Nullable config,
@@ -45,9 +47,10 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) NV2AMetalDrawConfig config;
 @property(nonatomic, readonly) id<MTLDepthStencilState> depthStencil;
 @property(nonatomic, readonly) BOOL requiresDepth, requiresStencil,
-    logicEnabled, ditherEnabled;
+    logicEnabled, ditherEnabled, cullsBothFaces;
 @property(nonatomic, readonly) unsigned int logicOperation, blendWord,
     blendColor;
+/* Effective native blend state and attachment write mask. */
 @property(nonatomic, readonly) NSUInteger pipelineKey;
 
 - (nullable instancetype)
@@ -61,7 +64,8 @@ API_AVAILABLE(macos(26.0))
  * builder supplies its pixel format. Dynamic blend color is not in the key. */
 - (MTL4RenderPipelineColorAttachmentDescriptor *)colorAttachment;
 
-/* Sets dynamic state. Returns NO when scissor is empty or both faces of a
+/* Sets dynamic state, using the attachment dimensions for an unset viewport.
+ * Returns NO when scissor is empty or both faces of a
  * triangle are culled; the encoder must still end to honor pass load/store.
  * Points and lines ignore polygon culling, as in GL. */
 - (BOOL)applyToEncoder:(id<MTL4RenderCommandEncoder>)encoder

@@ -58,12 +58,15 @@ static BOOL checkpoint_error(NSError **error, NSString *message)
     _lengths[1] = state->inline_elements_length;
     _lengths[2] = state->inline_buffer_length;
     _lengths[3] = state->inline_array_length;
-    NSMutableData *ranges = [NSMutableData
-        dataWithBytes:state->draw_arrays_start
-               length:_lengths[0] * sizeof(state->draw_arrays_start[0])];
-    [ranges appendBytes:state->draw_arrays_count
-                 length:_lengths[0] * sizeof(state->draw_arrays_count[0])];
-    _ranges = [ranges copy];
+    if (_lengths[0]) {
+        size_t bytes = _lengths[0] * sizeof(state->draw_arrays_start[0]);
+        NSMutableData *ranges = [NSMutableData dataWithLength:bytes * 2];
+        memcpy(ranges.mutableBytes, state->draw_arrays_start, bytes);
+        memcpy((uint8_t *)ranges.mutableBytes + bytes, state->draw_arrays_count,
+               bytes);
+        /* Private backing is never mutated after this snapshot. */
+        _ranges = ranges;
+    }
     return self;
 }
 - (BOOL)restoreWithState:(PGRAPHState *)state error:(NSError **)error
@@ -81,14 +84,24 @@ static BOOL checkpoint_error(NSError **error, NSString *message)
                          (const uint8_t *)_ranges.bytes + bytes, bytes)))
         return checkpoint_error(error, @"Stale checkpoint DrawArrays ranges");
     for (unsigned a = 0; a < 16; a++) {
-        VertexAttribute current, original;
-        memcpy(&current, &state->vertex_attributes[a], sizeof(current));
-        memcpy(&original, &_attributes[a], sizeof(original));
-        memset(current.inline_value, 0, sizeof(current.inline_value));
-        memset(original.inline_value, 0, sizeof(original.inline_value));
-        current.inline_buffer_populated = original.inline_buffer_populated =
-            false;
-        if (memcmp(&current, &original, sizeof(current)))
+        const uint8_t *current = (const uint8_t *)&state->vertex_attributes[a],
+                      *original = (const uint8_t *)&_attributes[a];
+        const size_t values = offsetof(VertexAttribute, inline_value),
+                     valuesEnd = values + sizeof(_attributes[a].inline_value),
+                     populated = offsetof(VertexAttribute, inline_buffer_populated),
+                     populatedEnd = populated +
+                                    sizeof(_attributes[a].inline_buffer_populated);
+        _Static_assert(offsetof(VertexAttribute, inline_value) +
+                           sizeof(((VertexAttribute *)0)->inline_value) <=
+                           offsetof(VertexAttribute, inline_buffer_populated),
+                       "Checkpoint attribute ranges must stay ordered");
+        /* Compare every other byte, including padding, without copying and
+         * clearing two temporary attributes. Validation precedes all writes. */
+        if (memcmp(current, original, values) ||
+            memcmp(current + valuesEnd, original + valuesEnd,
+                   populated - valuesEnd) ||
+            memcmp(current + populatedEnd, original + populatedEnd,
+                   sizeof(_attributes[a]) - populatedEnd))
             return checkpoint_error(error, @"Stale checkpoint vertex layout");
     }
     for (unsigned a = 0; a < 16; a++) {

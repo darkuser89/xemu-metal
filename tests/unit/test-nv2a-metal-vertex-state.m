@@ -1,6 +1,7 @@
 /* Native State-program transport and masked ALU tests; no app or window.
  * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only */
 #import "hw/xbox/nv2a/pgraph/metal/vertex-state.h"
+#import <objc/runtime.h>
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -232,8 +233,73 @@ static void exerciseStateEdges(NV2AMetalStateProgram *executor)
 }
 
 
-int main(void)
+static void state_startup_and_upload_test(NV2AMetalStateProgram *executor)
 {
+    uint32_t expected[192][4] = { 0 }, written[192] = { 0 };
+    const uint32_t input[] = { 0x3f800000, 0xbf800000, 0x80000000, 0x40000000 };
+    NSData *constants = [NSData dataWithBytes:expected length:sizeof(expected)];
+    NSData *launch = [NSData dataWithBytes:input length:sizeof(input)];
+    reject(executor, NULL, 0, constants, launch);
+    assert(![executor valueForKey:@"module"]);
+
+    Token t = token(1, 0, 0);
+    source(&t, 0, 2, 0, 0xe4);
+    destination(&t, 96, 15, 0, 0, 0, 0);
+    t.word[3] |= 1;
+    NV2AMetalCommands *commands = [executor valueForKey:@"commands"];
+    SEL selector = @selector(uploadBytes:length:offset:error:);
+    Method method = class_getInstanceMethod(NV2AMetalCommands.class, selector);
+    assert(method);
+    id<MTLBuffer> (*original)(id, SEL, const void *, NSUInteger, NSUInteger *,
+                             NSError **) = (void *)method_getImplementation(method);
+    NSMutableArray<id<MTLBuffer>> *buffers = [NSMutableArray new];
+    NSMutableArray<NSNumber *> *offsets = [NSMutableArray new];
+    NSError *failure = [NSError errorWithDomain:@"test.xf-state.upload"
+                                           code:1 userInfo:nil];
+    __block BOOL fail = YES;
+    IMP injected = imp_implementationWithBlock(
+        ^id<MTLBuffer>(id owner, const void *bytes, NSUInteger length,
+                        NSUInteger *offset, NSError **error) {
+          assert(owner == commands);
+          if (fail && buffers.count == 1) {
+              if (error)
+                  *error = failure;
+              return nil;
+          }
+          id<MTLBuffer> buffer = original(owner, selector, bytes, length,
+                                          offset, error);
+          assert(buffer && !(*offset % 256));
+          [buffers addObject:buffer];
+          [offsets addObject:@(*offset)];
+          return buffer;
+        });
+    method_setImplementation(method, injected);
+    NSError *error = nil;
+    assert(![executor executeTokens:t.word length:1 constants:constants
+                              launch:launch error:&error] && error == failure);
+    assert(!commands.commandBuffer && !commands.lastSubmitted && buffers.count == 1);
+    [buffers removeAllObjects];
+    [offsets removeAllObjects];
+    fail = NO;
+    NV2AMetalStateResult *result = execute(executor, &t, 1, constants, launch);
+    method_setImplementation(method, (IMP)original);
+    assert(imp_removeBlock(injected));
+    assert(buffers.count == 3 && buffers[0] == buffers[1] && buffers[1] == buffers[2] &&
+           offsets[0].unsignedIntegerValue < offsets[1].unsignedIntegerValue &&
+           offsets[1].unsignedIntegerValue < offsets[2].unsignedIntegerValue);
+    memcpy(expected[96], input, sizeof(input));
+    written[96] = 1;
+    check(result, expected, written);
+    puts("XF state startup: invalid tokens compile nothing; three aligned "
+         "arena slices, injected upload failure and exact retry PASS");
+}
+
+#include "test-metal-state-program-memo.h"
+
+int main(int argc, char **argv)
+{
+    BOOL memoOnly = argc == 2 && !strcmp(argv[1], "--state-program-memo");
+    assert(argc == 1 || memoOnly);
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         assert(device);
@@ -245,6 +311,10 @@ int main(void)
                     error.localizedDescription.UTF8String);
             abort();
         }
+        state_startup_and_upload_test(executor);
+        state_program_memo_tests(device);
+        if (memoOnly)
+            return 0;
         exerciseALUs(executor);
         exerciseStateEdges(executor);
         uint32_t original[192][4], expected[192][4], flags[192] = { 0 };

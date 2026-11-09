@@ -299,6 +299,125 @@ static void incremental_publication(void)
 
 #include "test-metal-pending-progress.h"
 
+static void plan_reuse_tests(void)
+{
+    for (unsigned kind = 1; kind <= 4; kind++) {
+        NV2AMetalPendingJournal *j =
+            [[NV2AMetalPendingJournal alloc] initWithLimit:16];
+        NSMutableArray *inputs = [@[
+            progress_input(kind, 0, 2), progress_input(kind, 1, 2)
+        ] mutableCopy];
+        NSArray *snapshot = [inputs copy];
+        NSError *error = nil;
+        NV2AMetalPendingPlan *plan = [j planInputs:inputs
+                               preservingLastArray:NO error:&error];
+        assert(plan && !error);
+        for (unsigned n = 0; n < 16; n++)
+            assert([j planInputs:inputs preservingLastArray:NO
+                           error:&error] == plan && !error);
+        inputs[1] = progress_input(kind, 1, 3);
+        NV2AMetalPendingPlan *changed = [j planInputs:inputs
+                                  preservingLastArray:NO error:&error];
+        assert(changed && changed != plan && changed.inputs[1].count == 3 &&
+               plan.inputs[1].count == 2 && !error);
+        inputs[1] = snapshot[1];
+        plan = [j planInputs:inputs preservingLastArray:NO error:&error];
+        inputs[1] = NSNull.null;
+        assert(![j planInputs:inputs preservingLastArray:NO error:&error] &&
+               error);
+        inputs[1] = snapshot[1];
+        error = nil;
+        assert([j planInputs:inputs preservingLastArray:NO error:&error] ==
+                   plan && !error);
+        NV2AMetalPendingJournal *copy = [j copyForTransaction];
+        NV2AMetalPendingPlan *copied = [copy planInputs:inputs
+                                 preservingLastArray:NO error:&error];
+        assert(copied && copied != plan);
+        assert(![copy beginProgressForPlan:plan error:&error] && error);
+        error = nil;
+        NV2AMetalPendingProgress *cursor =
+            [j beginProgressForPlan:plan error:&error];
+        for (unsigned stream = 0; stream < 2; stream++) {
+            assert([j commitNextSuffix:tags(1, stream, 0, 2)
+                              progress:cursor error:&error] && !error);
+            NV2AMetalPendingPlan *current = [j planInputs:inputs
+                                      preservingLastArray:NO error:&error];
+            assert(current && current != plan &&
+                   current.prefixCounts[0].unsignedIntegerValue == 2 &&
+                   current.prefixCounts[1].unsignedIntegerValue ==
+                       (stream ? 2u : 0u));
+            plan = current;
+        }
+        NSUInteger generation = j.generation;
+        cursor = [j beginProgressForPlan:plan error:&error];
+        assert([j commitNextSuffix:nil progress:cursor error:&error] &&
+               [j commitNextSuffix:nil progress:cursor error:&error] &&
+               j.generation == generation &&
+               [j planInputs:inputs preservingLastArray:NO error:&error] ==
+                   plan && !error);
+        NV2AMetalPendingUpdate *update =
+            [j prepareCompletedProgress:cursor error:&error];
+        assert(update && [j commitUpdate:update error:&error] && !error);
+        NV2AMetalPendingPlan *committed = [j planInputs:inputs
+                                    preservingLastArray:NO error:&error];
+        assert(committed && committed != plan &&
+               committed.prefixCounts[1].unsignedIntegerValue == 2);
+        assert([j consumeUpdate:update error:&error] && !error);
+        NV2AMetalPendingPlan *consumed = [j planInputs:inputs
+                                   preservingLastArray:NO error:&error];
+        assert(consumed && consumed != committed &&
+               consumed.prefixCounts[0].unsignedIntegerValue == 0 &&
+               consumed.prefixCounts[1].unsignedIntegerValue == 0);
+        [j reset];
+        assert([j planInputs:inputs preservingLastArray:NO error:&error] !=
+                   consumed && !error);
+    }
+    NV2AMetalPendingJournal *j =
+        [[NV2AMetalPendingJournal alloc] initWithLimit:16];
+    NSArray *inputs = @[ array(0, 2), array(8, 2) ];
+    NSError *error = nil;
+    NV2AMetalPendingPlan *plan = [j planInputs:inputs
+                           preservingLastArray:NO error:&error];
+    NV2AMetalPendingUpdate *update = [j preparePlan:plan
+        suffixes:@[ tags(1, 0, 0, 2), tags(1, 1, 0, 2) ] error:&error];
+    assert(update && [j commitUpdate:update error:&error] && !error);
+    inputs = @[ inputs[0] ];
+    plan = [j planInputs:inputs preservingLastArray:YES error:&error];
+    assert(plan && plan.prefixCounts[0].unsignedIntegerValue == 2 && !error);
+    assert(![j planInputs:inputs preservingLastArray:NO error:&error] && error);
+    error = nil;
+    assert([j planInputs:inputs preservingLastArray:YES error:&error] == plan);
+    [j setValue:@(NSUIntegerMax) forKey:@"generation"];
+    assert(![j planInputs:inputs preservingLastArray:YES error:&error] &&
+           error);
+    [j reset];
+    assert(![j planInputs:inputs preservingLastArray:YES error:&error]);
+
+    j = [[NV2AMetalPendingJournal alloc] initWithLimit:16];
+    __weak id weakResource = nil;
+    __weak NV2AMetalPendingPlan *weakPlan = nil;
+    @autoreleasepool {
+        id resource = [NSObject new];
+        weakResource = resource;
+        NSArray *live = @[ array(0, 1) ];
+        NV2AMetalPendingPlan *initial = [j planInputs:live
+                                preservingLastArray:NO error:&error];
+        NV2AMetalPendingSpan *span = [NV2AMetalPendingSpan resource:resource
+                                                             first:0 count:1];
+        NV2AMetalPendingUpdate *accepted = [j preparePlan:initial
+            suffixes:@[ span ] error:&error];
+        assert(accepted && [j commitUpdate:accepted error:&error]);
+        weakPlan = [j planInputs:live preservingLastArray:NO error:&error];
+    }
+    assert(weakResource && weakPlan);
+    [j reset];
+    assert(!weakResource && !weakPlan);
+    puts("Pending plan reuse: four input kinds, immutable caller snapshots, "
+         "partial/no-op progress, commit/consume/reset invalidation, journal "
+         "ownership, hidden-last policy, exhausted generation and resource "
+         "release PASS (CPU only)");
+}
+
 static void transaction_copy_tests(void)
 {
     for (unsigned kind = 1; kind <= 4; kind++) {
@@ -330,19 +449,31 @@ static void transaction_copy_tests(void)
                               error:&error];
         NV2AMetalPendingProgress *cursor =
             [original beginProgressForPlan:plan error:&error];
-        NV2AMetalPendingJournal *staged = [original copyForTransaction];
+        NV2AMetalPendingPlan *grown = [original planInputs:@[ input(3) ]
+                                       preservingLastArray:NO
+                                                     error:&error];
+        NV2AMetalPendingPlan *stagedPlan = nil;
+        NV2AMetalPendingJournal *staged =
+            [original copyForTransactionWithPlan:grown
+                                       stagedPlan:&stagedPlan
+                                            error:&error];
         assert(staged && staged != original &&
-               staged.generation == original.generation);
+               staged.generation == original.generation &&
+               stagedPlan && stagedPlan.inputs == grown.inputs &&
+               stagedPlan.prefixCounts == grown.prefixCounts);
         assert(staged.retainedStreams[0][0] == a);
         assert(![staged beginProgressForPlan:plan error:&error]);
+        assert(![original beginProgressForPlan:stagedPlan error:&error]);
         assert(![staged commitNextSuffix:nil progress:cursor error:&error]);
-        NV2AMetalPendingPlan *grown = [staged planInputs:@[ input(3) ]
-                                     preservingLastArray:NO
-                                                   error:&error];
+        NV2AMetalPendingPlan *rejectedPlan = nil;
+        assert(![staged copyForTransactionWithPlan:grown
+                                         stagedPlan:&rejectedPlan
+                                              error:&error] &&
+               !rejectedPlan);
         NV2AMetalPendingSpan *b = [NV2AMetalPendingSpan resource:@"unsubmitted"
                                                            first:0
                                                            count:1];
-        NV2AMetalPendingUpdate *update = [staged preparePlan:grown
+        NV2AMetalPendingUpdate *update = [staged preparePlan:stagedPlan
                                                     suffixes:@[ b ]
                                                        error:&error];
         assert(update && [staged commitUpdate:update error:&error]);
@@ -358,6 +489,10 @@ static void transaction_copy_tests(void)
         assert([original commitNextSuffix:nil progress:cursor error:&error]);
         staged = [original copyForTransaction];
         [original reset];
+        assert(![original copyForTransactionWithPlan:grown
+                                           stagedPlan:&rejectedPlan
+                                                error:&error] &&
+               !rejectedPlan);
         assert(staged.retainedStreams[0][0] == a &&
                staged.retainedInputs[0].count == 2);
     }
@@ -367,9 +502,18 @@ static void transaction_copy_tests(void)
          "plans/progress "
          "rejected and copied limits PASS (CPU only)");
 }
-int main(void)
+#include "test-metal-index-capture-growth.h"
+
+int main(int argc, char **argv)
 {
     @autoreleasepool {
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--index-capture-growth"))) {
+            index_capture_growth_tests();
+            if (argc == 2)
+                return 0;
+        }
+        assert(argc == 1);
         for (unsigned kind = 1; kind <= 4; kind++) {
             @autoreleasepool {
                 NV2AMetalPendingJournal *j =
@@ -561,6 +705,7 @@ int main(void)
         pending_progress_contracts();
         pending_progress_benchmark();
         index_snapshot_reuse();
+        plan_reuse_tests();
         transaction_copy_tests();
     }
     return 0;

@@ -14,12 +14,19 @@
 #import "vertex-pgraph.h"
 #include "renderer.h"
 
+typedef enum NV2AMetalPresentationRequest {
+    NV2AMetalPresentationIdle,
+    NV2AMetalPresentationRequested,
+    NV2AMetalPresentationSignaled,
+} NV2AMetalPresentationRequest;
+
 typedef struct NV2AMetalRendererState {
     void *draw, *scanout;
     QemuEvent save_complete, shutdown_complete, scale_complete,
         restore_complete;
     bool save_pending, shutdown_pending, scale_pending, resume_begin;
     bool restore_pending, load_pending;
+    NV2AMetalPresentationRequest presentation_request;
     unsigned int requested_scale;
     char *save_error;
     bool diagnostics;
@@ -42,16 +49,32 @@ static NV2AMetalPGRAPHScanout *renderer_scanout(NV2AState *d)
 }
 void *pgraph_metal4_copy_framebuffer(NV2AState *d)
 {
+    NV2AMetalRendererState *state = renderer_state(d);
+    /* The FIFO can service the request itself while busy. If it was about
+     * to sleep, a later UI poll can still send the wakeup. */
+    if (qatomic_cmpxchg(&state->presentation_request,
+                       NV2AMetalPresentationIdle,
+                       NV2AMetalPresentationRequested) !=
+            NV2AMetalPresentationSignaled &&
+        !qemu_mutex_trylock(&d->pfifo.lock)) {
+        if (qatomic_cmpxchg(&state->presentation_request,
+                           NV2AMetalPresentationRequested,
+                           NV2AMetalPresentationSignaled) ==
+            NV2AMetalPresentationRequested)
+            pfifo_kick(d);
+        qemu_mutex_unlock(&d->pfifo.lock);
+    }
+    return (__bridge_retained void *)renderer_scanout(d).frame;
+}
+void *pgraph_metal4_capture_framebuffer(NV2AState *d)
+{
     qemu_mutex_lock(&d->pfifo.lock);
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&d->pgraph.sync_pending, true);
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
-    qemu_mutex_lock(&d->pgraph.lock);
-    void *frame = (__bridge_retained void *)renderer_scanout(d).frame;
-    qemu_mutex_unlock(&d->pgraph.lock);
-    return frame;
+    return (__bridge_retained void *)renderer_scanout(d).frame;
 }
 void pgraph_metal4_release_framebuffer(void *handle)
 {
@@ -285,8 +308,7 @@ void pgraph_metal4_flip_stall(NV2AState *d)
     @autoreleasepool {
         NSError *error = nil;
         NV2AMetalSurfaceCache *cache = renderer_draw(d).surfaces.cache;
-        BOOL ok = [cache submitWithError:&error] &&
-                  [cache waitUntilIdleWithError:&error];
+        BOOL ok = [cache finishSurfaceQueueWithError:&error];
         check_draw(ok, error);
         NV2AMetalRendererState *state = renderer_state(d);
         if (state->diagnostics) {
@@ -417,6 +439,8 @@ void pgraph_metal4_process_pending(NV2AState *d)
             !qatomic_read(&state->load_pending) &&
             !qatomic_read(&d->pgraph.flush_pending) &&
             !qatomic_read(&d->pgraph.sync_pending) &&
+            qatomic_read(&state->presentation_request) ==
+                NV2AMetalPresentationIdle &&
             ![renderer_draw(d).surfaces needsCPUService])
             return;
         qemu_mutex_unlock(&d->pfifo.lock);
@@ -520,8 +544,14 @@ void pgraph_metal4_process_pending(NV2AState *d)
                 qemu_event_set(&state->restore_complete);
             }
         }
-        if (qatomic_read(&d->pgraph.sync_pending)) {
-            BOOL synced = [renderer_scanout(d) renderWithError:&error];
+        bool capture = qatomic_read(&d->pgraph.sync_pending);
+        bool present = qatomic_xchg(&state->presentation_request,
+                                    NV2AMetalPresentationIdle) !=
+                       NV2AMetalPresentationIdle;
+        if (capture || (present && !restore && !shutdown)) {
+            NV2AMetalPGRAPHScanout *scanout = renderer_scanout(d);
+            BOOL synced = capture ? [scanout renderWithError:&error] :
+                                    [scanout updatePresentationWithError:&error];
             check_draw(synced, error);
             if (state->diagnostics &&
                 (++state->diagnostic_syncs <= 3 ||
@@ -542,8 +572,10 @@ void pgraph_metal4_process_pending(NV2AState *d)
             d->pgraph.surface_zeta.draw_dirty =
                 renderer_draw(d).surfaces.zeta.valid &&
                 renderer_draw(d).surfaces.zeta.dirty;
-            qatomic_set(&d->pgraph.sync_pending, false);
-            qemu_event_set(&d->pgraph.sync_complete);
+            if (capture) {
+                qatomic_set(&d->pgraph.sync_pending, false);
+                qemu_event_set(&d->pgraph.sync_complete);
+            }
         }
         BOOL ok =
             [renderer_draw(d).surfaces processCPURequestsWithError:&error];

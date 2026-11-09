@@ -25,8 +25,7 @@ static uint fetch_u32(device const uchar *p)
 }
 
 static float4 fetch_attribute(device const uchar *p,
-                              constant NV2AMetalFetchAttribute &a,
-                              bool current)
+                              constant NV2AMetalFetchAttribute &a)
 {
     float4 value(0, 0, 0, 1);
     if (a.format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
@@ -36,7 +35,7 @@ static float4 fetch_attribute(device const uchar *p,
         int z = int(packed >> 22) - int((packed & 0x80000000) >> 21);
         value = float4(float(x) / 1023.0f, float(y) / 1023.0f,
                        float(z) / 511.0f, 1);
-        if (current || !a.stride) {
+        if (!a.stride) {
             value = max(value, float4(-1));
         }
         return value;
@@ -58,10 +57,6 @@ static float4 fetch_attribute(device const uchar *p,
             value[k] = as_type<float>(fetch_u32(p + 4 * k));
             break;
         }
-    }
-    if (a.format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D &&
-        a.stride && !current) {
-        value = value.bgra;
     }
     return value;
 }
@@ -99,38 +94,44 @@ kernel void nv2a_vertex_fetch(
     bool overflow = index > UINT_MAX - u.first_vertex;
     index += u.first_vertex;
     uint fault = overflow ? UINT_MAX : 0;
+    bool emit_vertex = id < decoded;
+    bool emit_current = ordinal == u.current_vertex;
     for (uint i = 0; i < 16; i++) {
         constant NV2AMetalFetchAttribute &a = u.attributes[i];
         float4 value(a.inline_value[0], a.inline_value[1], a.inline_value[2],
                      a.inline_value[3]);
-        if (a.count && !overflow) {
+        bool loaded = a.count && !overflow;
+        if (loaded) {
             if (a.stride && index > a.max_index) {
                 fault |= 1u << i;
                 value = float4(0, 0, 0, 1);
+                loaded = false;
             } else {
-                value = fetch_attribute(
-                    sources[i] + ulong(index) * a.stride, a, false);
+                value = fetch_attribute(sources[i] + ulong(index) * a.stride, a);
             }
         }
-        if (id < decoded)
+        /* Both outputs use the same loaded lanes. Apply the output-specific
+         * conversion only to valid DMA data, never to defaults or faults. */
+        if (emit_vertex) {
+            bool swap_d3d = loaded && a.stride &&
+                            a.format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D;
+            float4 vertex_value = swap_d3d ? value.bgra : value;
             for (uint k = 0; k < 4; k++)
-                output[id].attributes[i][k] = value[k];
-        if (ordinal == u.current_vertex) {
-            /* Current conversion differs from array conversion for D3D
-             * colors and CMP endpoints. Never copy the array result blindly. */
-            if (a.count && !(fault & (1u << i))) {
-                value = fetch_attribute(sources[i] + ulong(index) * a.stride,
-                                        a, true);
-            }
+                output[id].attributes[i][k] = vertex_value[k];
+        }
+        if (emit_current) {
+            if (loaded && a.stride &&
+                a.format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP)
+                value = max(value, float4(-1));
             for (uint k = 0; k < 4; k++) {
                 output[decoded].attributes[i][k] = value[k];
             }
         }
     }
-    if (id < decoded)
+    if (u.record_faults && emit_vertex)
         faults[id] = fault;
     if (fault)
         atomic_fetch_or_explicit(summary, fault, memory_order_relaxed);
-    if (ordinal == u.current_vertex)
+    if (u.record_faults && emit_current)
         faults[decoded] = fault;
 }

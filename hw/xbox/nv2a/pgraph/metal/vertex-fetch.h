@@ -8,6 +8,19 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/* Host-only, capture-bound Float32 evidence; never a GPU uniform or snapshot
+ * record. min/max use raw Float total order, distinguishing -0 and +0.
+ * minExponent includes EVERY selected word, so zero/subnormal contributes 0.
+ * Without Finite the lane remains unknown; equal min/max proves identical bits.
+ */
+typedef struct NV2AMetalFloatLaneSummary {
+    uint32_t minBits, maxBits, minExponent, flags;
+} NV2AMetalFloatLaneSummary;
+enum {
+    NV2AMetalFloatLaneSummaryFinite = 1u,
+    NV2AMetalFloatProofMaximumWords = 4096u,
+};
+
 typedef struct NV2AMetalAttributeSource {
     __unsafe_unretained id<MTLBuffer> _Nullable buffer;
     NSUInteger offset;
@@ -23,20 +36,48 @@ typedef struct NV2AMetalAttributeSource {
 unsigned int nv2a_metal_attribute_size(unsigned int format, unsigned int count);
 
 API_AVAILABLE(macos(26.0))
+__attribute__((objc_subclassing_restricted))
 @interface NV2AMetalFetchResult : NSObject
 @property(nonatomic, readonly, nullable) id<MTLBuffer> attributes;
-/* One uint32 per output vertex: bit i means attribute i was out of bounds;
- * UINT32_MAX also denotes index + firstVertex overflow. These are validation
- * faults, not hardware results. The draw frontend must reject faulted draws. */
+/* Bit i means attribute i was out of bounds. UINT32_MAX also denotes index +
+ * firstVertex overflow. In summary-only mode this contains one uint32. */
 @property(nonatomic, readonly, nullable) id<MTLBuffer> faults;
-/* Byte offset of an extra uint32 containing the bitwise OR of all vertex
- * faults. Read only after successful GPU completion; individual fault words
- * and the optional Current word retain their original layout. */
+/* Byte offset of the bitwise OR of all faults, including Current. Read only
+ * after successful GPU completion. Optional individual words precede it. */
 @property(nonatomic, readonly) NSUInteger faultSummaryOffset;
 @property(nonatomic, readonly) NSUInteger vertexCount;
-/* When present, attributes[vertexCount] and faults[vertexCount] hold the
- * selected vertex converted with Current (stride-zero) rules. */
+/* When present, attributes[vertexCount] holds Current (stride-zero rules).
+ * Its individual fault word exists only when requested by the fetch owner. */
 @property(nonatomic, readonly) BOOL hasCurrent;
+/* Copy the exact immutable shader parameters for this untouched fetch output.
+ * A range proof may use them only for this buffer/range in the original live
+ * recording. This does not prove absence of fetch/index faults or make GPU
+ * output CPU-readable. No portable snapshot contains this metadata. */
+- (BOOL)getSourceUniforms:(NV2AMetalFetchUniforms *_Nullable)uniforms
+          attributeBuffer:(id<MTLBuffer>)attributes
+                    first:(NSUInteger)first
+                    count:(NSUInteger)count
+                 commands:(NV2AMetalCommands *)commands;
+/* Same binding checks, with constant decoded Float4 domains when PGRAPH owns
+ * a guarded host Current capture of the corresponding stride-zero source.
+ * These are proof inputs only; the recorded shader parameters stay intact. */
+- (BOOL)getReadonlyProofUniforms:(NV2AMetalFetchUniforms *_Nullable)uniforms
+                attributeBuffer:(id<MTLBuffer>)attributes
+                          first:(NSUInteger)first
+                          count:(NSUInteger)count
+                       commands:(NV2AMetalCommands *)commands;
+/* Optional immutable 64-lane summary array, captured only by PGRAPH after
+ * source read guards. The range must be contained in the captured suffix;
+ * appended Current is not covered. Every call rechecks live output ownership.
+ * Raw/generic fetches and restored snapshots carry no such evidence. */
+- (BOOL)getFloatProofSummaries:(NSData *_Nullable *_Nullable)summaries
+                      laneMask:(uint64_t *_Nullable)laneMask
+               attributeBuffer:(id<MTLBuffer>)attributes
+                         first:(NSUInteger)first
+                         count:(NSUInteger)count
+                      commands:(NV2AMetalCommands *)commands;
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
 @end
 
 /* The six formats in GL vertex.c / glsl/vsh.c, materialized as 16 Float4s for
@@ -50,6 +91,9 @@ API_AVAILABLE(macos(26.0))
 @interface NV2AMetalVertexFetch : NSObject
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                                   error:(NSError *_Nullable *_Nullable)error;
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                        faultSummaryOnly:(BOOL)faultSummaryOnly
+                                   error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 

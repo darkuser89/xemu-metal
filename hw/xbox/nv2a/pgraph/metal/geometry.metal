@@ -461,3 +461,508 @@ kernel void nv2a_expand_geometry(device const NV2AMetalVertex *input
         }
     }
 }
+
+/* Materialize logical records only for stream joining/geometry expansion. */
+kernel void nv2a_vertex_stream_gather(
+    device const NV2AMetalVertex *src [[buffer(0)]],
+    device const uint *indices [[buffer(1)]],
+    device NV2AMetalVertex *dst [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < count)
+        dst[i] = src[indices[i]];
+}
+
+/* Direct polygons retain only their whole-boundary face, never an expanded
+ * vertex stream. These entry points leave both compute references above
+ * unchanged. Each logical fan position is remapped before loading a clip. */
+template <bool Indexed>
+static uint direct_polygon_source(uint logical, device const uint *remap)
+{
+    return Indexed ? remap[logical] : logical;
+}
+template <bool Indexed>
+static void direct_polygon_face(device const NV2AMetalVertex *input,
+                                  device uint *face,
+                                  constant NV2AMetalGeometryUniforms &u,
+                                  device const uint *remap)
+{
+    face[0] = 0;
+    if (u.input_count < 3)
+        return;
+    float4 a = geometry_device_clip(input[direct_polygon_source<Indexed>(0, remap)]);
+    for (uint i = 1; i + 1 < u.input_count; i++) {
+        float4 b = geometry_device_clip(input[direct_polygon_source<Indexed>(i, remap)]);
+        float4 c = geometry_device_clip(input[direct_polygon_source<Indexed>(i + 1, remap)]);
+        float area = geometry_area(a, b, c);
+        if (area != 0) {
+            face[0] = u.front_clockwise ? area < 0 : area > 0;
+            return;
+        }
+    }
+}
+kernel void nv2a_direct_polygon_face(
+    device const NV2AMetalVertex *input [[buffer(0)]],
+    device uint *face [[buffer(1)]],
+    constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id == 0)
+        direct_polygon_face<false>(input, face, u, nullptr);
+}
+kernel void nv2a_direct_indexed_polygon_face(
+    device const NV2AMetalVertex *input [[buffer(0)]],
+    device uint *face [[buffer(1)]],
+    constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+    device const uint *remap [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id == 0)
+        direct_polygon_face<true>(input, face, u, remap);
+}
+
+/* Compact carriers are independent of the full-vertex expansion above, which
+ * remains the raster oracle. Keep its clipping/band operation order intact. */
+static NV2AMetalCompactLine
+compact_line_carrier(uint2 source, uint provoking, uint face, float slope,
+                     float4 p0, float4 p1, float4 a, float4 b,
+                     constant NV2AMetalGeometryUniforms &u)
+{
+    NV2AMetalCompactLine result = {};
+    result.source[0] = source.x;
+    result.source[1] = source.y;
+    result.provoking = provoking;
+    result.color_smooth = u.smooth;
+    result.width = u.line_width;
+    result.smooth = u.line_smooth;
+    result.face = face;
+    result.slope = isfinite(slope) ? slope : 0.0f;
+    float enter = 0, leave = 1;
+    bool valid = all(isfinite(a)) && all(isfinite(b));
+    if (valid) {
+        // Positive homogeneous rescaling preserves the clipped projective
+        // segment and keeps a short visible interval from rounding to t=1.
+        int shift_a, shift_b;
+        frexp(max(abs(a.w), max(abs(a.x), abs(a.y))), shift_a);
+        frexp(max(abs(b.w), max(abs(b.x), abs(b.y))), shift_b);
+        a.xyw = ldexp(a.xyw, -shift_a);
+        b.xyw = ldexp(b.xyw, -shift_b);
+    }
+    /* Depth clamp leaves Z to the fragment stage. Clip the centreline in XY/W
+     * before expanding its width, as with the original line primitive. */
+    float4 fa(a.w + a.x, a.w - a.x, a.w + a.y, a.w - a.y);
+    float4 fb(b.w + b.x, b.w - b.x, b.w + b.y, b.w - b.y);
+    uint enter_planes = 0, leave_planes = 0;
+    for (uint k = 0; k < 4; k++) {
+        if (fa[k] < 0 && fb[k] < 0)
+            valid = false;
+        else if (fa[k] < 0) {
+            float t = fa[k] / (fa[k] - fb[k]);
+            if (t > enter) {
+                enter = t;
+                enter_planes = 1u << k;
+            } else if (t == enter) {
+                enter_planes |= 1u << k;
+            }
+        } else if (fb[k] < 0) {
+            float t = fa[k] / (fa[k] - fb[k]);
+            if (t < leave) {
+                leave = t;
+                leave_planes = 1u << k;
+            } else if (t == leave) {
+                leave_planes |= 1u << k;
+            }
+        }
+    }
+    float4 ca = mix(a, b, enter), cb = mix(a, b, leave);
+    // Keep generated endpoints exactly on their intersected clip planes.
+    for (uint k = 0; k < 4; k++) {
+        if (enter_planes & (1u << k))
+            ca[k / 2] = k & 1 ? ca.w : -ca.w;
+        if (leave_planes & (1u << k))
+            cb[k / 2] = k & 1 ? cb.w : -cb.w;
+    }
+    valid &= enter <= leave && ca.w > 0 && cb.w > 0;
+    float2 viewport(u.viewport[0], u.viewport[1]);
+    float2 pa = float2(ca.x / ca.w + 1, 1 - ca.y / ca.w) * viewport * .5f;
+    float2 pb = float2(cb.x / cb.w + 1, 1 - cb.y / cb.w) * viewport * .5f;
+    valid &= all(isfinite(pa)) && all(isfinite(pb)) && any(pa != pb);
+    float padding = u.line_width * .5f + 2;
+    float2 lo = max(min(pa, pb) - padding, float2(0));
+    float2 hi = min(max(pa, pb) + padding, viewport);
+    valid &= all(hi > lo);
+    if (!valid) {
+        return result;
+    }
+    float2 corners[4] = { lo, float2(lo.x, hi.y), float2(hi.x, lo.y), hi };
+    /* Every smooth covered square lies within half a line width plus its
+     * half-diagonal. Aliased wide lines translate the diamond along the minor
+     * axis by at most (rounded_width-1)/2. This bounds both its tangent and
+     * normal displacement. Three extra pixels also retain the neighbouring
+     * helper quad; fragment interpolation/derivatives stay unchanged.
+     * Keep the clipped AABB when it is smaller than this conservative band. */
+    float2 segment = pb - pa;
+    float length = metal::length(segment);
+    float margin = u.line_width * .5f + 3;
+    if ((length + 2 * margin) * (2 * margin) < (hi.x - lo.x) * (hi.y - lo.y)) {
+        float2 along = segment / length * margin;
+        float2 across(-along.y, along.x);
+        corners[0] = pa - along - across;
+        corners[1] = pa - along + across;
+        corners[2] = pb + along - across;
+        corners[3] = pb + along + across;
+    }
+
+    for (uint i = 0; i < 4; i++) {
+        float2 ndc = corners[i] / viewport * 2 - 1;
+        result.clip[i][0] = ndc.x;
+        result.clip[i][1] = -ndc.y;
+        result.p0[i] = p0[i];
+        result.p1[i] = p1[i];
+        result.p2[i] = i < 2 ? pa[i] : pb[i - 2];
+    }
+    result.valid = 1;
+    return result;
+}
+template <bool Indexed>
+static void compact_line(device const NV2AMetalVertex *input,
+                         device NV2AMetalCompactLine *output,
+                         constant NV2AMetalGeometryUniforms &u,
+                         device const uint *remap, uint id)
+{
+    if (id >= u.primitive_count)
+        return;
+    uint2 source = u.primitive == NV2AMetalPrimitiveLines ?
+                       uint2(2 * id, 2 * id + 1) :
+                       uint2(id, id + 1 == u.input_count ? 0 : id + 1);
+    if (Indexed) {
+        source.x = remap[source.x];
+        source.y = remap[source.y];
+    }
+    float4 p0 = float4(input[source.x].screen[0], input[source.x].screen[1],
+                       input[source.x].screen[2], input[source.x].screen[3]);
+    float4 p1 = float4(input[source.y].screen[0], input[source.y].screen[1],
+                       input[source.y].screen[2], input[source.y].screen[3]);
+    output[id] = compact_line_carrier(
+        source, u.first_provoking ? source.x : source.y, NV2AMetalFaceFront, 0,
+        p0, p1, geometry_device_clip(input[source.x]),
+        geometry_device_clip(input[source.y]), u);
+}
+
+kernel void
+nv2a_compact_lines(device const NV2AMetalVertex *input [[buffer(0)]],
+                   device NV2AMetalCompactLine *output [[buffer(1)]],
+                   constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+                   uint id [[thread_position_in_grid]])
+{
+    compact_line<false>(input, output, u, nullptr, id);
+}
+kernel void
+nv2a_compact_indexed_lines(device const NV2AMetalVertex *input [[buffer(0)]],
+                           device NV2AMetalCompactLine *output [[buffer(1)]],
+                           constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+                           device const uint *remap [[buffer(3)]],
+                           uint id [[thread_position_in_grid]])
+{
+    compact_line<true>(input, output, u, remap, id);
+}
+
+/* Polygon boundaries retain the legacy topology, face and depth planes.
+ * One invocation owns all three/four edges, so plane work is not repeated. */
+template <bool Indexed>
+static void compact_polygon_line(device const NV2AMetalVertex *input,
+                                 device NV2AMetalCompactLine *output,
+                                 constant NV2AMetalGeometryUniforms &u,
+                                 device const uint *remap,
+                                 device const uint *polygon_face, uint id)
+{
+    if (id >= u.primitive_count)
+        return;
+    bool boundary = u.primitive == NV2AMetalPrimitivePolygon;
+    bool quad = u.primitive == NV2AMetalPrimitiveQuads ||
+                u.primitive == NV2AMetalPrimitiveQuadStrip;
+    bool strip = u.primitive == NV2AMetalPrimitiveQuadStrip;
+    uint4 logical;
+    uint provoking;
+    if (boundary) {
+        logical = uint4(id, (id + 1) % u.input_count, 0, 0);
+        provoking = 0;
+    } else if (u.primitive == NV2AMetalPrimitiveTriangles) {
+        logical = 3 * id + uint4(0, 1, 2, 0);
+        provoking = u.first_provoking ? 0 : 2;
+    } else if (u.primitive == NV2AMetalPrimitiveTriangleStrip) {
+        logical = uint4(id, id + 1 + (id & 1), id + 2 - (id & 1), 0);
+        provoking = u.first_provoking ? 0 : 2 - (id & 1);
+    } else if (u.primitive == NV2AMetalPrimitiveTriangleFan) {
+        logical = uint4(0, id + 1, id + 2, 0);
+        provoking = u.first_provoking ? 0 : 1;
+    } else {
+        logical = (strip ? 2 : 4) * id + uint4(0, 1, 2, 3);
+        provoking = 3;
+    }
+    uint count = boundary ? 2 : quad ? 4 : 3;
+    uint4 physical = logical;
+    float4 p[4], clip[4];
+    for (uint i = 0; i < count; i++) {
+        if (Indexed)
+            physical[i] = remap[logical[i]];
+        device const NV2AMetalVertex &v = input[physical[i]];
+        p[i] = float4(v.screen[0], v.screen[1], v.screen[2], v.screen[3]);
+        clip[i] = geometry_device_clip(v);
+    }
+    float area = boundary ? 0 : geometry_area(clip[0], clip[1], clip[2]);
+    bool front = boundary          ? polygon_face[0] != 0 :
+                 u.front_clockwise ? area < 0 :
+                                     area > 0;
+    uint edges = boundary ? 1 : count;
+    uint base = id * edges;
+    if (u.face_mask && !(u.face_mask & (front ? 1u : 2u))) {
+        NV2AMetalCompactLine invalid = {};
+        for (uint e = 0; e < edges; e++)
+            output[base + e] = invalid;
+        return;
+    }
+    float4x4 plane =
+        boundary      ? float4x4(0) :
+        quad && strip ? geometry_plane(p[2], p[0], p[1], u.z_perspective) :
+                        geometry_plane(p[0], p[1], p[2], u.z_perspective);
+    float4x4 plane2 =
+        quad ? (strip ? geometry_plane(p[2], p[1], p[3], u.z_perspective) :
+                        geometry_plane(p[0], p[2], p[3], u.z_perspective)) :
+               plane;
+    uint4 order = boundary ? uint4(0, 1, 0, 0) :
+                  quad     ? (strip ? uint4(0, 1, 3, 2) : uint4(0, 1, 2, 3)) :
+                             uint4(0, 1, 2, 0);
+    for (uint e = 0; e < edges; e++) {
+        uint a = order[e], b = order[(e + 1) % count];
+        float slope = boundary ? 0 :
+                      quad && (strip ? e == 1 || e == 2 : e >= 2) ?
+                                 plane2[3].x :
+                                 plane[3].x;
+        output[base + e] = compact_line_carrier(
+            uint2(physical[a], physical[b]), physical[provoking],
+            front ? NV2AMetalFaceFront : NV2AMetalFaceBack, slope, p[a], p[b],
+            clip[a], clip[b], u);
+    }
+}
+kernel void
+nv2a_compact_polygon_lines(device const NV2AMetalVertex *input [[buffer(0)]],
+                           device NV2AMetalCompactLine *output [[buffer(1)]],
+                           constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+                           device const uint *polygon_face [[buffer(4)]],
+                           uint id [[thread_position_in_grid]])
+{
+    compact_polygon_line<false>(input, output, u, nullptr, polygon_face, id);
+}
+kernel void nv2a_compact_indexed_polygon_lines(
+    device const NV2AMetalVertex *input [[buffer(0)]],
+    device NV2AMetalCompactLine *output [[buffer(1)]],
+    constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+    device const uint *remap [[buffer(3)]],
+    device const uint *polygon_face [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    compact_polygon_line<true>(input, output, u, remap, polygon_face, id);
+}
+
+/* Compact smooth fill retains the original coverage projection and carrier
+ * corner arithmetic, but borrows attributes instead of writing six vertices.
+ * The legacy geometry_polygon/expansion implementation above is unchanged. */
+static NV2AMetalCompactPolygon
+compact_polygon_fill_carrier(uint3 source, uint provoking, uint face,
+                             float4x4 plane, thread float4 *clips,
+                             constant NV2AMetalGeometryUniforms &u,
+                             device NV2AMetalPolygonProjection *projection)
+{
+    NV2AMetalCompactPolygon result = {};
+    float2 points[8], viewport(u.viewport[0], u.viewport[1]);
+    uint count = polygon_project(clips, viewport, points);
+    float area = geometry_area(clips[0], clips[1], clips[2]);
+    bool front = face == NV2AMetalFaceFront;
+    bool valid = count && area != 0 &&
+                 (!u.face_mask || (u.face_mask & (front ? 1u : 2u)));
+    projection->count = valid ? count : 0;
+    for (uint i = 0; i < count; i++) {
+        projection->points[i][0] = points[i].x;
+        projection->points[i][1] = points[i].y;
+    }
+    float2 lo = viewport, hi = 0;
+    for (uint i = 0; i < count; i++) {
+        lo = min(lo, points[i]);
+        hi = max(hi, points[i]);
+    }
+    // Padding ensures Metal's centre sampling covers every intersected square.
+    lo = max(lo - 1, float2(0));
+    hi = min(hi + 1, viewport);
+    float2 corners[4] = { lo, float2(hi.x, lo.y), float2(lo.x, hi.y), hi };
+    /* A long diagonal polygon need not shade the empty corners of its AABB.
+     * Bound its projected vertices along the longest edge and its normal.
+     * Scaling the largest axis component to one keeps the inverse basis's
+     * determinant in [1,2], without a square root or a tiny divisor. Three
+     * pixels of L-infinity padding retain intersected squares and neighbouring
+     * helper quads, with headroom for Float32 reconstruction at <=16K
+     * viewports. Use this carrier only when its full area is below the clipped
+     * AABB's; original clip/plane/attribute records and fragment integration
+     * stay put. */
+    float2 edge = 0;
+    float longest = 0;
+    if (valid) {
+        for (uint i = 0; i < count; i++) {
+            float2 delta = points[(i + 1) % count] - points[i];
+            float squared = dot(delta, delta);
+            if (isfinite(squared) && squared > longest) {
+                edge = delta;
+                longest = squared;
+            }
+        }
+    }
+    if (longest > 0) {
+        float2 axis = edge / max(abs(edge.x), abs(edge.y));
+        float2 normal(-axis.y, axis.x), origin = points[0];
+        float2 lower = INFINITY, upper = -INFINITY;
+        bool finite = true;
+        for (uint i = 0; i < count; i++) {
+            float2 relative = points[i] - origin;
+            float2 p(dot(relative, axis), dot(relative, normal));
+            finite &= all(isfinite(p));
+            lower = min(lower, p);
+            upper = max(upper, p);
+        }
+        float padding = 3 * (abs(axis.x) + abs(axis.y));
+        lower -= padding;
+        upper += padding;
+        float inverse = 1 / dot(axis, axis);
+        float2 extent = upper - lower;
+        if (finite && all(isfinite(lower)) && all(isfinite(upper)) &&
+            extent.x * extent.y * inverse < (hi.x - lo.x) * (hi.y - lo.y)) {
+            corners[0] = origin + (axis * lower.x + normal * lower.y) * inverse;
+            corners[1] = origin + (axis * upper.x + normal * lower.y) * inverse;
+            corners[2] = origin + (axis * lower.x + normal * upper.y) * inverse;
+            corners[3] = origin + (axis * upper.x + normal * upper.y) * inverse;
+        }
+    }
+    if (!valid)
+        return result;
+    for (uint i = 0; i < 4; i++) {
+        float2 ndc = corners[i] / viewport * 2 - 1;
+        result.clip[i][0] = ndc.x;
+        result.clip[i][1] = -ndc.y;
+        result.p0[i] = plane[0][i];
+        result.p1[i] = plane[1][i];
+        result.p2[i] = plane[2][i];
+    }
+    result.slope = isfinite(plane[3].x) ? plane[3].x : 0.0f;
+    result.face = face;
+    result.valid = 1;
+    result.color_smooth = u.smooth;
+    for (uint i = 0; i < 3; i++)
+        result.source[i] = source[i];
+    result.provoking = provoking;
+    result.viewport[0] = viewport.x;
+    result.viewport[1] = viewport.y;
+    return result;
+}
+
+template <bool Indexed>
+static void
+compact_polygon_fill(device const NV2AMetalVertex *input,
+                     device NV2AMetalCompactPolygon *output,
+                     constant NV2AMetalGeometryUniforms &u,
+                     device const uint *remap, device const uint *polygon_face,
+                     device NV2AMetalPolygonProjection *projections, uint id)
+{
+    if (id >= u.primitive_count)
+        return;
+    bool genuine = u.primitive == NV2AMetalPrimitivePolygon;
+    bool quad = u.primitive == NV2AMetalPrimitiveQuads ||
+                u.primitive == NV2AMetalPrimitiveQuadStrip;
+    bool strip = u.primitive == NV2AMetalPrimitiveQuadStrip;
+    uint4 logical;
+    uint provoking;
+    if (u.primitive == NV2AMetalPrimitiveTriangles) {
+        logical = 3 * id + uint4(0, 1, 2, 0);
+        provoking = u.first_provoking ? 0 : 2;
+    } else if (u.primitive == NV2AMetalPrimitiveTriangleStrip) {
+        logical = uint4(id, id + 1 + (id & 1), id + 2 - (id & 1), 0);
+        provoking = u.first_provoking ? 0 : 2 - (id & 1);
+    } else if (u.primitive == NV2AMetalPrimitiveTriangleFan) {
+        logical = uint4(0, id + 1, id + 2, 0);
+        provoking = u.first_provoking ? 0 : 1;
+    } else if (genuine) {
+        logical = uint4(0, id + 1, id + 2, 0);
+        provoking = 2;
+    } else {
+        logical = (strip ? 2 : 4) * id + uint4(0, 1, 2, 3);
+        provoking = 3;
+    }
+    uint4 physical = logical;
+    float4 p[4], clip[4];
+    uint count = quad ? 4 : 3;
+    for (uint i = 0; i < count; i++) {
+        if (Indexed)
+            physical[i] = remap[logical[i]];
+        device const NV2AMetalVertex &v = input[physical[i]];
+        p[i] = float4(v.screen[0], v.screen[1], v.screen[2], v.screen[3]);
+        clip[i] = geometry_device_clip(v);
+    }
+    float area = geometry_area(clip[0], clip[1], clip[2]);
+    bool front = genuine           ? polygon_face[0] != 0 :
+                 u.front_clockwise ? area < 0 :
+                                     area > 0;
+    uint face = front ? NV2AMetalFaceFront : NV2AMetalFaceBack;
+    uint parts = quad ? 2 : 1, base = id * parts;
+    if (u.face_mask && !(u.face_mask & (front ? 1u : 2u))) {
+        NV2AMetalCompactPolygon invalid = {};
+        for (uint i = 0; i < parts; i++) {
+            output[base + i] = invalid;
+            projections[base + i].count = 0;
+        }
+        return;
+    }
+    float4x4 plane = quad && strip ?
+                         geometry_plane(p[2], p[0], p[1], u.z_perspective) :
+                         geometry_plane(p[0], p[1], p[2], u.z_perspective);
+    float4x4 plane2 =
+        quad ? (strip ? geometry_plane(p[2], p[1], p[3], u.z_perspective) :
+                        geometry_plane(p[0], p[2], p[3], u.z_perspective)) :
+               plane;
+    const uint3 first = quad && !strip ? uint3(1, 2, 0) : uint3(0, 1, 2);
+    const uint3 second = strip ? uint3(2, 1, 3) : uint3(2, 3, 0);
+    for (uint part = 0; part < parts; part++) {
+        uint3 triangle = part ? second : first;
+        uint3 source;
+        float4 clips[3];
+        for (uint i = 0; i < 3; i++) {
+            source[i] = physical[triangle[i]];
+            clips[i] = clip[triangle[i]];
+        }
+        output[base + part] = compact_polygon_fill_carrier(
+            source, physical[provoking], face, part ? plane2 : plane, clips, u,
+            projections + base + part);
+    }
+}
+kernel void
+nv2a_compact_polygon_fill(device const NV2AMetalVertex *input [[buffer(0)]],
+                          device NV2AMetalCompactPolygon *output [[buffer(1)]],
+                          constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+                          device const uint *polygon_face [[buffer(4)]],
+                          device NV2AMetalPolygonProjection *projections
+                          [[buffer(5)]],
+                          uint id [[thread_position_in_grid]])
+{
+    compact_polygon_fill<false>(input, output, u, nullptr, polygon_face,
+                                projections, id);
+}
+kernel void nv2a_compact_indexed_polygon_fill(
+    device const NV2AMetalVertex *input [[buffer(0)]],
+    device NV2AMetalCompactPolygon *output [[buffer(1)]],
+    constant NV2AMetalGeometryUniforms &u [[buffer(2)]],
+    device const uint *remap [[buffer(3)]],
+    device const uint *polygon_face [[buffer(4)]],
+    device NV2AMetalPolygonProjection *projections [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    compact_polygon_fill<true>(input, output, u, remap, polygon_face,
+                               projections, id);
+}

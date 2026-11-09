@@ -411,10 +411,341 @@ static void render_case(const PolygonPoint *points, const float *w, bool flat,
 #include "test-metal-polygon-projection.h"
 #include "test-metal-polygon-transport.h"
 #include "test-metal-polygon-quads.h"
+#include "test-metal-compact-polygon-fill.h"
+#include "test-metal-polygon-window-clip.h"
+#include "test-metal-polygon-window-benchmark.h"
+#include "test-metal-projection-mode.h"
+
+typedef struct {
+    float clips[3][4], viewport[2], centre[2];
+    NV2AMetalPolygonProjection projection;
+    unsigned preprojected;
+} PolygonInteriorCase;
+_Static_assert(sizeof(PolygonInteriorCase) == 136, "Interior test MSL ABI");
+
+static NSString *interior_slice(NSString *source, NSString *start,
+                                NSString *end)
+{
+    NSRange first = [source rangeOfString:start];
+    assert(first.location != NSNotFound);
+    NSRange last =
+        [source rangeOfString:end
+                      options:0
+                        range:NSMakeRange(NSMaxRange(first),
+                                          source.length - NSMaxRange(first))];
+    assert(last.location != NSNotFound);
+    return
+        [source substringWithRange:NSMakeRange(first.location,
+                                               last.location - first.location)];
+}
+
+/* Exercise the admission bound under both arithmetic modes allowed by MSL
+ * 8.2, including output FTZ. The GPU itself exposes no mode selector. */
+static float interior_round(double value, BOOL towardZero)
+{
+    float rounded = (float)value;
+    if (towardZero && fabs((double)rounded) > fabs(value)) {
+        uint32_t bits;
+        memcpy(&bits, &rounded, 4);
+        bits--;
+        memcpy(&rounded, &bits, 4);
+    }
+    return fabsf(rounded) < 0x1p-126f ? copysignf(0, rounded) : rounded;
+}
+
+static void interior_rounding_checks(const float *points, unsigned count,
+                                     const float *centre, unsigned *admissions)
+{
+    double orientation = 0;
+    for (unsigned j = 0; j < count; j++) {
+        unsigned k = (j + 1) % count;
+        orientation += (double)points[2 * j] * points[2 * k + 1] -
+                       (double)points[2 * j + 1] * points[2 * k];
+    }
+    double sign = orientation > 0 ? 1 : -1;
+    for (unsigned mode = 0; mode < 2; mode++)
+        for (unsigned j = 0; j < count; j++) {
+            unsigned k = (j + 1) % count;
+            float a[2], b[2], d[2];
+            for (unsigned axis = 0; axis < 2; axis++) {
+                a[axis] = interior_round(
+                    (double)points[2 * j + axis] - centre[axis], mode);
+                b[axis] = interior_round(
+                    (double)points[2 * k + axis] - centre[axis], mode);
+                d[axis] = interior_round((double)b[axis] - a[axis], mode);
+            }
+            float left = interior_round((double)d[1] * a[0], mode),
+                  right = interior_round((double)d[0] * a[1], mode),
+                  cross = interior_round((double)left - right, mode),
+                  span =
+                      interior_round((double)fabsf(d[0]) + fabsf(d[1]), mode),
+                  radius = interior_round(.5 * span, mode),
+                  minimum = interior_round(sign * cross - radius, mode),
+                  magnitude = fmaxf(fmaxf(fabsf(a[0]), fabsf(a[1])),
+                                    fmaxf(fabsf(b[0]), fabsf(b[1]))),
+                  scale = interior_round(1.0 + magnitude, mode),
+                  bound = interior_round(
+                      (double)interior_round(0x1p-18 * scale, mode) * scale,
+                      mode);
+            if (!(magnitude <= 32768 && isfinite(minimum) && minimum > bound))
+                continue;
+            double ax = (double)points[2 * j] - centre[0],
+                   ay = (double)points[2 * j + 1] - centre[1],
+                   dx = (double)points[2 * k] - points[2 * j],
+                   dy = (double)points[2 * k + 1] - points[2 * j + 1];
+            assert(sign * (dy * ax - dx * ay) - .5 * (fabs(dx) + fabs(dy)) > 0);
+            admissions[mode]++;
+        }
+}
+
+static void polygon_interior_tests(void)
+{
+    NSError *error = nil;
+    NSString *source = @(pq_pixel_source);
+    NSString *weights =
+        interior_slice(source, @"static float3 polygon_weights(",
+                       @"static float polygon_sample(");
+    NSString *sample = interior_slice(source, @"static float polygon_sample(",
+                                      @"static bool pixel_quad_helpers(");
+    NSString *gate = @"    if (interior)\n        return 1.0f;\n";
+    assert([sample componentsSeparatedByString:gate].count == 2);
+    NSString *previous = [[sample stringByReplacingOccurrencesOfString:gate
+                                                            withString:@""]
+        stringByReplacingOccurrencesOfString:@"polygon_sample("
+                                  withString:@"pi_previous_sample("];
+    sample = [sample
+        stringByReplacingOccurrencesOfString:gate
+                                  withString:@"    if (interior) { hit = true; "
+                                             @"return 1.0f; }\n"];
+    assert([sample componentsSeparatedByString:@"bool preprojected)"].count ==
+           2);
+    sample = [sample
+        stringByReplacingOccurrencesOfString:@"bool preprojected)"
+                                  withString:
+                                      @"bool preprojected, thread bool &hit)"];
+    NSMutableString *test = [NSMutableString
+        stringWithString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+    [test appendString:
+              interior_slice(
+                  source, @"typedef struct NV2AMetalPolygonProjection {",
+                  @"/* Scalar arrays keep the CPU and MSL layouts identical.")];
+    [test appendString:interior_slice(source, @"static uint polygon_project(",
+                                      @"#endif")];
+    [test appendString:weights];
+    [test appendString:previous];
+    [test appendString:sample];
+    [test appendString:
+              @"struct PICase { float clips[3][4], viewport[2], centre[2];"
+               " NV2AMetalPolygonProjection projection; uint preprojected; };\n"
+               "kernel void pi_check(device const PICase *cases [[buffer(0)]],"
+               "device float *results [[buffer(1)]], uint id "
+               "[[thread_position_in_grid]]) {"
+               "device const PICase &c=cases[id]; float4 clips[3];"
+               "for(uint "
+               "i=0;i<3;i++)clips[i]=float4(c.clips[i][0],c.clips[i][1],c."
+               "clips[i][2],c.clips[i][3]);"
+               "float2 "
+               "viewport(c.viewport[0],c.viewport[1]),centre(c.centre[0],c."
+               "centre[1]);"
+               "float3 a,b;bool hit=false;"
+               "float "
+               "coverage=polygon_sample(clips,viewport,centre,a,&c.projection,"
+               "c.preprojected!=0,hit);"
+               "float "
+               "old=pi_previous_sample(clips,viewport,centre,b,&c.projection,c."
+               "preprojected!=0);"
+               "device float *out=results+id*26;for(uint i=0;i<26;i++)out[i]=0;"
+               "for(uint i=0;i<3;i++){out[i]=a[i];out[4+i]=b[i];}"
+               "out[3]=coverage;out[7]=old;out[8]=hit;float2 points[8];uint n;"
+               "if(c.preprojected){n=min(c.projection.count,8u);for(uint "
+               "i=0;i<n;i++)"
+               "points[i]=float2(c.projection.points[i][0],c.projection.points["
+               "i][1]);}"
+               "else n=polygon_project(clips,viewport,points);out[9]=n;"
+               "for(uint "
+               "i=0;i<n;i++){out[10+i*2]=points[i].x;out[11+i*2]=points[i].y;} "
+               "}\n"];
+    id<MTL4Compiler> compiler =
+        [commands.device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                             error:&error];
+    require(compiler != nil, error);
+    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
+    ld.source = test;
+    ld.options = [MTLCompileOptions new];
+    ld.options.languageVersion = MTLLanguageVersion4_0;
+    ld.options.mathMode = MTLMathModeSafe;
+    ld.options.mathFloatingPointFunctions =
+        MTLMathFloatingPointFunctionsPrecise;
+    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld
+                                                          error:&error];
+    require(library != nil, error);
+    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
+    fn.library = library;
+    fn.name = @"pi_check";
+    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
+    pd.computeFunctionDescriptor = fn;
+    id<MTLComputePipelineState> pipeline =
+        [compiler newComputePipelineStateWithDescriptor:pd
+                                    compilerTaskOptions:nil
+                                                  error:&error];
+    require(pipeline != nil, error);
+    const unsigned count = 8256;
+    NSMutableData *data =
+        [NSMutableData dataWithLength:count * sizeof(PolygonInteriorCase)];
+    PolygonInteriorCase *cases = data.mutableBytes;
+    for (unsigned i = 0; i < count; i++) {
+        PolygonInteriorCase *c = &cases[i];
+        const unsigned sizes[] = { 16, 256, 4096, 16384 };
+        float size = sizes[(i / 64) % 4];
+        c->viewport[0] = c->viewport[1] = size;
+        c->centre[0] = c->centre[1] = size * .5f + .5f;
+        c->preprojected = i < 8192 && (i & 4);
+        unsigned n = c->projection.count = 3 + i % 6;
+        float radius = (i & 16) ? size * .25f : 1 + (i % 5) * .25f;
+        for (unsigned j = 0; j < n; j++) {
+            double angle = 6.283185307179586 * j / n + .125 * (i % 8);
+            unsigned index = i & 1 ? n - 1 - j : j;
+            c->projection.points[index][0] = c->centre[0] + radius * cos(angle);
+            c->projection.points[index][1] = c->centre[1] + radius * sin(angle);
+        }
+        /* Axis-aligned near-boundaries include exact and adjacent Float32
+         * edge coordinates at all viewport sizes, with both windings. */
+        if (i & 8) {
+            c->projection.count = 4;
+            float edge = c->centre[0] + .5f;
+            int steps = (int)(i % 9) - 4;
+            for (int j = 0; j < abs(steps); j++)
+                edge = nextafterf(edge, steps < 0 ? -INFINITY : INFINITY);
+            const float p[4][2] = {
+                { c->centre[0] - radius, c->centre[1] - radius },
+                { edge, c->centre[1] - radius },
+                { edge, c->centre[1] + radius },
+                { c->centre[0] - radius, c->centre[1] + radius }
+            };
+            for (unsigned j = 0; j < 4; j++)
+                memcpy(c->projection.points[i & 1 ? 3 - j : j], p[j], 8);
+        }
+        for (unsigned j = 0; j < 3; j++) {
+            float w = (i & 32) ? (float[]){ .25f, 1, 64 }[j] : 1;
+            float x = c->projection.points[j][0],
+                  y = c->projection.points[j][1];
+            c->clips[j][0] = (x / size * 2 - 1) * w;
+            c->clips[j][1] = (1 - y / size * 2) * w;
+            c->clips[j][2] = .5f * w;
+            c->clips[j][3] = w;
+        }
+        if (i >= 8192) {
+            unsigned which = (i - 8192) % 3;
+            c->clips[which][3] = i & 1 ? 0 : -1;
+        }
+    }
+    id<MTLBuffer> input =
+        [commands.device newBufferWithBytes:data.bytes
+                                     length:data.length
+                                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> output =
+        [commands.device newBufferWithLength:count * 26 * 4
+                                     options:MTLResourceStorageModeShared];
+    assert(input && output);
+    memset(output.contents, 0xcc, output.length);
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+    ad.maxBufferBindCount = 2;
+    ad.initializeBindings = YES;
+    id<MTL4ArgumentTable> arguments =
+        [commands.device newArgumentTableWithDescriptor:ad error:&error];
+    require(arguments != nil, error);
+    pp_begin();
+    require([commands addResource:input error:&error] &&
+                [commands addResource:output error:&error],
+            error);
+    [arguments setAddress:input.gpuAddress atIndex:0];
+    [arguments setAddress:output.gpuAddress atIndex:1];
+    id<MTL4ComputeCommandEncoder> encoder =
+        [commands.commandBuffer computeCommandEncoder];
+    assert(encoder);
+    [encoder setComputePipelineState:pipeline];
+    [encoder setArgumentTable:arguments];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [encoder endEncoding];
+    pp_finish();
+    unsigned hits = 0, misses = 0, boundary = 0, arithmetic[2] = { 0 };
+    float max_previous_error = 0;
+    for (unsigned i = 0; i < count; i++) {
+        const float *o = (const float *)output.contents + i * 26;
+        assert(o[9] >= 0 && o[9] <= 8);
+        interior_rounding_checks(o + 10, o[9], cases[i].centre, arithmetic);
+        if (!o[8]) {
+            assert(!memcmp(o, o + 4, 16));
+            misses++;
+            boundary += o[3] > 0 && o[3] < 1;
+            continue;
+        }
+        assert(o[8] == 1 && o[3] == 1 && !memcmp(o, o + 4, 12));
+        hits++;
+        max_previous_error = fmaxf(max_previous_error, fabsf(1 - o[7]));
+        unsigned n = o[9];
+        assert(n >= 3 && n <= 8);
+        double orientation = 0;
+        for (unsigned j = 0; j < n; j++) {
+            unsigned k = (j + 1) % n;
+            orientation += (double)o[10 + 2 * j] * o[11 + 2 * k] -
+                           (double)o[11 + 2 * j] * o[10 + 2 * k];
+        }
+        assert(orientation != 0);
+        /* Independent double half-plane checks on the actual GPU-projected
+         * points: every admitted pixel square must be strictly contained. */
+        for (unsigned j = 0; j < n; j++) {
+            unsigned k = (j + 1) % n;
+            double ax = o[10 + 2 * j], ay = o[11 + 2 * j],
+                   dx = (double)o[10 + 2 * k] - ax,
+                   dy = (double)o[11 + 2 * k] - ay;
+            for (unsigned corner = 0; corner < 4; corner++) {
+                double x = (double)cases[i].centre[0] + (corner & 1 ? .5 : -.5),
+                       y = (double)cases[i].centre[1] + (corner & 2 ? .5 : -.5);
+                assert((dx * (y - ay) - dy * (x - ax)) *
+                           (orientation > 0 ? 1 : -1) >
+                       0);
+            }
+        }
+    }
+    assert(hits > 500 && misses > 500 && boundary > 100 &&
+           arithmetic[0] > 1000 && arithmetic[1] > 1000);
+    printf(
+        "Polygon full-square admission:%u GPU samples,%u strict double-oracle "
+        "interiors with exact centre weights,%u bit-exact fallbacks(%u "
+        "partial),"
+        "3..8 edges,both windings,16..16K viewports,ULP boundaries,W<=0;"
+        "RNE/RZ+FTZ edge admissions=%u/%u;"
+        "previous full-square coverage error<=%g PASS\n",
+        count, hits, misses, boundary, arithmetic[0], arithmetic[1],
+        max_previous_error);
+}
 
 int main(int argc, char **argv)
 {
     @autoreleasepool {
+        if (argc >= 2 && (!strcmp(argv[1], "--projection-mode") ||
+                          !strcmp(argv[1], "--projection-mode-reference"))) {
+            assert(argc == 2 || argc == 3);
+            projection_mode_tests(!strcmp(argv[1], "--projection-mode") ? 2 : 1,
+                                  argc == 3 ? argv[2] : NULL);
+            return 0;
+        }
+        if (argc == 1)
+            projection_mode_tests(2, NULL);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--polygon-window-clip")))
+            polygon_window_clip_tests();
+        if (argc == 2 && !strcmp(argv[1], "--polygon-window-clip"))
+            return 0;
+        if (argc == 2 && !strcmp(argv[1], "--polygon-window-benchmark")) {
+            polygon_window_benchmark();
+            return 0;
+        }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--compact-polygon-fill")))
+            compact_polygon_fill_tests();
+        if (argc == 2 && !strcmp(argv[1], "--compact-polygon-fill"))
+            return 0;
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
@@ -428,6 +759,10 @@ int main(int argc, char **argv)
                sampleCount:1
                      error:&error];
         require(pixel != nil, error);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--interior")))
+            polygon_interior_tests();
+        if (argc == 2 && !strcmp(argv[1], "--interior"))
+            return 0;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--quad-discard")))
             polygon_quad_tests();
         if (argc == 2 && !strcmp(argv[1], "--quad-discard"))

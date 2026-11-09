@@ -62,13 +62,11 @@ static float4 sample_read(texturecube<float> t, uint3 c, uint level, uint face)
 }
 
 template <typename T>
-static float4 sample_texel(T t, int3 c, uint3 size, uint level, uint face,
-                           constant NV2AMetalSamplingUniforms &s,
-                           uint unsigned_half_mask)
+static float4 sample_addressed_texel(T t, int3 c, uint3 size, uint level,
+                                     uint face,
+                                     constant NV2AMetalSamplingUniforms &s,
+                                     uint unsigned_half_mask)
 {
-    for (uint i = 0; i < 3; i++) {
-        c[i] = sample_address(c[i], size[i], s.address[i]);
-    }
     if (any(c < 0) || any(c >= int3(size))) {
         return float4(s.border_color[0], s.border_color[1], s.border_color[2],
                       s.border_color[3]);
@@ -78,6 +76,25 @@ static float4 sample_texel(T t, int3 c, uint3 size, uint level, uint face,
         if (unsigned_half_mask & (1u << k))
             value[k] = (value[k] * 256.0f) / 255.0f;
     return value;
+}
+
+template <typename T>
+static float4 sample_texel(T t, int3 c, uint3 size, uint level, uint face,
+                           constant NV2AMetalSamplingUniforms &s,
+                           uint unsigned_half_mask)
+{
+    for (uint i = 0; i < 3; i++) {
+        c[i] = sample_address(c[i], size[i], s.address[i]);
+    }
+    return sample_addressed_texel(t, c, size, level, face, s,
+                                  unsigned_half_mask);
+}
+
+/* Equal addressed taps share one helper result; its original bounds and
+ * border checks still apply. Every weighted contribution remains below. */
+static bool sample_collapsed_taps(int2 ax, int2 ay, int2 az)
+{
+    return ax.x == ax.y && ay.x == ay.y && az.x == az.y;
 }
 
 template <typename T>
@@ -100,6 +117,31 @@ static float4 sample_level(T t, float3 c, uint level, uint face, bool linear,
     if (!volume) {
         base.z = 0;
     }
+    /* Each addressed axis is shared by several taps. Preserve every tap's
+     * weight, including zero-weight NaN/Inf contributions. */
+    int2 ax(sample_address(base.x, size.x, s.address[0]),
+            sample_address(base.x + 1, size.x, s.address[0]));
+    int2 ay(sample_address(base.y, size.y, s.address[1]),
+            sample_address(base.y + 1, size.y, s.address[1]));
+    int2 az(sample_address(base.z, size.z, s.address[2]),
+            sample_address(base.z + int(volume), size.z, s.address[2]));
+    if (sample_collapsed_taps(ax, ay, az)) {
+        float4 texel = sample_addressed_texel(t, int3(ax.x, ay.x, az.x), size,
+                                              level, face, s, unsigned_half_mask);
+        float4 color = 0;
+        for (uint z = 0; z < (volume ? 2u : 1u); z++) {
+            for (uint y = 0; y < 2; y++) {
+                for (uint x = 0; x < 2; x++) {
+                    float w = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
+                    if (volume) {
+                        w *= z ? f.z : 1 - f.z;
+                    }
+                    color += w * texel;
+                }
+            }
+        }
+        return color;
+    }
     float4 color = 0;
     for (uint z = 0; z < (volume ? 2u : 1u); z++) {
         for (uint y = 0; y < 2; y++) {
@@ -108,8 +150,9 @@ static float4 sample_level(T t, float3 c, uint level, uint face, bool linear,
                 if (volume) {
                     w *= z ? f.z : 1 - f.z;
                 }
-                color += w * sample_texel(t, base + int3(x, y, z), size, level,
-                                          face, s, unsigned_half_mask);
+                color += w * sample_addressed_texel(
+                    t, int3(ax[x], ay[y], az[z]), size, level, face, s,
+                    unsigned_half_mask);
             }
         }
     }
@@ -125,29 +168,39 @@ static float4 sample_mips(T t, float3 c, float lod, uint face, bool volume,
     lod = lod <= 0 || s.mip_filter == 0 ?
               0 :
               clamp(lod, 0.0f, float(t.get_num_mip_levels() - 1));
-    if (s.mip_filter != 2) {
-        /* GL's preferred nearest-mip tie selects the lower level. */
-        uint level = uint(max(0.0f, ceil(lod + .5f) - 1));
-        return sample_level(t, c, level, face, linear, volume, s,
-                            unsigned_half_mask);
-    }
-    uint a = uint(floor(lod));
+    bool interpolate = s.mip_filter == 2;
+    float lower = floor(lod);
+    /* GL's preferred nearest-mip tie selects the lower level. */
+    uint a = interpolate ? uint(lower) :
+                           uint(max(0.0f, ceil(lod + .5f) - 1));
+    float4 first =
+        sample_level(t, c, a, face, linear, volume, s, unsigned_half_mask);
+    if (!interpolate)
+        return first;
     uint b = min(a + 1, t.get_num_mip_levels() - 1);
-    return mix(
-        sample_level(t, c, a, face, linear, volume, s, unsigned_half_mask),
-        sample_level(t, c, b, face, linear, volume, s, unsigned_half_mask),
-        lod - floor(lod));
+    float4 second = b == a ? first :
+        sample_level(t, c, b, face, linear, volume, s, unsigned_half_mask);
+    /* Keep mix even at the last level to preserve its float behavior. */
+    return mix(first, second, lod - lower);
 }
 
 template <typename T>
 static float4 sample_footprint(T t, float3 c, float3 dx, float3 dy, uint face,
                                bool volume,
                                constant NV2AMetalSamplingUniforms &s,
-                               uint unsigned_half_mask = 0)
+                               uint unsigned_half_mask = 0,
+                               bool base_only = false)
 {
     if (!all(isfinite(c))) {
         return float4(s.border_color[0], s.border_color[1], s.border_color[2],
                       s.border_color[3]);
+    }
+    if (base_only) {
+        /* Preserve the zero-coordinate offset and accumulator addition
+         * of the single-tap footprint path. */
+        float4 texel = sample_level(t, c + float3(0), 0, face, s.mag_linear,
+                                    volume, s, unsigned_half_mask);
+        return float4(0) + texel;
     }
     dx = all(isfinite(dx)) ? dx : float3(0);
     dy = all(isfinite(dy)) ? dy : float3(0);
@@ -187,7 +240,7 @@ static float4 sample_footprint(T t, float3 c, float3 dx, float3 dy, uint face,
 static bool sample_base_only(constant NV2AMetalSamplingUniforms &s)
 {
     /* One tap at level zero with identical min/mag filtering is independent
-     * of the footprint. Keep sample_footprint for its exact color arithmetic. */
+     * of the footprint. */
     return s.enabled == 1 && s.mip_filter == 0 &&
            s.min_linear == s.mag_linear && s.anisotropy == 1;
 }
@@ -199,13 +252,14 @@ static float4 nv2a_sample(texture2d<float> t, sampler smp, float2 c,
     if (!s.enabled) {
         return t.sample(smp, c);
     }
+    bool base_only = sample_base_only(s);
     float2 dx(0), dy(0);
-    if (!sample_base_only(s)) {
+    if (!base_only) {
         dx = dfdx(c);
         dy = dfdy(c);
     }
     return sample_footprint(t, float3(c, 0), float3(dx, 0), float3(dy, 0), 0,
-                            false, s, unsigned_half_mask);
+                            false, s, unsigned_half_mask, base_only);
 }
 static float4 nv2a_sample(texture3d<float> t, sampler smp, float3 c,
                           constant NV2AMetalSamplingUniforms &s,
@@ -214,12 +268,14 @@ static float4 nv2a_sample(texture3d<float> t, sampler smp, float3 c,
     if (!s.enabled) {
         return t.sample(smp, c);
     }
+    bool base_only = sample_base_only(s);
     float3 dx(0), dy(0);
-    if (!sample_base_only(s)) {
+    if (!base_only) {
         dx = dfdx(c);
         dy = dfdy(c);
     }
-    return sample_footprint(t, c, dx, dy, 0, true, s, unsigned_half_mask);
+    return sample_footprint(t, c, dx, dy, 0, true, s, unsigned_half_mask,
+                            base_only);
 }
 static float4 nv2a_sample(texturecube<float> t, sampler smp, float3 c,
                           constant NV2AMetalSamplingUniforms &s, float2 logical,
@@ -230,8 +286,9 @@ static float4 nv2a_sample(texturecube<float> t, sampler smp, float3 c,
     }
     /* Compute direction derivatives before selecting the face. Projecting
      * those derivatives analytically avoids dfdx/dfdy across a face seam. */
+    bool base_only = sample_base_only(s);
     float3 dx(0), dy(0);
-    if (!sample_base_only(s)) {
+    if (!base_only) {
         dx = dfdx(c);
         dy = dfdy(c);
     }
@@ -273,7 +330,7 @@ static float4 nv2a_sample(texturecube<float> t, sampler smp, float3 c,
         uy *= scale;
     }
     return sample_footprint(t, float3(uv, 0), float3(ux, 0), float3(uy, 0),
-                            face, false, s, unsigned_half_mask);
+                            face, false, s, unsigned_half_mask, base_only);
 }
 static float4 nv2a_sample(texturecube<float> t, sampler smp, float3 c,
                           constant NV2AMetalSamplingUniforms &s,

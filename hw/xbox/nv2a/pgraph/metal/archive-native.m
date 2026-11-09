@@ -34,6 +34,7 @@ nv2a_metal_pending_capture(NV2AMetalPendingJournal *journal,
     NSArray *inputs = journal.retainedInputs,
             *retained = journal.retainedStreams;
     NSMutableArray *streams = [NSMutableArray new];
+    NSMutableIndexSet *indexedStreams = [NSMutableIndexSet new];
     NSUInteger total = 0;
     for (NSUInteger i = 0; i < inputs.count; i++) {
         NV2AMetalPendingInput *input = inputs[i];
@@ -60,11 +61,22 @@ nv2a_metal_pending_capture(NV2AMetalPendingJournal *journal,
                 }
                 continue;
             }
-            if (![span.resource conformsToProtocol:@protocol(MTLBuffer)] ||
-                ![stream appendVertices:(id<MTLBuffer>)span.resource
-                                  first:span.first
-                                  count:span.count
-                                  error:error]) {
+            BOOL indexed =
+                [span.resource isMemberOfClass:NV2AMetalIndexedVertices.class];
+            if (indexed)
+                [indexedStreams addIndex:i];
+            BOOL appended =
+                indexed ?
+                    [stream appendIndexedVertices:span.resource
+                                            first:span.first
+                                            count:span.count
+                                            error:error] :
+                    [span.resource conformsToProtocol:@protocol(MTLBuffer)] &&
+                        [stream appendVertices:(id<MTLBuffer>)span.resource
+                                         first:span.first
+                                         count:span.count
+                                         error:error];
+            if (!appended) {
                 native_error(error, @"Invalid retained native vertex resource");
                 return nil;
             }
@@ -75,14 +87,39 @@ nv2a_metal_pending_capture(NV2AMetalPendingJournal *journal,
         }
         [streams addObject:stream];
     }
-    NSMutableArray *buffers = [NSMutableArray new],
-                   *bytes = [NSMutableArray new];
-    if (streams.count) {
+    NSMutableArray *bytes = [NSMutableArray arrayWithCapacity:streams.count];
+    NSMutableArray<NSData *> *remaps =
+        [NSMutableArray arrayWithCapacity:streams.count];
+    NSMutableIndexSet *readbacks = [NSMutableIndexSet new];
+    for (NSUInteger i = 0; i < streams.count; i++) {
+        NSData *remap = [NSData data];
+        NSData *data =
+            [indexedStreams containsIndex:i] ?
+                [streams[i] completedHostCompactVertexDataWithRemap:&remap] :
+                [streams[i] completedHostVertexData];
+        if (!data)
+            [readbacks addIndex:i];
+        [bytes addObject:data ?: (id)NSNull.null];
+        [remaps addObject:remap];
+    }
+    if (readbacks.count) {
+        NSMutableArray<id<MTLBuffer>> *buffers =
+            [NSMutableArray arrayWithCapacity:readbacks.count];
         if (![commands beginWithError:error])
             return nil;
-        for (NV2AMetalVertexStream *stream in streams) {
-            id<MTLBuffer> buffer = [stream encodeWithCommands:commands
-                                                        error:error];
+        for (NSUInteger i = readbacks.firstIndex; i != NSNotFound;
+             i = [readbacks indexGreaterThanIndex:i]) {
+            id<MTLBuffer> buffer;
+            if ([indexedStreams containsIndex:i]) {
+                NV2AMetalVertexSlice *slice = [streams[i]
+                    encodeCompactSliceForCaptureWithCommands:commands
+                                                       error:error];
+                buffer = slice.buffer;
+                if (slice)
+                    remaps[i] = slice.indexedVertices.remap;
+            } else {
+                buffer = [streams[i] encodeWithCommands:commands error:error];
+            }
             if (!buffer) {
                 [commands cancel];
                 return nil;
@@ -95,12 +132,17 @@ nv2a_metal_pending_capture(NV2AMetalPendingJournal *journal,
         }
         if (![commands waitUntilIdleWithError:error])
             return nil;
-        for (id<MTLBuffer> buffer in buffers)
-            [bytes addObject:[NSData dataWithBytes:buffer.contents
-                                            length:buffer.length]];
+        NSUInteger next = 0;
+        for (NSUInteger i = readbacks.firstIndex; i != NSNotFound;
+             i = [readbacks indexGreaterThanIndex:i]) {
+            id<MTLBuffer> buffer = buffers[next++];
+            bytes[i] = [NSData dataWithBytes:buffer.contents
+                                      length:buffer.length];
+        }
     }
     return [[NV2AMetalPendingArchive alloc] initWithInputs:inputs
-                                                  vertices:bytes
+                                          physicalVertices:bytes
+                                                    remaps:remaps
                                                      limit:524287
                                                      error:error];
 }
@@ -119,16 +161,17 @@ pending_restore(NV2AMetalPendingArchive *archive, NV2AMetalCommands *commands,
                                                error:error];
     if (!plan)
         return nil;
-    NSMutableArray *uploads = [NSMutableArray new],
-                   *targets = [NSMutableArray new],
-                   *spans = [NSMutableArray new];
+    NSMutableArray<NSData *> *uploads = [NSMutableArray new];
+    NSMutableArray<id<MTLBuffer>> *targets = [NSMutableArray new];
+    NSMutableArray<NV2AMetalPendingSpan *> *spans = [NSMutableArray new];
     for (NSUInteger i = 0; i < archive.inputs.count; i++) {
-        NSData *bytes = archive.vertices[i];
+        NSData *bytes = archive.physicalVertices[i];
+        NSData *remap = archive.remaps[i];
         if (!bytes.length || bytes.length > commands.device.maxBufferLength) {
             native_error(error, @"Pending restore buffer exceeds native limit");
             return nil;
         }
-        BOOL zero = raw;
+        BOOL zero = raw && !remap.length;
         const uint8_t *payload = bytes.bytes;
         for (NSUInteger n = 0; zero && n < bytes.length; n++)
             zero = payload[n] == 0;
@@ -149,21 +192,27 @@ pending_restore(NV2AMetalPendingArchive *archive, NV2AMetalCommands *commands,
             [spans addObject:span];
             continue;
         }
-        id<MTLBuffer> upload =
-            [commands.device newBufferWithBytes:bytes.bytes
-                                         length:bytes.length
-                                        options:MTLResourceStorageModeShared];
         id<MTLBuffer> gpu =
             [commands.device newBufferWithLength:bytes.length
                                          options:MTLResourceStorageModePrivate];
-        if (!upload || !gpu) {
-            native_error(error, @"Cannot allocate pending restore buffers");
+        if (!gpu) {
+            native_error(error, @"Cannot allocate pending restore target");
             return nil;
         }
-        [uploads addObject:upload];
+        [uploads addObject:bytes];
         [targets addObject:gpu];
+        id resource = gpu;
+        if (remap.length) {
+            resource = [[NV2AMetalIndexedVertices alloc]
+                initWithVertices:gpu
+                   physicalCount:bytes.length / sizeof(NV2AMetalVertex)
+                           remap:remap
+                           error:error];
+            if (!resource)
+                return nil;
+        }
         [spans
-            addObject:[NV2AMetalPendingSpan resource:gpu
+            addObject:[NV2AMetalPendingSpan resource:resource
                                                first:0
                                                count:archive.inputs[i].count]];
     }
@@ -173,14 +222,25 @@ pending_restore(NV2AMetalPendingArchive *archive, NV2AMetalCommands *commands,
     if (!update)
         return nil;
     if (uploads.count) {
+        NSMutableArray<id<MTLBuffer>> *sources =
+            [NSMutableArray arrayWithCapacity:uploads.count];
+        NSMutableData *offsets =
+            [NSMutableData dataWithLength:uploads.count * sizeof(NSUInteger)];
+        NSUInteger *sourceOffsets = offsets.mutableBytes;
         if (![commands beginWithError:error])
             return nil;
-        for (NSUInteger i = 0; i < uploads.count; i++)
-            if (![commands addResource:uploads[i] error:error] ||
-                ![commands addResource:targets[i] error:error]) {
+        for (NSUInteger i = 0; i < uploads.count; i++) {
+            NSData *data = uploads[i];
+            id<MTLBuffer> source = [commands uploadBytes:data.bytes
+                                                  length:data.length
+                                                  offset:&sourceOffsets[i]
+                                                   error:error];
+            if (!source || ![commands addResource:targets[i] error:error]) {
                 [commands cancel];
                 return nil;
             }
+            [sources addObject:source];
+        }
         id<MTL4ComputeCommandEncoder> encoder =
             [commands.commandBuffer computeCommandEncoder];
         if (!encoder) {
@@ -189,11 +249,11 @@ pending_restore(NV2AMetalPendingArchive *archive, NV2AMetalCommands *commands,
             return nil;
         }
         for (NSUInteger i = 0; i < uploads.count; i++)
-            [encoder copyFromBuffer:uploads[i]
-                       sourceOffset:0
+            [encoder copyFromBuffer:sources[i]
+                       sourceOffset:sourceOffsets[i]
                            toBuffer:targets[i]
                   destinationOffset:0
-                               size:((id<MTLBuffer>)uploads[i]).length];
+                               size:uploads[i].length];
         [encoder barrierAfterStages:MTLStageBlit
                   beforeQueueStages:MTLStageAll
                   visibilityOptions:MTL4VisibilityOptionDevice];

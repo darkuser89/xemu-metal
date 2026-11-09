@@ -19,11 +19,13 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) BOOL rectangle, signedNormalized, depth;
 @property(nonatomic, readonly) BOOL mixedSignedHalf;
 /* Shared by bindings of the same immutable decoded content. Becomes true
- * only after successful GPU completion and fault validation (or restore).
+ * only after validated producer completion and fault validation (or restore).
  * The PGRAPH owner may skip another completion wait for a validated hit. */
 @property(nonatomic, readonly) BOOL decodeValidated;
-/* False while GPU decode is still pending. Faults are only inspected after
- * the surface cache has successfully waited for idle; no CPU pixel decoding.
+/* The producer of an immutable decode/RTT copy, or nil for a restored image. */
+@property(nonatomic, readonly, nullable) NV2AMetalSurfaceRecording *producerRecording;
+/* False while GPU decode is still pending. Faults are inspected only after
+ * the surface cache has validated its producer's completion.
  * Frontends must validate before accepting an upload with emulation faults. */
 - (BOOL)validateCompletedWithError:(NSError *_Nullable *_Nullable)error;
 - (nullable instancetype)initWithRestoredBinding:
@@ -60,11 +62,13 @@ API_AVAILABLE(macos(26.0))
 /* Capture immutable binding state. A hit does not open a recording or retain
  * resources in an unrelated command section. Misses still decode/copy on the
  * GPU. The eventual GPU consumer must register its own resources, as the
- * pixel encoder and texture snapshot readback already do. */
+ * pixel encoder and texture snapshot readback already do. Initialize
+ * collectedFeedback to NO for each group of texture stages. */
 - (nullable NV2AMetalCachedTexture *)
     captureSource:(const NV2AMetalTextureSource *_Nullable)source
           sampler:(const NV2AMetalSamplerConfig *_Nullable)sampler
             frame:(uint64_t)frame
+    collectedFeedback:(BOOL *)collectedFeedback
             error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)sourceLengthForShape:(const NV2AMetalTextureShape *_Nullable)shape
                paletteLength:(NSUInteger)paletteLength

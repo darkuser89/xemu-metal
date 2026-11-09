@@ -1047,6 +1047,7 @@ static void back_lighting_tests(NV2AMetalVertexFixed *fixed,
 
 #include "test-metal-fixed-offset.h"
 #include "test-metal-specialized-fixed.h"
+#include "test-metal-fixed-uniform-cache.h"
 
 int main(int argc, char **argv)
 {
@@ -1059,11 +1060,17 @@ int main(int argc, char **argv)
             [[NV2AMetalVertexFixed alloc] initWithDevice:commands.device
                                                    error:&error];
         require(fixed != nil, error);
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--fixed-uniform-cache")))
+            fixed_uniform_cache_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--fixed-uniform-cache"))
+            return 0;
         sf_cold_tests(commands);
         if (argc == 2 && !strcmp(argv[1], "--cold-fixed"))
             return 0;
         specialized_fixed_tests(commands);
-        if (argc == 2 && !strcmp(argv[1],"--specialized-fixed")) return 0;
+        if (argc == 2 && !strcmp(argv[1], "--specialized-fixed"))
+            return 0;
         assert(argc == 1);
         unlit_back_color_tests(fixed, commands);
         back_lighting_tests(fixed, commands);

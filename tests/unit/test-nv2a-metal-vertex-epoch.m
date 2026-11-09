@@ -286,6 +286,7 @@ static void raw_fixed_epoch_tests(NV2AMetalCommands *commands,
 #include "test-metal-fixed-specialized-epoch.h"
 #include "test-metal-readonly-fault-summary.h"
 #include "test-metal-nonwriting-epoch.h"
+#include "test-metal-context-metadata.h"
 
 int main(int argc, char **argv)
 {
@@ -298,6 +299,10 @@ int main(int argc, char **argv)
             [[NV2AMetalEpochExecutor alloc] initWithDevice:commands.device
                                                      error:&error];
         require(executor != nil, error);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--context-metadata")))
+            context_metadata_tests(commands);
+        if (argc == 2 && !strcmp(argv[1], "--context-metadata"))
+            return 0;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--nonwriting-epoch")))
             nonwriting_epoch_tests(commands, executor);
         if (argc == 2 && !strcmp(argv[1], "--nonwriting-epoch"))

@@ -32,6 +32,12 @@ API_AVAILABLE(macos(26.0))
               commands:(NV2AMetalCommands *)commands
                 target:(id<MTLTexture>)target
                  error:(NSError *_Nullable *_Nullable)error;
+/* A requested clear initializes the whole target, even with no geometry. */
+- (BOOL)encodeDrawData:(const struct ImDrawData *)drawData
+              commands:(NV2AMetalCommands *)commands
+                target:(id<MTLTexture>)target
+                 clear:(BOOL)clear
+                 error:(NSError *_Nullable *_Nullable)error;
 @end
 
 NS_ASSUME_NONNULL_END

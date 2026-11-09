@@ -230,11 +230,11 @@ static void fetch_prefix_read_tests(void)
                     for (NSUInteger i = 0; i < batches.count; i++) {
                         NV2AMetalFetchResult *f = batches[i].fetch;
                         const NV2AMetalProgramInput *v = f.attributes.contents;
-                        const uint32_t *faults = f.faults.contents;
+                        if (f.faults)
+                            assert(!*(const uint32_t *)f.faults.contents);
                         for (NSUInteger j = 0; j < f.vertexCount; j++) {
                             unsigned vertex = !kind ? 2 : 0;
-                            assert(!faults[j] && !memcmp(v[j].attributes[0],
-                                                         data[vertex], 16));
+                            assert(!memcmp(v[j].attributes[0], data[vertex], 16));
                         }
                     }
                 }

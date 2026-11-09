@@ -45,6 +45,19 @@ struct VPReadOnlyRegisters {
     uint fault;
 };
 
+/* Independent context stores use immutable incoming constants. Only the
+ * final invocation publishes stores; no per-vertex constant array is needed. */
+struct VPIndependentWriteRegisters {
+    bool full_access;
+    float4 temporary[12];
+    float4 output[13];
+    int address;
+    uint fault;
+    device const NV2AMetalWritableContext *previous;
+    device NV2AMetalWritableContext *context;
+    bool publish;
+};
+
 float4 vp_context_constant(constant NV2AMetalProgramUniforms &,
                            thread const VPRegisters &r, uint index)
 {
@@ -54,6 +67,16 @@ float4 vp_context_constant(constant NV2AMetalProgramUniforms &u,
                            thread const VPReadOnlyRegisters &, uint index)
 {
     return vp_load4(u.constants[index]);
+}
+float4 vp_context_constant(constant NV2AMetalProgramUniforms &u,
+                           thread const VPIndependentWriteRegisters &r,
+                           uint index)
+{
+    return r.previous ? float4(r.previous->constants[index][0],
+                               r.previous->constants[index][1],
+                               r.previous->constants[index][2],
+                               r.previous->constants[index][3]) :
+                        vp_load4(u.constants[index]);
 }
 #endif
 

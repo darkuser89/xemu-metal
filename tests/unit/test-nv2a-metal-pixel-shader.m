@@ -4,6 +4,7 @@
  */
 
 #import "hw/xbox/nv2a/pgraph/metal/pixel-shader.h"
+#import "hw/xbox/nv2a/pgraph/metal/lru-cache.h"
 #import "hw/xbox/nv2a/pgraph/metal/geometry.h"
 #import "hw/xbox/nv2a/pgraph/metal/vertex-fetch.h"
 #import "hw/xbox/nv2a/pgraph/metal/vertex-program.h"
@@ -5014,6 +5015,7 @@ static void xo_complete_blending(void)
                                          surfaceChannels:policies[format]
                                                    error:&error];
         require(pipeline != nil, error);
+        NV2AMetalLRUCache *cache = [pipeline valueForKey:@"fragmentPipelines"];
         MTLTextureDescriptor *td =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                                                                width:8
@@ -5063,6 +5065,10 @@ static void xo_complete_blending(void)
                                           commands:commands
                                              error:&error],
                                 error);
+                        unsigned expectedPipelines =
+                            equation == 0 && sf == 0 && df == 0 ? 1 : 2;
+                        assert(cache.count == expectedPipelines &&
+                               cache.missCount == expectedPipelines);
                         require([commands submitWithError:&error], error);
                         require([commands waitUntilIdleWithError:&error],
                                 error);
@@ -5072,14 +5078,17 @@ static void xo_complete_blending(void)
                              mipmapLevel:0];
                         double expected[4];
                         for (unsigned channel = 0; channel < 3; channel++) {
-                            double a =
-                                src[channel] *
+                            /* X1/X8 DstAlpha is opaque in the Xbox captures. */
+                            double aFactor = factors[sf] == 6 ? 1 :
+                                             factors[sf] == 7 ? 0 :
                                 xo_blend_factor(factors[sf], channel, src, dest,
                                                 blend_constant);
-                            double b =
-                                dest[channel] *
+                            double bFactor = factors[df] == 6 ? 1 :
+                                             factors[df] == 7 ? 0 :
                                 xo_blend_factor(factors[df], channel, src, dest,
                                                 blend_constant);
+                            double a = src[channel] * aFactor;
+                            double b = dest[channel] * bFactor;
                             double color =
                                 equation == 3 ?
                                     fmin(src[channel], dest[channel]) :
@@ -5165,6 +5174,7 @@ static void a7_complete_blending(void)
                                          surfaceChannels:policies[format]
                                                    error:&error];
         require(pipeline != nil, error);
+        NV2AMetalLRUCache *cache = [pipeline valueForKey:@"fragmentPipelines"];
         MTLTextureDescriptor *td =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                                                                width:8
@@ -5214,6 +5224,10 @@ static void a7_complete_blending(void)
                                           commands:commands
                                              error:&error],
                                 error);
+                        unsigned expectedPipelines =
+                            equation == 0 && sf == 0 && df == 0 ? 1 : 2;
+                        assert(cache.count == expectedPipelines &&
+                               cache.missCount == expectedPipelines);
                         require([commands submitWithError:&error], error);
                         require([commands waitUntilIdleWithError:&error],
                                 error);
@@ -5276,7 +5290,9 @@ static void a7_complete_blending(void)
 static void a7_alpha_codes(void)
 {
     NSError *error = nil;
-    for (unsigned one = 0; one < 2; one++) {
+    for (unsigned mode = 0; mode < 4; mode++) {
+        BOOL bound = mode >= 2;
+        unsigned one = mode & 1;
         NV2AMetalPixelShader *pipeline = [[NV2AMetalPixelShader alloc]
              initWithDevice:commands.device
                 colorFormat:MTLPixelFormatBGRA8Unorm
@@ -5286,6 +5302,11 @@ static void a7_alpha_codes(void)
                                   NV2AMetalSurfaceStorageZ7
                       error:&error];
         require(pipeline != nil, error);
+        NV2AMetalDrawConfig config = draw_config();
+        config.blend = 0;
+        NV2AMetalDrawState *state = [[NV2AMetalDrawState alloc]
+            initWithDevice:commands.device config:&config error:&error];
+        require(state != nil, error);
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                          width:8
@@ -5320,16 +5341,28 @@ static void a7_alpha_codes(void)
             NV2AMetalPixelUniforms u = uniforms();
             NV2AMetalPixelTexture textures[4] = { 0 };
             require([commands beginWithError:&error] != nil, error);
-            require([pipeline encodeVertices:input
-                                       count:64
-                                   primitive:MTLPrimitiveTypePoint
-                                    uniforms:&u
-                                    textures:textures
-                                        pass:p
-                                depthStencil:nil
-                                    commands:commands
-                                       error:&error],
-                    error);
+            if (bound)
+                require([pipeline encodeVertices:input
+                                           count:64
+                                       primitive:MTLPrimitiveTypePoint
+                                        uniforms:&u
+                                        textures:textures
+                                            pass:p
+                                       drawState:state
+                                        commands:commands
+                                           error:&error],
+                        error);
+            else
+                require([pipeline encodeVertices:input
+                                           count:64
+                                       primitive:MTLPrimitiveTypePoint
+                                        uniforms:&u
+                                        textures:textures
+                                            pass:p
+                                    depthStencil:nil
+                                        commands:commands
+                                           error:&error],
+                        error);
             require([commands submitWithError:&error], error);
             require([commands waitUntilIdleWithError:&error], error);
             uint32_t words[64];
@@ -5346,7 +5379,8 @@ static void a7_alpha_codes(void)
             draws++;
         }
     }
-    puts("Metal 4 A7: all256 alpha input codes on both storage policies PASS");
+    puts("Metal 4 A7: all256 alpha input codes on both storage policies, "
+         "nil and explicit opaque draw state PASS");
 }
 
 /* NVIDIA NV_texture_shader section3.8.13.1.9: clamp the luminance
@@ -6174,16 +6208,88 @@ static void combiner_output_bias_tests(void)
 }
 
 #include "test-metal-raster-specialization.h"
+#include "test-metal-dstalpha-surfaces.h"
+#include "test-metal-source-blend.h"
+#include "test-metal-sampler-addresses.h"
+#include "test-metal-sampler-shared-taps.h"
+#include "test-metal-sampler-shared-taps-benchmark.h"
+#include "test-metal-sampler-shared-taps-fragment.h"
+#include "test-metal-prepared-ranges.h"
+#include "test-metal-final-combiner-keys.h"
+#include "test-metal-async-pipeline-integration.h"
 
 int main(int argc, char **argv)
 {
+    BOOL asyncPipelineIntegration =
+        argc == 2 && !strcmp(argv[1], "--async-pipeline-integration");
+    BOOL finalCombinerKeys =
+        argc == 2 && !strcmp(argv[1], "--final-combiner-keys");
+    BOOL sharedTaps = argc == 2 && !strcmp(argv[1], "--sampler-shared-taps");
+    BOOL sharedTapsBenchmark =
+        argc == 2 && !strcmp(argv[1], "--sampler-shared-taps-benchmark");
+    BOOL sharedTapsFragment =
+        argc == 2 && !strcmp(argv[1], "--sampler-shared-taps-fragment");
+    BOOL preparedRanges = argc == 2 && !strcmp(argv[1], "--prepared-ranges");
     BOOL specialization =
         argc == 2 && !strcmp(argv[1], "--pipeline-specialization");
-    assert(argc == 1 || specialization);
+    BOOL packedAlphaBlending =
+        argc == 2 && !strcmp(argv[1], "--packed-alpha-blending");
+    BOOL packedAlphaOutput =
+        argc == 2 && !strcmp(argv[1], "--packed-alpha-output");
+    BOOL dstAlpha = argc == 2 && !strcmp(argv[1], "--dstalpha-surfaces");
+    BOOL sourceBlend = argc == 2 && !strcmp(argv[1], "--source-only-blend");
+    BOOL samplerAddresses = argc == 2 && !strcmp(argv[1], "--sampler-addresses");
+    assert(argc == 1 || specialization || packedAlphaBlending ||
+           packedAlphaOutput || dstAlpha || sourceBlend || samplerAddresses || preparedRanges ||
+           sharedTaps || sharedTapsBenchmark || sharedTapsFragment ||
+           finalCombinerKeys || asyncPipelineIntegration);
     @autoreleasepool {
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        if (asyncPipelineIntegration) {
+            async_pipeline_integration_tests();
+            return 0;
+        }
+        if (finalCombinerKeys) {
+            final_combiner_key_tests();
+            return 0;
+        }
+        if (sharedTaps) {
+            sampler_shared_taps_tests();
+            return 0;
+        }
+        if (sharedTapsBenchmark) {
+            sampler_shared_taps_benchmark();
+            return 0;
+        }
+        if (sharedTapsFragment) {
+            sampler_shared_taps_fragment_tests();
+            return 0;
+        }
+        if (samplerAddresses) {
+            sampler_addresses_tests();
+            return 0;
+        }
+        if (sourceBlend) {
+            source_blend_tests();
+            return 0;
+        }
+        if (dstAlpha) {
+            dstalpha_surface_tests();
+            return 0;
+        }
+        if (packedAlphaOutput) {
+            a7_alpha_codes();
+            return 0;
+        }
+        if (packedAlphaBlending) {
+            xo_complete_blending();
+            a7_complete_blending();
+            puts("Packed-alpha blend cache: source-only and destination "
+                 "pipelines per surface policy PASS");
+            return 0;
+        }
         shader = [[NV2AMetalPixelShader alloc]
             initWithDevice:commands.device
                colorFormat:MTLPixelFormatRGBA32Float
@@ -6212,6 +6318,10 @@ int main(int argc, char **argv)
         ds.depthWriteEnabled = YES;
         depth_state = [commands.device newDepthStencilStateWithDescriptor:ds];
         assert(target && depth && depth_readback && depth_state);
+        if (preparedRanges) {
+            prepared_range_tests();
+            return 0;
+        }
         NV2AMetalVertex v[6];
         quad(v);
         NV2AMetalPixelUniforms u = uniforms();
@@ -6240,6 +6350,7 @@ int main(int argc, char **argv)
             render(&u, v, 6, MTLPrimitiveTypeTriangle, textures);
             color(3, 4, .625f, .375f, .2f, .75f);
         }
+        pixel_argument_reuse_test();
         if (specialization) {
             dynamic_raster_tag_tests();
             raster_class_tests();
@@ -6288,6 +6399,10 @@ int main(int argc, char **argv)
         snapshots_test();
         multisample_test();
         native_sampler_tests();
+        sampler_addresses_tests();
+        sampler_shared_taps_tests();
+        sampler_shared_taps_fragment_tests();
+        final_combiner_key_tests();
         manual_sampling = YES;
         sampling_tests();
         special_sampling_tests();
@@ -6302,6 +6417,7 @@ int main(int argc, char **argv)
         a7_complete_blending();
         a7_alpha_codes();
         native_depth16_test();
+        async_pipeline_integration_tests();
         printf("Metal 4 native fragment pipeline: %u offscreen draws PASS\n",
                draws);
     }

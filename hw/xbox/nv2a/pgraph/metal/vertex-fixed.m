@@ -131,6 +131,11 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
         words[23] |= u->light[i] << (2 * i);
 }
 
+typedef struct NV2AMetalFixedParameterSlot {
+    const void *bytes;
+    MTLGPUAddress address;
+} NV2AMetalFixedParameterSlot;
+
 @implementation NV2AMetalVertexFixed {
     id<MTLDevice> _device;
     id<MTL4Compiler> _compiler;
@@ -143,6 +148,10 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
     uint64_t _specializedDispatches, _generalDispatches;
     id<MTLComputePipelineState> _pipeline, _rasterPipeline;
     id<MTL4ArgumentTable> _arguments;
+    __weak NV2AMetalCommands *_parameterCommands;
+    uint64_t _parameterSerial;
+    NV2AMetalFixedParameterSlot _parameterSlots[4];
+    unsigned _parameterSlotCount, _nextParameterSlot;
 }
 
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
@@ -160,12 +169,27 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
         return nil;
     }
     _device = device;
+    MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
+    arguments.maxBufferBindCount = 4;
+    arguments.initializeBindings = YES;
+    _arguments = [device newArgumentTableWithDescriptor:arguments error:error];
+    _variants = [[NV2AMetalLRUCache alloc] initWithCapacity:64];
+    _specializationQueue = dispatch_queue_create(
+        "org.xemu.metal4.fixed-compile",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                QOS_CLASS_UTILITY,0));
+    return _arguments && _variants && _specializationQueue ? self : nil;
+}
+
+- (BOOL)prepareLibraryWithError:(NSError **)error
+{
+    if (_library)
+        return YES;
     id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
-        return nil;
-    }
+        [_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                     error:error];
+    if (!compiler)
+        return NO;
     MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
     libraryDescriptor.source = @(metal_shader_source);
     libraryDescriptor.options = [MTLCompileOptions new];
@@ -175,46 +199,47 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
         MTLMathFloatingPointFunctionsPrecise;
     id<MTLLibrary> library =
         [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library) {
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = library;
-    function.name = @"nv2a_vertex_fixed";
-    MTL4SpecializedFunctionDescriptor *general =
-        [MTL4SpecializedFunctionDescriptor new];
-    general.functionDescriptor = function;
-    general.constantValues = [MTLFunctionConstantValues new];
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = general;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                            compilerTaskOptions:nil
-                                                          error:error];
-    if (!_pipeline) {
-        return nil;
-    }
-    function.name = @"nv2a_vertex_fixed_raster";
-    general.functionDescriptor = function;
-    descriptor.computeFunctionDescriptor = general;
-    _rasterPipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                                  compilerTaskOptions:nil
-                                                                error:error];
-    if (!_rasterPipeline)
-        return nil;
-    MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
-    arguments.maxBufferBindCount = 4;
-    arguments.initializeBindings = YES;
-    _arguments = [device newArgumentTableWithDescriptor:arguments error:error];
+    if (!library)
+        return NO;
     _compiler = compiler;
     _library = library;
-    _variants = [[NV2AMetalLRUCache alloc] initWithCapacity:64];
-    _specializationQueue = dispatch_queue_create(
-        "org.xemu.metal4.fixed-compile",
-        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
-                                                QOS_CLASS_UTILITY,0));
-    return _arguments && _variants && _specializationQueue ? self : nil;
+    return YES;
+}
+
+- (id<MTLComputePipelineState>)compilePipelineCompact:(BOOL)compact
+                                           constants:(MTLFunctionConstantValues *)values
+                                               error:(NSError **)error
+{
+    MTL4LibraryFunctionDescriptor *function =
+        [MTL4LibraryFunctionDescriptor new];
+    function.library = _library;
+    function.name = compact ? @"nv2a_vertex_fixed_raster" : @"nv2a_vertex_fixed";
+    MTL4SpecializedFunctionDescriptor *specialized =
+        [MTL4SpecializedFunctionDescriptor new];
+    specialized.functionDescriptor = function;
+    specialized.constantValues = values;
+    MTL4ComputePipelineDescriptor *descriptor =
+        [MTL4ComputePipelineDescriptor new];
+    descriptor.computeFunctionDescriptor = specialized;
+    return [_compiler newComputePipelineStateWithDescriptor:descriptor
+                                        compilerTaskOptions:nil
+                                                      error:error];
+}
+
+- (id<MTLComputePipelineState>)generalPipelineCompact:(BOOL)compact
+                                               error:(NSError **)error
+{
+    id<MTLComputePipelineState> pipeline = compact ? _rasterPipeline : _pipeline;
+    if (pipeline || ![self prepareLibraryWithError:error])
+        return pipeline;
+    pipeline = [self compilePipelineCompact:compact
+                                  constants:[MTLFunctionConstantValues new]
+                                      error:error];
+    if (compact)
+        _rasterPipeline = pipeline;
+    else
+        _pipeline = pipeline;
+    return pipeline;
 }
 
 /* Compilation runs only on the instance's serial background queue. */
@@ -225,32 +250,18 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
     MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
     for (unsigned i = 0; i < NV2A_METAL_FIXED_CONSTANT_COUNT; i++)
         [values setConstantValue:words+i type:MTLDataTypeUInt atIndex:i];
-    NSMutableArray *pipelines = [NSMutableArray new];
-    for (NSString *name in @[@"nv2a_vertex_fixed", @"nv2a_vertex_fixed_raster"]) {
-        MTL4LibraryFunctionDescriptor *function =
-            [MTL4LibraryFunctionDescriptor new];
-        function.library = _library;
-        function.name = name;
-        MTL4SpecializedFunctionDescriptor *specialized =
-            [MTL4SpecializedFunctionDescriptor new];
-        specialized.functionDescriptor = function;
-        specialized.constantValues = values;
-        MTL4ComputePipelineDescriptor *descriptor =
-            [MTL4ComputePipelineDescriptor new];
-        descriptor.computeFunctionDescriptor = specialized;
-        id<MTLComputePipelineState> pipeline =
-            [_compiler newComputePipelineStateWithDescriptor:descriptor
-                                         compilerTaskOptions:nil
-                                                       error:error];
-        if (!pipeline)
-            return nil;
-        [pipelines addObject:pipeline];
-    }
-    return [pipelines copy];
+    id<MTLComputePipelineState> full =
+        [self compilePipelineCompact:NO constants:values error:error];
+    if (!full)
+        return nil;
+    id<MTLComputePipelineState> compact =
+        [self compilePipelineCompact:YES constants:values error:error];
+    return compact ? @[full, compact] : nil;
 }
 - (id<MTLComputePipelineState>)pipelineForUniforms:
                                    (const NV2AMetalFixedUniforms *)u
                                            compact:(BOOL)compact
+                                             error:(NSError **)error
 {
     uint32_t words[NV2A_METAL_FIXED_CONSTANT_COUNT];
     fixed_variant_words(u, words);
@@ -270,14 +281,18 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
             _specializedDispatches++;
             return variant.pipelines[compact ? 1 : 0];
         }
-        if (variant.uses < 4)
-            variant.uses++;
     }
+    id<MTLComputePipelineState> pipeline =
+        [self generalPipelineCompact:compact error:error];
+    if (!pipeline)
+        return nil;
     /* General GPU execution continues while cold or compiling. Up to two
-     * jobs may retain entries outside the64-entry/two-pipelines-per-entry LRU.
+     * jobs may retain entries outside the 64-entry/two-pipelines-per-entry LRU.
      */
     @synchronized(self) {
         @synchronized(variant) {
+            if (variant.uses < 4)
+                variant.uses++;
             if (variant.uses == 4 && !variant.queued && !variant.finished &&
                 _specializationPending < 2) {
                 variant.queued = YES;
@@ -306,7 +321,42 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
         }
     }
     _generalDispatches++;
-    return compact ? _rasterPipeline : _pipeline;
+    return pipeline;
+}
+
+- (MTLGPUAddress)addressForParameters:
+                     (const NV2AMetalFixedParameters *)parameters
+                             commands:(NV2AMetalCommands *)commands
+                                error:(NSError **)error
+{
+    /* Upload bytes are immutable within this recording. Seal/cancel ends
+     * the recording before its arena can be rewound or reused. */
+    uint64_t serial = commands.recordingSerial;
+    if (_parameterCommands != commands || _parameterSerial != serial) {
+        _parameterCommands = commands;
+        _parameterSerial = serial;
+        _parameterSlotCount = _nextParameterSlot = 0;
+    }
+    for (unsigned i = 0; i < _parameterSlotCount; i++) {
+        NV2AMetalFixedParameterSlot slot = _parameterSlots[i];
+        if (!memcmp(slot.bytes, parameters, sizeof(*parameters)))
+            return slot.address;
+    }
+    NSUInteger offset;
+    id<MTLBuffer> buffer = [commands uploadBytes:parameters
+                                          length:sizeof(*parameters)
+                                          offset:&offset
+                                           error:error];
+    if (!buffer)
+        return 0;
+    MTLGPUAddress address = buffer.gpuAddress + offset;
+    _parameterSlots[_nextParameterSlot] = (NV2AMetalFixedParameterSlot){
+        (const uint8_t *)buffer.contents + offset, address
+    };
+    unsigned capacity = sizeof(_parameterSlots) / sizeof(*_parameterSlots);
+    _nextParameterSlot = (_nextParameterSlot + 1) % capacity;
+    _parameterSlotCount = MIN(_parameterSlotCount + 1, capacity);
+    return address;
 }
 
 - (nullable NV2AMetalFixedResult *)
@@ -385,14 +435,17 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
                                                       vertices:nil
                                                          count:0];
     }
+    id<MTLComputePipelineState> pipeline = [self pipelineForUniforms:uniforms
+                                                             compact:compact
+                                                               error:error];
+    if (!pipeline)
+        return nil;
     NV2AMetalFixedParameters parameters = { .uniforms = *uniforms,
                                             .rasterize = rasterize };
     parameters.uniforms.common.vertex_count = (unsigned)count;
-    NSUInteger constantsOffset = 0;
-    id<MTLBuffer> constants = [commands uploadBytes:&parameters
-                                             length:sizeof(parameters)
-                                             offset:&constantsOffset
-                                              error:error];
+    MTLGPUAddress constants = [self addressForParameters:&parameters
+                                                commands:commands
+                                                   error:error];
     if (!constants) {
         return nil;
     }
@@ -414,8 +467,6 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
         ![commands keepAlive:self error:error]) {
         return nil;
     }
-    id<MTLComputePipelineState> pipeline = [self pipelineForUniforms:uniforms
-                                                             compact:compact];
     if (![commands keepAlive:pipeline error:error])
         return nil;
     id<MTL4ComputeCommandEncoder> encoder =
@@ -432,7 +483,7 @@ static void fixed_variant_words(const NV2AMetalFixedUniforms *u,
            atIndex:0];
     [_arguments setAddress:compact ? 0 : registers.gpuAddress atIndex:1];
     [_arguments setAddress:vertices.gpuAddress atIndex:2];
-    [_arguments setAddress:constants.gpuAddress + constantsOffset atIndex:3];
+    [_arguments setAddress:constants atIndex:3];
     [encoder setArgumentTable:_arguments];
     [encoder setComputePipelineState:pipeline];
     NSUInteger width = pipeline.threadExecutionWidth;

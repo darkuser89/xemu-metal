@@ -4,12 +4,34 @@
  */
 
 #import "ui/xui/metal4/decal.h"
+#import <objc/runtime.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "test-metal-texture-alias.h"
+
+typedef id (*DecalPipelineBuilder)(id, SEL, id, id, NSError **)
+    __attribute__((ns_returns_retained));
+static DecalPipelineBuilder original_pipeline_builder;
+static unsigned decal_pipeline_builds;
+static BOOL fail_decal_pipeline;
+static id observe_pipeline(id object, SEL selector, id descriptor, id options,
+                           NSError **error) __attribute__((ns_returns_retained));
+static id observe_pipeline(id object, SEL selector, id descriptor, id options,
+                           NSError **error)
+{
+    decal_pipeline_builds++;
+    if (fail_decal_pipeline) {
+        *error = [NSError errorWithDomain:@"test.decal.pipeline"
+                                     code:1
+                                 userInfo:nil];
+        return nil;
+    }
+    return original_pipeline_builder(object, selector, descriptor, options,
+                                     error);
+}
 
 static void require(BOOL success, NSError *error)
 {
@@ -92,6 +114,15 @@ int main(void)
         NV2AMetalCommands *commands =
             [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        id<MTL4Compiler> compiler = [commands.device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        require(compiler != nil, error);
+        Method pipeline = class_getInstanceMethod(
+            object_getClass(compiler),
+            @selector(newRenderPipelineStateWithDescriptor:compilerTaskOptions:error:));
+        assert(pipeline);
+        original_pipeline_builder = (void *)method_setImplementation(
+            pipeline, (IMP)observe_pipeline);
         XemuMetal4Decals *renderer =
             [[XemuMetal4Decals alloc] initWithDevice:commands.device
                                          pixelFormat:MTLPixelFormatRGBA8Unorm
@@ -108,8 +139,12 @@ int main(void)
         id<MTLTexture> target = new_texture(commands.device, 4, 4);
         XemuMetal4Decal *decal = new_decal(texture, CGRectMake(1, 1, 2, 2));
         require([commands beginWithError:&error] != nil, error);
+        XemuMetal4Decal *empty = new_decal(texture, CGRectMake(0, 0, 0.5, 2));
+        draw(commands, renderer, @[ empty ], target, YES);
+        assert(!decal_pipeline_builds && ![renderer valueForKey:@"library"]);
         draw(commands, renderer, @[ decal ], target, YES);
         submit(commands);
+        assert(decal_pipeline_builds == 1);
         check_pixel(target, 0, 0, 0, 0, 0, 0);
         check_pixel(target, 1, 1, 255, 0, 0, 255);
         check_pixel(target, 2, 1, 0, 255, 0, 255);
@@ -119,6 +154,7 @@ int main(void)
         require([commands beginWithError:&error] != nil, error);
         draw(commands, renderer, @[ decal ], target, YES);
         submit(commands);
+        assert(decal_pipeline_builds == 1);
         check_pixel(target, 1, 1, 0, 255, 0, 0);
         check_pixel(target, 2, 2, 0, 255, 0, 255);
 
@@ -140,8 +176,21 @@ int main(void)
         foreground.primary = foreground.secondary = 0xff0000ff;
         foreground.blend = XemuMetal4DecalBlendAlpha;
         require([commands beginWithError:&error] != nil, error);
+        id<MTL4CommandBuffer> recording = commands.commandBuffer;
+        fail_decal_pipeline = YES;
+        BOOL encoded = [renderer encodeDecals:@[ background, foreground ]
+                                      commands:commands target:target clear:YES
+                                         error:&error];
+        assert(!encoded &&
+               [error.domain isEqualToString:@"test.decal.pipeline"] &&
+               commands.commandBuffer == recording && decal_pipeline_builds == 2);
+        fail_decal_pipeline = NO;
+        submit(commands);
+        check_pixel(target, 2, 2, 0, 255, 0, 255);
+        require([commands beginWithError:&error] != nil, error);
         draw(commands, renderer, @[ background, foreground ], target, YES);
         submit(commands);
+        assert(decal_pipeline_builds == 3);
         check_pixel(target, 1, 1, 128, 0, 127, 191);
 
         background.fill = 0;
@@ -206,6 +255,10 @@ int main(void)
         assert(memcmp(first, next, bytes) != 0);
         free(first);
         free(next);
+        assert(decal_pipeline_builds == 5);
+        method_setImplementation(pipeline, (IMP)original_pipeline_builder);
+        puts("Metal 4 decal startup: clear-only skips the compiler, four "
+             "used variants, failed compile and exact retry PASS");
         texture_alias_cases(commands.device, ^(id<MTLTexture> src,
                                                id<MTLTexture> dst,
                                                BOOL expected) {

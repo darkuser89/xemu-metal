@@ -7,6 +7,9 @@
 #import "draw-state.h"
 #include "pixel-shader-types.h"
 #import "geometry.h"
+#import "lru-cache.h"
+
+@class NV2AMetalPipelineCompiler;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -50,8 +53,25 @@ typedef NS_ENUM(unsigned, NV2AMetalPixelRasterClass) {
     NV2AMetalPixelRasterDirectLineSmooth,
     NV2AMetalPixelRasterDirectLineFlatFirst,
     NV2AMetalPixelRasterDirectLineFlatLast,
-    /* OR with NV2AMetalDirectTriangleOptions for the vertex specialization. */
+    /* Geometry-owned compact carriers at buffer6 plus borrowed source0;
+     * sourcePrimitive distinguishes real lines and polygon boundary groups. */
+    NV2AMetalPixelRasterCompactLine,
+    /* Geometry-owned smooth-polygon carriers and unchanged projections. */
+    NV2AMetalPixelRasterCompactPolygon,
+    /* OR with NV2AMetalDirectTriangleOptions for the vertex specialization.
+     * Counts describe generated triangle corners, or quad point/wire corners
+     * with DirectQuadPoint/Line (4/8 per quad). Triangle strips/fans bind
+     * count/3+2 sources, filled quad lists count/6*4 and strips count/3+2.
+     * Quad point/wire lists bind 4 sources per quad, strips 2 per quad + 2;
+     * DirectPolygonPoint/Line generate 3/6 records per triangle. Triangle
+     * lists bind 3 sources per triangle, strips/fans 1 per triangle + 2;
+     * genuine Polygon fill binds count/3+2 sources and wire count/2. Their
+     * geometry-owned whole-polygon face is additionally bound at buffer 5;
+     * empty draws bind zero sources. */
     NV2AMetalPixelRasterDirectTriangle = 0x100,
+    /* OR with NV2AMetalDirectLineOptions. Counts are generated endpoints;
+     * strips bind count/2+1 sources, loops count/2, empty draws zero. */
+    NV2AMetalPixelRasterDirectMappedLine = 0x200,
 };
 
 /* Immutable host preparation for one raster slice. All validation, pipeline
@@ -64,6 +84,16 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) NSUInteger vertexCount;
 - (BOOL)encodeWithRenderEncoder:(id<MTL4RenderCommandEncoder>)encoder
                        commands:(NV2AMetalCommands *)commands
+                          error:(NSError *_Nullable *_Nullable)error;
+/* Emit a bounded range without changing this packet or preparing bindings
+ * again. firstVertex is relative to its prepared span. Nonempty ranges must
+ * cover complete geometry groups (raw packets use independent primitives);
+ * raw strip packets permit only their complete span. Existing whole-packet
+ * emission preserves the preparation API's partial-slice contract. */
+- (BOOL)encodeWithRenderEncoder:(id<MTL4RenderCommandEncoder>)encoder
+                       commands:(NV2AMetalCommands *)commands
+                    firstVertex:(NSUInteger)first
+                    vertexCount:(NSUInteger)count
                           error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
@@ -86,6 +116,29 @@ API_AVAILABLE(macos(26.0))
                             depthFormat:(MTLPixelFormat)depthFormat
                             sampleCount:(NSUInteger)sampleCount
                         surfaceChannels:(unsigned int)surfaceChannels
+                                  error:(NSError *_Nullable *_Nullable)error;
+/* Render pipelines may be shared on the same encoding thread, device and
+ * library for matching color format, sample count and attachment policy
+ * (native, B8, G8B8 or packed alpha). Each instance validates its own depth
+ * attachment, supplies its exact channel layout and owns its bindings. */
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                            colorFormat:(MTLPixelFormat)colorFormat
+                            depthFormat:(MTLPixelFormat)depthFormat
+                            sampleCount:(NSUInteger)sampleCount
+                        surfaceChannels:(unsigned int)surfaceChannels
+                          pipelineCache:(nullable NV2AMetalLRUCache<
+                              NSData *, id<MTLRenderPipelineState>> *)cache
+                                  error:(NSError *_Nullable *_Nullable)error;
+/* Only the PGRAPH controller opts into provisional generic pipelines.
+ * nil preserves synchronous low-level construction and preparation. */
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                            colorFormat:(MTLPixelFormat)colorFormat
+                            depthFormat:(MTLPixelFormat)depthFormat
+                            sampleCount:(NSUInteger)sampleCount
+                        surfaceChannels:(unsigned int)surfaceChannels
+                          pipelineCache:(nullable NV2AMetalLRUCache<
+                              NSData *, id<MTLRenderPipelineState>> *)cache
+                       pipelineCompiler:(nullable NV2AMetalPipelineCompiler *)compiler
                                   error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
@@ -199,9 +252,18 @@ API_AVAILABLE(macos(26.0))
     ignorePolygonCulling:(BOOL)ignore
                 commands:(NV2AMetalCommands *)commands
                    error:(NSError *_Nullable *_Nullable)error;
+/* Scope the common attachment and texture checks to one immutable descriptor and
+ * recording. End preparation before changing the descriptor or encoding. */
+- (void)beginPreparationForPass:(MTL4RenderPassDescriptor *)pass
+                         commands:(NV2AMetalCommands *)commands;
+- (void)endPreparation;
+/* Scope encoder state reuse to consecutive packets from this shader. End
+ * the scope before other commands can change the encoder's state. */
+- (void)beginRasterEncoding:(id<MTL4RenderCommandEncoder>)encoder;
+- (void)endRasterEncoding;
 /* Geometry-owned vertices/projections form one immutable binding. Slice offsets
- * address both streams; expanded polygon fragments reuse the GPU projection.
- * Other geometry keeps the original vertex-only path. */
+ * address generated vertices; direct strips/fans keep their full source bound
+ * and select the slice with draw IDs. Expanded polygons reuse the projection. */
 - (BOOL)encodeGeometry:(NV2AMetalGeometryResult *)geometry
                   offset:(NSUInteger)offset
                    count:(NSUInteger)count

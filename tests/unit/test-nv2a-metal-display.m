@@ -4,11 +4,34 @@
  */
 
 #import "hw/xbox/nv2a/pgraph/metal/display.h"
+#import <objc/runtime.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "test-metal-texture-alias.h"
+
+typedef id (*DisplayPipelineBuilder)(id, SEL, id, id, NSError **)
+    __attribute__((ns_returns_retained));
+static DisplayPipelineBuilder original_display_pipeline;
+static unsigned display_pipeline_builds;
+static BOOL fail_display_pipeline;
+static id observe_display_pipeline(id object, SEL selector, id descriptor,
+                                   id options, NSError **error)
+    __attribute__((ns_returns_retained));
+static id observe_display_pipeline(id object, SEL selector, id descriptor,
+                                   id options, NSError **error)
+{
+    display_pipeline_builds++;
+    if (fail_display_pipeline) {
+        *error = [NSError errorWithDomain:@"test.display.pipeline"
+                                     code:1
+                                 userInfo:nil];
+        return nil;
+    }
+    return original_display_pipeline(object, selector, descriptor, options,
+                                     error);
+}
 
 static void require(BOOL success, NSError *error)
 {
@@ -90,6 +113,15 @@ int main(void)
         NV2AMetalCommands *commands =
             [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        id<MTL4Compiler> compiler = [commands.device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        require(compiler != nil, error);
+        Method pipeline = class_getInstanceMethod(
+            object_getClass(compiler),
+            @selector(newRenderPipelineStateWithDescriptor:compilerTaskOptions:error:));
+        assert(pipeline);
+        original_display_pipeline = (void *)method_setImplementation(
+            pipeline, (IMP)observe_display_pipeline);
         NV2AMetalDisplay *display =
             [[NV2AMetalDisplay alloc] initWithDevice:commands.device
                                          pixelFormat:MTLPixelFormatRGBA8Unorm
@@ -109,6 +141,11 @@ int main(void)
                     withBytes:input
                   bytesPerRow:8];
         id<MTLTexture> target = new_texture(commands.device, 4, 4);
+        id<MTLTexture> blank = new_texture(commands.device, 4, 4);
+        [target replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                  mipmapLevel:0
+                    withBytes:input
+                  bytesPerRow:4];
         NV2AMetalDisplayUniforms uniforms = { .scale = { 1, 1 } };
         for (unsigned i = 0; i < 256; i++) {
             uniforms.palette[i] = i | (i << 8) | (i << 16);
@@ -130,10 +167,31 @@ int main(void)
                                      linear:NO
                                   screenOff:NO
                                       error:&error]);
+        encode(commands, display, nil, blank, &uniforms, NO, YES);
+        assert(!display_pipeline_builds && ![display valueForKey:@"pipeline"] &&
+               ![display valueForKey:@"arguments"]);
+        id<MTL4CommandBuffer> recording = commands.commandBuffer;
+        fail_display_pipeline = YES;
+        assert(![display encodeWithCommands:commands
+                                     source:source
+                                     target:target
+                                   uniforms:&uniforms
+                                     linear:NO
+                                  screenOff:NO
+                                      error:&error] &&
+               [error.domain isEqualToString:@"test.display.pipeline"] &&
+               commands.commandBuffer == recording && display_pipeline_builds == 1);
+        fail_display_pipeline = NO;
+        submit_and_wait(commands);
+        unsigned char pixels[4 * 4 * 4];
+        read_texture(blank, pixels);
+        check_pixel(pixels, 4, 0, 0, 0, 0, 0, 0);
+        read_texture(target, pixels);
+        check_pixel(pixels, 4, 0, 0, 255, 0, 0, 255);
+        require([commands beginWithError:&error] != nil, error);
         encode(commands, display, source, target, &uniforms, NO, NO);
         submit_and_wait(commands);
         assert(!commands.commandBuffer);
-        unsigned char pixels[4 * 4 * 4];
         read_texture(target, pixels);
         check_pixel(pixels, 4, 0, 0, 255, 0, 0, 255);
         check_pixel(pixels, 4, 3, 0, 0, 255, 0, 255);
@@ -146,11 +204,13 @@ int main(void)
         require([commands beginWithError:&error] != nil, error);
         uniforms.flip_y = 1;
         encode(commands, display, source, intermediate, &uniforms, NO, NO);
+        uniforms.flip_y = 0;
         encode(commands, display, intermediate, target, &uniforms, NO, NO);
+        uniforms.flip_y = 1;
         submit_and_wait(commands);
         read_texture(target, pixels);
-        check_pixel(pixels, 4, 0, 0, 255, 0, 0, 255);
-        check_pixel(pixels, 4, 3, 3, 255, 255, 255, 128);
+        check_pixel(pixels, 4, 0, 0, 0, 0, 255, 255);
+        check_pixel(pixels, 4, 3, 3, 0, 255, 0, 255);
         read_texture(intermediate, pixels);
         check_pixel(pixels, 4, 0, 0, 0, 0, 255, 255);
 
@@ -245,6 +305,10 @@ int main(void)
           assert(accepted || alias_error);
           [commands cancel];
         });
+        assert(display_pipeline_builds == 2);
+        method_setImplementation(pipeline, (IMP)original_display_pipeline);
+        puts("Metal 4 display startup: screen-off clear skips shader resources; "
+             "failed first draw leaves target intact, exact retry PASS");
         puts("Metal 4 display gamma, orientation, filtering and hazards: PASS "
              "(offscreen)");
     }

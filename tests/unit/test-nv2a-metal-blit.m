@@ -164,6 +164,44 @@ static void partial_views(void)
     free(expected);
     checks++;
 }
+static void lazy_blit_pipeline_test(void)
+{
+    NV2AMetalBlitConfig c = {
+        .format = NV062_SET_COLOR_FORMAT_LE_Y8,
+        .operation = NV09F_SET_OPERATION_SRCCOPY,
+        .source_pitch = 16, .destination_pitch = 16,
+        .row_bytes = 16, .destination_offset = 128,
+    };
+    run(c, NO);
+    assert(![blit valueForKey:@"library"] && ![blit valueForKey:@"parallel"] &&
+           ![blit valueForKey:@"serial"] && ![blit valueForKey:@"alpha"]);
+    c.rows = 1;
+    run(c, NO);
+    id library = [blit valueForKey:@"library"];
+    id parallel = [blit valueForKey:@"parallel"];
+    assert(library && parallel && ![blit valueForKey:@"serial"] &&
+           ![blit valueForKey:@"alpha"]);
+    c.destination_offset = 1;
+    run(c, YES);
+    id serial = [blit valueForKey:@"serial"];
+    assert(serial && ![blit valueForKey:@"alpha"]);
+    c.format = NV062_SET_COLOR_FORMAT_LE_X8R8G8B8;
+    c.destination_offset = 128;
+    c.rows = 0;
+    c.tail_bytes = 3;
+    run(c, NO);
+    assert(![blit valueForKey:@"alpha"]);
+    c.rows = 1;
+    c.tail_bytes = 0;
+    run(c, NO);
+    assert([blit valueForKey:@"alpha"] &&
+           [blit valueForKey:@"library"] == library &&
+           [blit valueForKey:@"parallel"] == parallel &&
+           [blit valueForKey:@"serial"] == serial);
+    puts("Blit shader startup: no-op skips compilation and byte-exact "
+         "copies build only the required variants PASS");
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -173,6 +211,7 @@ int main(void)
         blit = [[NV2AMetalBlit alloc] initWithDevice:commands.device
                                                error:&error];
         require(blit != nil, error);
+        lazy_blit_pipeline_test();
         unsigned formats[] = { NV062_SET_COLOR_FORMAT_LE_Y8,
                                NV062_SET_COLOR_FORMAT_LE_R5G6B5,
                                NV062_SET_COLOR_FORMAT_LE_A8R8G8B8,

@@ -6,8 +6,8 @@
 typedef struct NV2AState NV2AState;
 
 NS_ASSUME_NONNULL_BEGIN
-/* A bounded native visibility range. GPU storage may be released after its
- * recording completes; reports then retain the captured uint64 value. */
+/* A native visibility range or pool-free known-zero recording. GPU storage
+ * may be released after completion; reports retain the captured uint64 value. */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalVisibilityCounter : NSObject
 @property(nonatomic, readonly, nullable) id<MTLBuffer> buffer;
@@ -16,7 +16,7 @@ API_AVAILABLE(macos(26.0))
 + (instancetype)new NS_UNAVAILABLE;
 @end
 /* One guest Begin/End query may contain several independently submitted
- * batches. Only successfully submitted visibility buffers join its result.
+ * batches. Only accepted counters and known-zero recordings join its result.
  * Reports freeze prefixes without ending the guest Begin or rounding each
  * physical batch independently. */
 API_AVAILABLE(macos(26.0))
@@ -48,6 +48,10 @@ API_AVAILABLE(macos(26.0))
 /* Allocation may drain at pool pressure. Call before preparing raster
  * packets, since that drain can end the current producer recording. */
 - (nullable NV2AMetalVisibilityCounter *)allocateCounterWithError:
+    (NSError *_Nullable *_Nullable)error;
+/* A proven zero draw needs feedback ordering but no GPU counter or pool slot.
+ * Record/commit/cancel it through the same lifecycle as a native counter. */
+- (nullable NV2AMetalVisibilityCounter *)allocateZeroSampleCounterWithError:
     (NSError *_Nullable *_Nullable)error;
 /* Bind the current cache recording after pass/packet preparation and before
  * any GPU use. A failed draw cancels its recording before cancelling its

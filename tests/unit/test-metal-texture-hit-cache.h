@@ -58,7 +58,7 @@ static void texture_hit_cache_tests(void)
     hit_saved_binding =
         method_setImplementation(binding, (IMP)hit_count_binding);
     /* Real prepareSource timings include source versions, page/overlap checks,
-     * key/result allocation, validation and residency, not just the LRU. */
+     * key allocation, validation and residency, not just the LRU. */
     for (unsigned size = 1; size <= 512; size = size == 1   ? 16 :
                                                 size == 16  ? 128 :
                                                 size == 128 ? 512 :
@@ -90,7 +90,7 @@ static void texture_hit_cache_tests(void)
             for (unsigned n = 0; n < 128; n++) {
                 @autoreleasepool {
                     NV2AMetalCachedTexture *t = prepare(src);
-                    assert(t.binding == hot.binding);
+                    assert(t == hot);
                 }
             }
             double ms = hit_clock() - start;
@@ -106,7 +106,7 @@ static void texture_hit_cache_tests(void)
         color_at(out, 4, 0, 0, 3.f / 255, 2.f / 255, 1.f / 255, 1);
 
         /* Isolate the former cancellation sweep + ordered-set promotion using
-         * the same real content objects and keys. This is not an old binary or
+         * the same real snapshots and keys. This is not an old binary or
          * an end-to-end before/after comparison. */
         NV2AMetalLRUCache *lru = [textures valueForKey:@"entries"];
         NSDictionary *nodes = [lru valueForKey:@"entries"];
@@ -114,22 +114,21 @@ static void texture_hit_cache_tests(void)
         NSMutableOrderedSet *order = [NSMutableOrderedSet new];
         id hotKey = nil;
         for (id key in nodes) {
-            id content = [nodes[key] valueForKey:@"object"];
-            legacy[key] = content;
+            NV2AMetalCachedTexture *snapshot = [nodes[key] valueForKey:@"object"];
+            legacy[key] = snapshot;
             [order addObject:key];
-            if ([content valueForKey:@"texture"] == hot.binding.texture)
+            if (snapshot == hot)
                 hotKey = key;
         }
         assert(hotKey && legacy.count == size);
         hit_cancel_reads = 0;
         for (unsigned n = 0; n < 128; n++) {
             for (id key in [order.array copy]) {
-                NV2AMetalSurfaceRecording *token =
-                    [legacy[key] valueForKey:@"token"];
+                NV2AMetalCachedTexture *snapshot = legacy[key];
+                NV2AMetalSurfaceRecording *token = snapshot.producerRecording;
                 assert(!token.cancelled);
             }
-            id content = legacy[hotKey];
-            assert(content);
+            assert(legacy[hotKey] == hot);
             [order removeObject:hotKey];
             [order addObject:hotKey];
         }
@@ -137,7 +136,7 @@ static void texture_hit_cache_tests(void)
         printf("Texture hits size=%u: 128 complete prepareSource calls median "
                "%.6f ms "
                "(2 warmups/7 samples), %lu cancellation reads, zero "
-               "binding/view creations; "
+               "snapshot/binding/view creations; "
                "isolated old sweep %lu reads/128 array copies\n",
                size, times[3], (unsigned long)reads,
                (unsigned long)hit_cancel_reads);
@@ -156,7 +155,7 @@ static void texture_hit_cache_tests(void)
     }
     [surfaces cancel];
     NV2AMetalCachedTexture *same = prepare(stableSource);
-    assert(same.binding == stable.binding);
+    assert(same == stable);
     finish();
     for (unsigned i = 0; i < 32; i++) {
         assert(![aborted[i] validateCompletedWithError:&error]);
@@ -223,7 +222,7 @@ static void texture_hit_cache_tests(void)
         padded.bordered = p.bordered;
         padded.hilo16 = p.hilo16;
         padded.signed_channels = p.signed_channels;
-        assert(hit_prepare(mip, padded).binding == initial.binding);
+        assert(hit_prepare(mip, padded) == initial);
     }
     assert(!hit_binding_calls);
     finish();
@@ -240,8 +239,9 @@ static void texture_hit_cache_tests(void)
             changed.anisotropy = 2;
         hit_binding_calls = 0;
         NV2AMetalCachedTexture *next = hit_prepare(mip, changed);
-        assert(next.binding != initial.binding && hit_binding_calls == 1);
-        assert(hit_prepare(mip, changed).binding == next.binding &&
+        assert(next != initial && next.binding != initial.binding &&
+               hit_binding_calls == 1);
+        assert(hit_prepare(mip, changed) == next &&
                hit_binding_calls == 1);
         NV2AMetalSamplingUniforms old = initial.binding.sampling;
         assert(!memcmp(&old, &original, sizeof(old)));

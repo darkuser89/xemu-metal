@@ -13,22 +13,22 @@ static NSString *sampling_force_gradients(NSString *source)
                                   withString:
                                       @"    for (uint i = 0; i < 4; i++)"];
     for (NSString *type in @[ @"float2", @"float3" ]) {
-        NSString *block =
-            [NSString stringWithFormat:@"    %@ dx(0), dy(0);\n"
-                                        "    if (!sample_base_only(s)) {\n"
-                                        "        dx = dfdx(c);\n"
-                                        "        dy = dfdy(c);\n"
-                                        "    }\n",
-                                       type];
+        NSString *block = [NSString
+            stringWithFormat:@"    bool base_only = sample_base_only(s);\n"
+                              "    %@ dx(0), dy(0);\n"
+                              "    if (!base_only) {\n"
+                              "        dx = dfdx(c);\n"
+                              "        dy = dfdy(c);\n"
+                              "    }\n",
+                             type];
         assert([source componentsSeparatedByString:block].count ==
                ([type isEqualToString:@"float2"] ? 2u : 3u));
-        source = [source
-            stringByReplacingOccurrencesOfString:block
-                                      withString:
-                                          [NSString stringWithFormat:
-                                                        @"    %@ dx = dfdx(c), "
-                                                        @"dy = dfdy(c);\n",
-                                                        type]];
+        NSString *reference =
+            [NSString stringWithFormat:@"    bool base_only = false;\n"
+                                        "    %@ dx = dfdx(c), dy = dfdy(c);\n",
+                                       type];
+        source = [source stringByReplacingOccurrencesOfString:block
+                                                   withString:reference];
     }
     NSString *signature = @"static bool sample_base_only(";
     assert([source componentsSeparatedByString:signature].count == 2);

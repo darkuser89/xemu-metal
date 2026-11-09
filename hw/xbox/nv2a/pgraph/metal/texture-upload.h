@@ -22,6 +22,7 @@ typedef struct NV2AMetalTextureShape {
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalTextureUploadResult : NSObject
 @property(nonatomic, readonly) id<MTLTexture> texture;
+/* Read only after GPU completion. Fault-free uploads may share this buffer. */
 @property(nonatomic, readonly) id<MTLBuffer> faults;
 @property(nonatomic, readonly) NSUInteger sourceLength;
 @property(nonatomic, readonly) unsigned int minLevel, maxLevel;
@@ -39,12 +40,14 @@ API_AVAILABLE(macos(26.0))
  * values. R5G6B5 retains native packed16 storage. Other packed precision
  * retains RGBA32Float. Mixed Signed8 uses an explicitly
  * marked Half4 codec; unsigned lanes are reconstructed before filtering.
+ * Serialize access to each uploader, including metadata queries.
  * Does not implement the texture cache,
  * VRAM coherence or sampler policy. Palette out-of-range indices set faults
  * bit0; callers must handle the fault before treating the upload as a valid
  * emulated texture. */
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalTextureUpload : NSObject
+/* Direct copies and layout queries do not create decoder resources. */
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                                   error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;

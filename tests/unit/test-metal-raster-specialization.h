@@ -1,3 +1,100 @@
+#import <objc/runtime.h>
+
+static void pixel_argument_reuse_test(void)
+{
+    NSError *error = nil;
+    id<MTL4ArgumentTable> table = [shader valueForKey:@"arguments"];
+    SEL selectors[] = { @selector(setTexture:atIndex:),
+                        @selector(setSamplerState:atIndex:) };
+    Method methods[2];
+    IMP originals[2], spies[2];
+    unsigned writes[2] = { 0 };
+    for (unsigned i = 0; i < 2; i++) {
+        SEL selector = selectors[i];
+        methods[i] = class_getInstanceMethod(object_getClass(table), selector);
+        assert(methods[i]);
+        originals[i] = method_getImplementation(methods[i]);
+        void (*original)(id, SEL, MTLResourceID, NSUInteger) =
+            (void *)originals[i];
+        unsigned *counter = &writes[i];
+        spies[i] = imp_implementationWithBlock(
+            ^void(id object, MTLResourceID resource, NSUInteger index) {
+                if (object == table)
+                    (*counter)++;
+                original(object, selector, resource, index);
+            });
+        method_setImplementation(methods[i], spies[i]);
+    }
+    const float colors[][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 } };
+    id<MTLTexture> sampled[2], outputs[4];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                     width:1 height:1 mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead;
+    for (unsigned i = 0; i < 2; i++) {
+        sampled[i] = [commands.device newTextureWithDescriptor:td];
+        assert(sampled[i]);
+        [sampled[i] replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                     mipmapLevel:0 withBytes:colors[i] bytesPerRow:16];
+    }
+    td.width = td.height = 8;
+    td.usage = MTLTextureUsageRenderTarget;
+    for (unsigned i = 0; i < 4; i++) {
+        outputs[i] = [commands.device newTextureWithDescriptor:td];
+        assert(outputs[i]);
+    }
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.supportArgumentBuffers = YES;
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+    id<MTLSamplerState> alternate =
+        [commands.device newSamplerStateWithDescriptor:sd];
+    assert(alternate);
+    NV2AMetalVertex vertices[6];
+    quad(vertices);
+    id<MTLBuffer> input =
+        [commands.device newBufferWithBytes:vertices length:sizeof(vertices)
+                                    options:MTLResourceStorageModeShared];
+    assert(input);
+    NV2AMetalPixelUniforms u = uniforms();
+    texture_mode(&u, 0, PS_TEXTUREMODES_PROJECT2D);
+    show_texture(&u, 0);
+    NV2AMetalPixelTexture textures[4] = { 0 };
+    require([commands beginWithError:&error] != nil, error);
+    for (unsigned i = 0; i < 4; i++) {
+        textures[0].texture = sampled[i >= 2];
+        textures[0].sampler = i >= 2 ? alternate : nil;
+        MTL4RenderPassDescriptor *renderPass = pass();
+        renderPass.colorAttachments[0].texture = outputs[i];
+        require([shader encodeVertices:input count:6
+                              primitive:MTLPrimitiveTypeTriangle uniforms:&u
+                               textures:textures pass:renderPass
+                           depthStencil:depth_state commands:commands
+                                  error:&error], error);
+        const unsigned expected[][2] = { { 12, 4 }, { 12, 4 },
+                                          { 13, 5 }, { 25, 9 } };
+        assert(writes[0] == expected[i][0] && writes[1] == expected[i][1]);
+        if (i == 2) {
+            require([commands submitWithError:&error], error);
+            require([commands beginWithError:&error] != nil, error);
+        }
+    }
+    require([commands submitWithError:&error], error);
+    require([commands waitUntilIdleWithError:&error], error);
+    for (unsigned i = 0; i < 4; i++) {
+        float actual[4];
+        [outputs[i] getBytes:actual bytesPerRow:16
+                  fromRegion:MTLRegionMake2D(4, 4, 1, 1) mipmapLevel:0];
+        assert(!memcmp(actual, colors[i >= 2], sizeof(actual)));
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        method_setImplementation(methods[i], originals[i]);
+        assert(imp_removeBlock(spies[i]));
+    }
+    puts("Metal 4 pixel arguments: unchanged setters skipped, changed texture "
+         "and sampler rebound, fresh recording restored, exact pixels PASS");
+}
+
 /* Preserve the original float-tag comparisons for public dynamic vertices;
  * fractional/nonfinite values are neither expanded-line tag1 nor polygon tag2.
  */

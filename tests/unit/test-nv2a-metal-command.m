@@ -52,9 +52,11 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 }
 @end
 
+@class TestResidency;
 @interface TestBuffer : NSObject
 @property(nonatomic) BOOL recording;
 @property(nonatomic, strong) TestAllocator *allocator;
+@property(nonatomic, strong) TestResidency *residency;
 @property(nonatomic) BOOL raster;
 @property(nonatomic) MTL4RenderEncoderOptions rasterOptions;
 @property(nonatomic) MTL4RenderPassDescriptor *pass;
@@ -84,6 +86,7 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 - (void)useResidencySet:(id)set
 {
     assert(self.recording && set);
+    self.residency = set;
 }
 - (id)renderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)pass
                                  options:(MTL4RenderEncoderOptions)options
@@ -100,8 +103,9 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 
 @interface TestResidency : NSObject
 @property(nonatomic, strong) id device;
-@property(nonatomic) NSUInteger allocations;
+@property(nonatomic) NSUInteger allocations, adds, removes, resets, commits;
 - (void)addAllocation:(id)allocation;
+- (void)removeAllocation:(id)allocation;
 - (void)removeAllAllocations;
 - (void)commit;
 @end
@@ -111,13 +115,22 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 {
     assert(allocation);
     self.allocations++;
+    self.adds++;
+}
+- (void)removeAllocation:(id)allocation
+{
+    assert(allocation && self.allocations);
+    self.allocations--;
+    self.removes++;
 }
 - (void)removeAllAllocations
 {
     self.allocations = 0;
+    self.resets++;
 }
 - (void)commit
 {
+    self.commits++;
 }
 @end
 
@@ -131,6 +144,7 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 @interface TestSubmission : NSObject
 @property(nonatomic, strong) TestBuffer *buffer;
 @property(nonatomic) NSUInteger bufferCount;
+@property(nonatomic) uint64_t signalValue;
 @property(nonatomic) NSArray<TestBuffer *> *buffers;
 @property(nonatomic, copy) MTL4CommitFeedbackHandler feedback;
 @end
@@ -176,6 +190,7 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 @property(nonatomic) NSMutableArray<NSArray *> *foreignWaits;
 @property(nonatomic) uint64_t signaled;
 @property(nonatomic) uint64_t waited;
+@property(nonatomic) uint64_t successfulCompletion;
 @property(nonatomic, weak) TestDrawable *waitingDrawable;
 - (void)commit:(const id<MTL4CommandBuffer>[])buffers
          count:(NSUInteger)count
@@ -193,7 +208,8 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
        options:(MTL4CommitOptions *)options
 {
     assert(count && count <= NV2AMetalCommandBatchLimit + 1 &&
-           self.waited == self.signaled);
+           (self.waited == self.signaled ||
+            self.successfulCompletion == self.signaled));
     TestSubmission *submission = [TestSubmission new];
     submission.buffer = (TestBuffer *)buffers[0];
     submission.bufferCount = count;
@@ -233,6 +249,7 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
 {
     assert(event && value == self.signaled + 1);
     self.signaled = value;
+    self.pending.lastObject.signalValue = value;
 }
 - (void)waitForEvent:(id)event value:(uint64_t)value
 {
@@ -252,6 +269,9 @@ static NSUInteger raster_encoder_calls, raster_encoder_fail;
     TestSubmission *submission = self.pending.firstObject;
     assert(submission);
     [self.pending removeObjectAtIndex:0];
+    if (!error)
+        self.successfulCompletion =
+            MAX(self.successfulCompletion, submission.signalValue);
     submission.buffer.allocator.busy = NO;
     TestFeedback *feedback = [TestFeedback new];
     feedback.error = error;
@@ -436,6 +456,22 @@ static void check_uploads(void)
          "and allocation failure PASS (CPU only)");
 }
 
+static void check_receipt_without_monitor(NV2AMetalSubmission *receipt,
+                                          BOOL completed, NSError *failure)
+{
+    dispatch_semaphore_t polled = dispatch_semaphore_create(0);
+    @synchronized(receipt) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+          NSError *error = [NSError errorWithDomain:@"stale" code:1 userInfo:nil];
+          assert([receipt completedWithError:&error] == completed &&
+                 error == failure);
+          dispatch_semaphore_signal(polled);
+        });
+        assert(!dispatch_semaphore_wait(
+            polled, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)));
+    }
+}
+
 static void check_submission_receipts(void)
 {
     TestDevice *device = [TestDevice new];
@@ -459,6 +495,8 @@ static void check_submission_receipts(void)
     [device.queue completeWithError:nil];
     assert([receipts[0] completedWithError:&error] && !error);
     assert(![receipts[1] completedWithError:&error] && !error);
+    check_receipt_without_monitor(receipts[0], YES, nil);
+    check_receipt_without_monitor(receipts[1], NO, nil);
     assert([commands beginWithError:&error]);
     [commands cancel];
     assert(commands.lastSubmitted == receipts[2]);
@@ -478,9 +516,12 @@ static void check_submission_receipts(void)
     assert([fourth completedWithError:&error] && !error);
     commands = nil;
     assert([receipts[2] completedWithError:&error] && error == failure);
+    check_receipt_without_monitor(receipts[2], YES, failure);
     puts(
         "Metal4 submission receipts: pending/success/error, cancel, slot reuse "
         "and owner destruction PASS (CPU only)");
+    puts("Metal submission feedback polls: pending, success and error "
+         "are readable while another thread holds the receipt monitor PASS");
 }
 
 static void check_submission_waits(void)
@@ -582,6 +623,34 @@ static void check_submission_waits(void)
          "cancel,slot reuse and resource lifetime PASS (CPU only)");
 }
 
+static void check_same_queue_waits(void)
+{
+    TestDevice *device = [TestDevice new];
+    device.supported = YES;
+    device.queue = [TestQueue new];
+    device.queue.pending = [NSMutableArray new];
+    NSError *error = nil;
+    NV2AMetalCommands *commands =
+        [[NV2AMetalCommands alloc] initWithDevice:(id<MTLDevice>)device
+                                            error:&error];
+    assert(commands);
+    assert([commands beginWithError:&error] && [commands submitWithError:&error]);
+    assert([commands beginWithError:&error] && [commands submitWithError:&error]);
+    assert(device.queue.waited == 1 && device.queue.signaled == 2);
+    [device.queue completeWithError:nil];
+    [device.queue completeWithError:nil];
+    assert([commands beginWithError:&error] && [commands submitWithError:&error]);
+    assert(device.queue.waited == 1 && device.queue.signaled == 3);
+    NSError *failure = [NSError errorWithDomain:@"test.same-queue"
+                                           code:1 userInfo:nil];
+    [device.queue completeWithError:failure];
+    assert([commands beginWithError:&error] && [commands submitWithError:&error]);
+    assert(device.queue.waited == 3 && device.queue.signaled == 4);
+    [device.queue completeWithError:nil];
+    puts("Metal same-queue waits: pending and failed work keeps its event; "
+         "completed success skips it PASS");
+}
+
 @interface TestTextureResource : TestResource
 @property(nonatomic, strong) id<MTLTexture> parentTexture;
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -608,7 +677,11 @@ static void check_batch_budget(void)
     base.device = device;
     base.allocatedSize = 128 * 1024 * 1024;
     assert([commands beginWithError:&error]);
-    assert([commands addResource:(id)base error:&error]);
+    TestResidency *residency = ((TestBuffer *)commands.commandBuffer).residency;
+    assert(residency.allocations == 0);
+    for (unsigned i = 0; i < 16; i++)
+        assert([commands addResource:(id)base error:&error]);
+    assert(residency.allocations == 1);
     assert([commands sealWithError:&error] && !commands.batchNeedsSubmit);
     assert([commands beginWithError:&error]);
     for (unsigned i = 0; i < 64; i++) {
@@ -616,9 +689,13 @@ static void check_batch_budget(void)
         view.device = device;
         view.allocatedSize = NSUIntegerMax;
         view.buffer = (id)base;
-        assert([commands addResource:(id)view error:&error]);
+        for (unsigned repeat = 0; repeat < 4; repeat++) {
+            assert([commands addResource:(id)view error:&error]);
+            assert([commands addResource:(id)base error:&error]);
+        }
         assert(!commands.batchNeedsSubmit);
     }
+    assert(residency.allocations == 65);
     TestResource *extra = [TestResource new];
     extra.device = device;
     extra.allocatedSize = NV2AMetalCommandBatchExtraBytes - 1;
@@ -629,17 +706,28 @@ static void check_batch_budget(void)
     one.allocatedSize = 1;
     assert([commands addResource:(id)one error:&error] &&
            commands.batchNeedsSubmit);
+    assert(residency.allocations == 67);
+    NSUInteger adds = residency.adds, resets = residency.resets;
     [commands cancelUnsealed];
     assert(!commands.batchNeedsSubmit && commands.sealedBufferCount == 1);
+    assert(residency.allocations == 1 && residency.adds == adds &&
+           residency.resets == resets && residency.removes == 66);
     assert([commands beginWithError:&error]);
+    assert([commands addResource:(id)base error:&error] &&
+           residency.allocations == 1);
+    assert([commands addResource:(id)one error:&error] &&
+           residency.allocations == 2);
     TestBuffer *section = (id)commands.commandBuffer;
     section.allocator.commandBytes = NV2AMetalCommandBatchExtraBytes;
     assert(commands.batchNeedsSubmit);
     assert([commands submitWithError:&error]);
     [device.queue completeWithError:nil];
     assert([commands waitUntilIdleWithError:&error]);
+    assert(residency.allocations == 0);
     assert([commands beginWithError:&error]);
-    assert([commands addResource:(id)base error:&error]);
+    residency = ((TestBuffer *)commands.commandBuffer).residency;
+    assert([commands addResource:(id)base error:&error] &&
+           residency.allocations == 1);
     assert([commands sealWithError:&error]);
     assert([commands beginWithError:&error]);
     extra.allocatedSize = NSUIntegerMax;
@@ -652,7 +740,23 @@ static void check_batch_budget(void)
          "buffer-backed views, exact 32-MiB additional resource/allocator "
          "boundary, cancel rollback and saturated size arithmetic PASS (CPU "
          "only)");
+    puts("Metal residency registration: repeated buffers and 64 distinct "
+         "views, sealed prefix, rollback, retry and retirement PASS (CPU "
+         "only)");
 }
+
+@interface TestEqualLifetime : NSObject
+@end
+@implementation TestEqualLifetime
+- (BOOL)isEqual:(id)object
+{
+    return [object isKindOfClass:TestEqualLifetime.class];
+}
+- (NSUInteger)hash
+{
+    return 0;
+}
+@end
 
 static void check_batches(void)
 {
@@ -671,8 +775,11 @@ static void check_batches(void)
     NSUInteger offset = 0, firstOffset = 0;
     __weak NSObject *prefixLife;
     __weak NSObject *suffixLife;
+    NSObject *retry = [TestEqualLifetime new];
+    __weak NSObject *retryLife = retry;
     assert([commands beginWithError:&error]);
     TestBuffer *first = (id)commands.commandBuffer;
+    TestResidency *residency = first.residency;
     NSUInteger resets = first.allocator.resets;
     uint64_t serial = commands.recordingSerial;
     id<MTLBuffer> page = [commands uploadBytes:&one
@@ -681,10 +788,13 @@ static void check_batches(void)
                                          error:&error];
     assert(page && !firstOffset);
     @autoreleasepool {
-        NSObject *object = [NSObject new];
+        NSObject *object = [TestEqualLifetime new];
         prefixLife = object;
-        assert([commands keepAlive:object error:&error]);
+        for (unsigned i = 0; i < 16; i++)
+            assert([commands keepAlive:object error:&error]);
     }
+    assert([[[commands valueForKey:@"current"] valueForKey:@"objects"] count] ==
+           1);
     assert([commands sealWithError:&error] && prefixLife &&
            !commands.commandBuffer && commands.sealedBufferCount == 1 &&
            !commands.lastSubmitted);
@@ -694,20 +804,34 @@ static void check_batches(void)
            commands.commandBuffer != (id)first &&
            first.allocator.resets == resets);
     @autoreleasepool {
-        NSObject *object = [NSObject new];
+        NSObject *object = [TestEqualLifetime new];
         suffixLife = object;
-        assert([commands keepAlive:object error:&error]);
+        assert([object isEqual:prefixLife] && object != prefixLife);
+        assert([commands keepAlive:prefixLife error:&error] &&
+               [commands keepAlive:object error:&error] &&
+               [commands keepAlive:retry error:&error]);
     }
+    assert([[[commands valueForKey:@"current"] valueForKey:@"objects"] count] ==
+           3);
     assert([commands uploadBytes:&two length:4 offset:&offset
                            error:&error] == page &&
            offset == 256);
     assert(*(uint32_t *)page.contents == one);
+    NSUInteger commits = residency.commits;
     @autoreleasepool {
         [commands cancelUnsealed];
     }
+    assert(residency.commits == commits && residency.removes == 0);
     assert(prefixLife && !suffixLife && commands.sealedBufferCount == 1 &&
            !commands.commandBuffer);
     assert([commands beginWithError:&error]);
+    assert([commands keepAlive:retry error:&error]);
+    retry = nil;
+    @autoreleasepool {
+        assert(retryLife &&
+               [[[commands valueForKey:@"current"] valueForKey:@"objects"]
+                   count] == 2);
+    }
     assert([commands uploadBytes:&two length:4 offset:&offset
                            error:&error] == page &&
            offset == 256);
@@ -718,10 +842,12 @@ static void check_batches(void)
     assert(device.queue.pending.count == 1 &&
            device.queue.pending[0].bufferCount == 2);
     NV2AMetalSubmission *receipt = commands.lastSubmitted;
-    assert(![receipt completedWithError:NULL] && prefixLife);
+    assert(![receipt completedWithError:NULL] && prefixLife && retryLife);
     [device.queue completeWithError:nil];
     assert([commands waitForSubmission:receipt error:&error]);
-    assert([commands waitUntilIdleWithError:&error] && !prefixLife);
+    assert([commands waitUntilIdleWithError:&error] && !prefixLife && !retryLife);
+    puts("Metal batch ownership: duplicate identity retained once, equal "
+         "objects stay distinct, cancelled suffix can re-register PASS");
     for (unsigned section = 0; section < NV2AMetalCommandBatchLimit;
          section++) {
         assert([commands beginWithError:&error]);
@@ -745,10 +871,16 @@ static void check_batches(void)
 
 #include "test-metal-gpu-queue-order.h"
 #include "test-metal-raster-submission.h"
+#include "test-metal-command-producer-prefix.h"
 
-int main(void)
+int main(int argc, char **argv)
 {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "--producer-prefix-native")) {
+            check_command_producer_prefix_native();
+            return 0;
+        }
+        assert(argc == 1);
         check_lru();
         Method feedback = class_getInstanceMethod(
             [MTL4CommitOptions class], @selector(addFeedbackHandler:));
@@ -759,8 +891,10 @@ int main(void)
         check_batch_budget();
         check_submission_receipts();
         check_submission_waits();
+        check_same_queue_waits();
         check_gpu_queue_order();
         check_raster_submissions();
+        check_command_producer_prefix();
 
         TestDevice *device = [TestDevice new];
         device.queue = [TestQueue new];

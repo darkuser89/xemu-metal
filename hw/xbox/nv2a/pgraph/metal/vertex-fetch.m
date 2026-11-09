@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.0-or-later */
 
 #import "vertex-fetch.h"
+#import "shader-library.h"
 #include "vertex-fetch-source.h"
 #include <stdint.h>
 #include <string.h>
 
-_Static_assert(sizeof(NV2AMetalFetchUniforms) == 532, "CPU/MSL fetch layout");
+_Static_assert(sizeof(NV2AMetalFetchUniforms) == 536, "CPU/MSL fetch layout");
 _Static_assert(offsetof(NV2AMetalFetchUniforms, first_decoded_vertex) == 528,
                "CPU/MSL compact fetch offset");
 _Static_assert(sizeof(NV2AMetalProgramInput) == 256,
@@ -44,11 +45,24 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
     }
 }
 
-@implementation NV2AMetalFetchResult
+@implementation NV2AMetalFetchResult {
+    NV2AMetalFetchUniforms _sourceUniforms;
+    BOOL _hasSourceUniforms;
+    __weak NV2AMetalCommands *_owner;
+    uint64_t _recordingSerial;
+    NSData *_pgraphCurrent;
+    uint16_t _constantAttributes;
+    NSData *_floatProofSummaries;
+    uint64_t _floatProofLanes;
+    NSUInteger _floatProofFirst, _floatProofCount;
+}
 - (instancetype)initWithAttributes:(id<MTLBuffer>)attributes
                             faults:(id<MTLBuffer>)faults
                              count:(NSUInteger)count
                            current:(BOOL)current
+                     summaryOffset:(NSUInteger)summaryOffset
+                          uniforms:(const NV2AMetalFetchUniforms *)uniforms
+                          commands:(NV2AMetalCommands *)commands
 {
     self = [super init];
     if (self) {
@@ -56,20 +70,191 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
         _faults = faults;
         _vertexCount = count;
         _hasCurrent = current;
-        _faultSummaryOffset = (count + current) * sizeof(uint32_t);
+        _faultSummaryOffset = summaryOffset;
+        if (attributes && uniforms) {
+            _sourceUniforms = *uniforms;
+            _hasSourceUniforms = YES;
+            _owner = commands;
+            _recordingSerial = commands.recordingSerial;
+        }
     }
     return self;
 }
+- (BOOL)getSourceUniforms:(NV2AMetalFetchUniforms *)uniforms
+          attributeBuffer:(id<MTLBuffer>)attributes
+                    first:(NSUInteger)first
+                    count:(NSUInteger)count
+                 commands:(NV2AMetalCommands *)commands
+{
+    NSUInteger records = _vertexCount + _hasCurrent;
+    if (!uniforms || !_hasSourceUniforms || !attributes ||
+        attributes != _attributes || !commands || commands != _owner ||
+        !commands.commandBuffer ||
+        commands.recordingSerial != _recordingSerial || first > records ||
+        count > records - first)
+        return NO;
+    *uniforms = _sourceUniforms;
+    return YES;
+}
+/* Private producer handoff: only PGRAPH's guarded host capture calls this.
+ * Generic buffer fetches cannot infer CPU values from GPU-owned storage. */
+- (void)bindPGRAPHCurrentProof:(NSData *)current
+                     commands:(NV2AMetalCommands *)commands
+{
+    if (_pgraphCurrent || current.length != sizeof(NV2AMetalProgramInput) ||
+        [current isKindOfClass:NSMutableData.class])
+        return;
+    NV2AMetalFetchUniforms uniforms;
+    if (![self getSourceUniforms:&uniforms attributeBuffer:_attributes
+                            first:0 count:0 commands:commands] ||
+        (uniforms.index_size && uniforms.first_vertex) ||
+        (!uniforms.index_size && uniforms.vertex_count &&
+         (uint64_t)uniforms.first_vertex + uniforms.vertex_count - 1 > UINT32_MAX))
+        return;
+    for (unsigned i = 0; i < NV2A_METAL_VP_ATTRIBUTES; i++) {
+        const NV2AMetalFetchAttribute *a = &uniforms.attributes[i];
+        if (nv2a_metal_attribute_size(a->format, a->count) && !a->stride &&
+            a->max_index == UINT32_MAX)
+            _constantAttributes |= 1u << i;
+    }
+    if (_constantAttributes)
+        _pgraphCurrent = current;
+}
+- (BOOL)getReadonlyProofUniforms:(NV2AMetalFetchUniforms *)uniforms
+                attributeBuffer:(id<MTLBuffer>)attributes
+                          first:(NSUInteger)first
+                          count:(NSUInteger)count
+                       commands:(NV2AMetalCommands *)commands
+{
+    if (![self getSourceUniforms:uniforms attributeBuffer:attributes
+                            first:first count:count commands:commands])
+        return NO;
+    const NV2AMetalProgramInput *current = _pgraphCurrent.bytes;
+    for (unsigned i = 0; i < NV2A_METAL_VP_ATTRIBUTES; i++) {
+        if (!(_constantAttributes & (1u << i)))
+            continue;
+        uniforms->attributes[i].count = 0;
+        memcpy(uniforms->attributes[i].inline_value, current->attributes[i], 16);
+    }
+    return YES;
+}
+/* Only PGRAPH's guarded capture can attach host evidence. No guest pointer,
+ * index view or source buffer is retained by this output metadata. */
+- (void)bindPGRAPHFloatProofSummaries:(NSData *)summaries
+                             laneMask:(uint64_t)laneMask
+                                first:(NSUInteger)first
+                                count:(NSUInteger)count
+                             commands:(NV2AMetalCommands *)commands
+{
+    NV2AMetalFetchUniforms uniforms;
+    if (_floatProofSummaries || !laneMask || !count ||
+        summaries.length != 64 * sizeof(NV2AMetalFloatLaneSummary) ||
+        [summaries isKindOfClass:NSMutableData.class] || first > _vertexCount ||
+        count > _vertexCount - first ||
+        ![self getSourceUniforms:&uniforms
+                 attributeBuffer:_attributes
+                           first:first
+                           count:count
+                        commands:commands] ||
+        (uniforms.index_size && uniforms.first_vertex) ||
+        (!uniforms.index_size && uniforms.vertex_count &&
+         (uint64_t)uniforms.first_vertex + uniforms.vertex_count - 1 >
+             UINT32_MAX))
+        return;
+    _floatProofSummaries = [summaries copy];
+    _floatProofLanes = laneMask;
+    _floatProofFirst = first;
+    _floatProofCount = count;
+}
+- (BOOL)getFloatProofSummaries:(NSData **)summaries
+                      laneMask:(uint64_t *)laneMask
+               attributeBuffer:(id<MTLBuffer>)attributes
+                         first:(NSUInteger)first
+                         count:(NSUInteger)count
+                      commands:(NV2AMetalCommands *)commands
+{
+    if (summaries)
+        *summaries = nil;
+    if (laneMask)
+        *laneMask = 0;
+    NV2AMetalFetchUniforms uniforms;
+    if (!_floatProofSummaries || first < _floatProofFirst ||
+        first - _floatProofFirst > _floatProofCount ||
+        count > _floatProofCount - (first - _floatProofFirst) ||
+        ![self getSourceUniforms:&uniforms
+                 attributeBuffer:attributes
+                           first:first
+                           count:count
+                        commands:commands])
+        return NO;
+    if (summaries)
+        *summaries = _floatProofSummaries;
+    if (laneMask)
+        *laneMask = _floatProofLanes;
+    return YES;
+}
 @end
+
+typedef struct NV2AMetalFetchUniformSlot {
+    const uint8_t *bytes;
+    MTLGPUAddress address;
+} NV2AMetalFetchUniformSlot;
 
 @implementation NV2AMetalVertexFetch {
     id<MTLDevice> _device;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
+    BOOL _faultSummaryOnly;
+    __weak NV2AMetalCommands *_uniformCommands;
+    uint64_t _uniformSerial;
+    NV2AMetalFetchUniformSlot _uniformSlots[4];
+    unsigned _uniformSlotCount, _nextUniformSlot;
+}
+
+- (MTLGPUAddress)addressForUniforms:(const NV2AMetalFetchUniforms *)uniforms
+                           commands:(NV2AMetalCommands *)commands
+                              error:(NSError **)error
+{
+    /* Upload slices stay immutable while this recording is live. Seal/cancel
+     * ends its identity before the arena can be rewound or reused. */
+    uint64_t serial = commands.recordingSerial;
+    if (_uniformCommands != commands || _uniformSerial != serial) {
+        _uniformCommands = commands;
+        _uniformSerial = serial;
+        _uniformSlotCount = _nextUniformSlot = 0;
+    }
+    for (unsigned i = 0; i < _uniformSlotCount; i++) {
+        NV2AMetalFetchUniformSlot slot = _uniformSlots[i];
+        if (!memcmp(slot.bytes, uniforms, sizeof(*uniforms)))
+            return slot.address;
+    }
+    NSUInteger offset;
+    id<MTLBuffer> buffer = [commands uploadBytes:uniforms
+                                          length:sizeof(*uniforms)
+                                          offset:&offset
+                                           error:error];
+    if (!buffer)
+        return 0;
+    MTLGPUAddress address = buffer.gpuAddress + offset;
+    _uniformSlots[_nextUniformSlot] =
+        (NV2AMetalFetchUniformSlot){ (const uint8_t *)buffer.contents + offset,
+                                     address };
+    unsigned capacity = sizeof(_uniformSlots) / sizeof(*_uniformSlots);
+    _nextUniformSlot = (_nextUniformSlot + 1) % capacity;
+    _uniformSlotCount = MIN(_uniformSlotCount + 1, capacity);
+    return address;
 }
 
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                                   error:(NSError **)error
+{
+    return [self initWithDevice:device faultSummaryOnly:NO error:error];
+}
+
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                        faultSummaryOnly:(BOOL)faultSummaryOnly
+                                   error:(NSError **)error
 {
     self = [super init];
     if (!self) {
@@ -82,37 +267,7 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
         return nil;
     }
     _device = device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
-        return nil;
-    }
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    libraryDescriptor.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library) {
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = library;
-    function.name = @"nv2a_vertex_fetch";
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                            compilerTaskOptions:nil
-                                                          error:error];
-    if (!_pipeline) {
-        return nil;
-    }
+    _faultSummaryOnly = faultSummaryOnly;
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 21;
     arguments.initializeBindings = YES;
@@ -197,6 +352,7 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
     u.current_vertex =
         currentVertex == NSNotFound ? UINT32_MAX : (unsigned)currentVertex;
     u.first_decoded_vertex = (unsigned)prefix;
+    u.record_faults = !_faultSummaryOnly;
     NSUInteger decoded = count - prefix;
     NSUInteger records = decoded + (currentVertex != NSNotFound);
     NSUInteger work =
@@ -239,28 +395,40 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
         return [[NV2AMetalFetchResult alloc] initWithAttributes:nil
                                                          faults:nil
                                                           count:0
-                                                        current:NO];
+                                                        current:NO
+                                                  summaryOffset:0
+                                                       uniforms:&u
+                                                       commands:commands];
     }
-    NSUInteger constantsOffset = 0;
-    id<MTLBuffer> constants = [commands uploadBytes:&u
-                                             length:sizeof(u)
-                                             offset:&constantsOffset
-                                              error:error];
-    if (!constants) {
+    if (!_pipeline) {
+        _module = [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                                   source:metal_shader_source
+                                                    error:error];
+        if (!_module)
+            return nil;
+        _pipeline = [_module computeFunction:@"nv2a_vertex_fetch" error:error];
+        if (!_pipeline)
+            return nil;
+    }
+    MTLGPUAddress uniformAddress = [self addressForUniforms:&u
+                                                  commands:commands
+                                                     error:error];
+    if (!uniformAddress) {
         return nil;
     }
     id<MTLBuffer> attributes =
         [_device newBufferWithLength:records * sizeof(NV2AMetalProgramInput)
                              options:MTLResourceStorageModeShared];
+    NSUInteger summaryOffset = _faultSummaryOnly ? 0 : records * sizeof(uint32_t);
     id<MTLBuffer> faults =
-        [_device newBufferWithLength:(records + 1) * sizeof(unsigned)
+        [_device newBufferWithLength:summaryOffset + sizeof(uint32_t)
                              options:MTLResourceStorageModeShared];
     if (!attributes || !faults) {
         fetch_error(error, @"Could not allocate Metal attribute buffers");
         return nil;
     }
     uint32_t zero = 0;
-    memcpy((uint8_t *)faults.contents + records * sizeof(uint32_t), &zero,
+    memcpy((uint8_t *)faults.contents + summaryOffset, &zero,
            sizeof(zero));
     if (![commands addResource:attributes error:error] ||
         ![commands addResource:faults error:error] ||
@@ -274,16 +442,16 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
             return nil;
         }
         [_arguments setAddress:s->count ? s->buffer.gpuAddress + s->offset :
-                                          constants.gpuAddress + constantsOffset
+                                          uniformAddress
                        atIndex:i];
     }
     [_arguments setAddress:attributes.gpuAddress atIndex:16];
     [_arguments setAddress:faults.gpuAddress atIndex:17];
-    [_arguments setAddress:constants.gpuAddress + constantsOffset atIndex:18];
+    [_arguments setAddress:uniformAddress atIndex:18];
     [_arguments setAddress:indices ? indices.gpuAddress + indexOffset :
-                                     constants.gpuAddress + constantsOffset
+                                     uniformAddress
                    atIndex:19];
-    [_arguments setAddress:faults.gpuAddress + records * sizeof(uint32_t)
+    [_arguments setAddress:faults.gpuAddress + summaryOffset
                    atIndex:20];
     id<MTL4ComputeCommandEncoder> encoder =
         [commands.commandBuffer computeCommandEncoder];
@@ -306,9 +474,13 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
               beforeQueueStages:MTLStageAll
               visibilityOptions:MTL4VisibilityOptionDevice];
     [encoder endEncoding];
-    return [[NV2AMetalFetchResult alloc] initWithAttributes:attributes
-                                                     faults:faults
-                                                      count:decoded
-                                                    current:currentVertex != NSNotFound];
+    return [[NV2AMetalFetchResult alloc]
+        initWithAttributes:attributes
+                    faults:faults
+                     count:decoded
+                   current:currentVertex != NSNotFound
+             summaryOffset:summaryOffset
+                  uniforms:&u
+                  commands:commands];
 }
 @end

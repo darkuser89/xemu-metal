@@ -131,6 +131,7 @@ static BOOL decode_program(const uint32_t *tokens, NSUInteger length,
 
 #include <string.h>
 #include "vertex-state.h"
+#import "shader-library.h"
 #include "vertex-context-types.h"
 #include "vertex-context-source.h"
 _Static_assert(sizeof(NV2AMetalStateInput) == 3328, "State input transport");
@@ -154,8 +155,64 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
 
 @implementation NV2AMetalStateProgram {
     NV2AMetalCommands *_commands;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
+    NSData *_decodedTokens, *_decodedInstructions;
+    NSUInteger _decodedSlots;
+    id<MTLBuffer> _decodedBuffer;
+}
+- (BOOL)matchesDecodedTokens:(const uint32_t *)tokens length:(NSUInteger)length
+{
+    if (!tokens || !length || length > NV2A_METAL_VP_SLOTS || !_decodedSlots ||
+        length < _decodedSlots ||
+        _decodedTokens.length != _decodedSlots * 4 * sizeof(uint32_t) ||
+        _decodedInstructions.length !=
+            _decodedSlots * sizeof(NV2AMetalProgramInstruction))
+        return NO;
+    const uint32_t *known = _decodedTokens.bytes;
+    /* The declared length may extend past the first END's readable prefix.
+     * A changed token must miss before examining any later token. */
+    for (NSUInteger i = 0; i < _decodedSlots; i++) {
+        if (memcmp(tokens + 4 * i, known + 4 * i, 4 * sizeof(uint32_t)))
+            return NO;
+        if (tokens[4 * i + 3] & 1)
+            return i + 1 == _decodedSlots;
+    }
+    return NO;
+}
+- (BOOL)decodeTokens:(const uint32_t *)tokens
+              length:(NSUInteger)length
+             decoded:(NV2AMetalProgramInstruction *)decoded
+               slots:(NSUInteger *)slots
+               error:(NSError **)error
+{
+    return decode_program(tokens, length, decoded, slots, error);
+}
+- (nullable id<MTLBuffer>)newDecodedProgramBuffer:(NSData *)instructions
+{
+    return [_commands.device newBufferWithBytes:instructions.bytes
+                                         length:instructions.length
+                                        options:MTLResourceStorageModeShared];
+}
+- (void)cacheDecodedTokens:(const uint32_t *)tokens
+                     slots:(NSUInteger)slots
+              instructions:(const NV2AMetalProgramInstruction *)instructions
+{
+    NSData *key = [NSData dataWithBytes:tokens
+                                 length:slots * 4 * sizeof(uint32_t)];
+    NSData *code = key ? [NSData dataWithBytes:instructions
+                                        length:slots * sizeof(*instructions)] :
+                         nil;
+    if (!code)
+        return;
+    /* Never retain an arena slice across completion. This optional mirror
+     * owns its bytes and is published only after a valid execution result. */
+    _decodedBuffer = nil;
+    _decodedTokens = key;
+    _decodedInstructions = code;
+    _decodedSlots = slots;
+    _decodedBuffer = [self newDecodedProgramBuffer:code];
 }
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
                                   error:(NSError **)error
@@ -165,34 +222,6 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
         return nil;
     _commands = [[NV2AMetalCommands alloc] initWithDevice:device error:error];
     if (!_commands)
-        return nil;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler)
-        return nil;
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    libraryDescriptor.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library)
-        return nil;
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = library;
-    function.name = @"nv2a_state_program";
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                            compilerTaskOptions:nil
-                                                          error:error];
-    if (!_pipeline)
         return nil;
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 4;
@@ -230,9 +259,33 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
         return nil;
     }
     NV2AMetalProgramInstruction decoded[NV2A_METAL_VP_SLOTS];
-    NSUInteger slots = 0;
-    if (!decode_program(tokens, length, decoded, &slots, error))
-        return nil;
+    uint32_t tokenPrefix[NV2A_METAL_VP_SLOTS * 4];
+    NSData *memo = [self matchesDecodedTokens:tokens length:length] ?
+                       _decodedInstructions :
+                       nil;
+    id<MTLBuffer> cachedBuffer = memo ? _decodedBuffer : nil;
+    NSUInteger slots = memo ? _decodedSlots : 0;
+    const NV2AMetalProgramInstruction *instructions = memo.bytes;
+    if (!memo) {
+        if (![self decodeTokens:tokens
+                         length:length
+                        decoded:decoded
+                          slots:&slots
+                          error:error])
+            return nil;
+        instructions = decoded;
+        memcpy(tokenPrefix, tokens, slots * 4 * sizeof(uint32_t));
+    }
+    if (!_pipeline) {
+        _module = [NV2AMetalShaderLibrary sharedWithDevice:_commands.device
+                                                   source:metal_shader_source
+                                                    error:error];
+        if (!_module)
+            return nil;
+        _pipeline = [_module computeFunction:@"nv2a_state_program" error:error];
+        if (!_pipeline)
+            return nil;
+    }
     NV2AMetalStateInput input = { 0 };
     memcpy(input.constants, constants.bytes, constants.length);
     memcpy(input.attributes.attributes[0], launch.bytes, launch.length);
@@ -241,32 +294,39 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
     parameters.common.program_length = (unsigned)slots;
     parameters.full_access = access == NV2AMetalStateFull;
     id<MTLDevice> device = _commands.device;
-    id<MTLBuffer> inputs =
-        [device newBufferWithBytes:&input
-                            length:sizeof(input)
-                           options:MTLResourceStorageModeShared];
     id<MTLBuffer> output =
         [device newBufferWithLength:sizeof(NV2AMetalStateOutput)
                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> uniformBuffer =
-        [device newBufferWithBytes:&parameters
-                            length:sizeof(parameters)
-                           options:MTLResourceStorageModeShared];
-    id<MTLBuffer> program =
-        [device newBufferWithBytes:decoded
-                            length:slots * sizeof(decoded[0])
-                           options:MTLResourceStorageModeShared];
-    if (!inputs || !output || !uniformBuffer || !program) {
-        program_error(error, @"Could not allocate Metal state-program buffers");
+    if (!output) {
+        program_error(error, @"Could not allocate Metal state-program output");
         return nil;
     }
     if (![_commands beginWithError:error])
         return nil;
-    for (id<MTLBuffer> buffer in @[ inputs, output, uniformBuffer, program ]) {
-        if (![_commands addResource:buffer error:error]) {
-            [_commands cancel];
-            return nil;
+    NSUInteger inputOffset = 0, uniformOffset = 0, programOffset = 0;
+    id<MTLBuffer> inputs = [_commands uploadBytes:&input
+                                            length:sizeof(input)
+                                            offset:&inputOffset
+                                             error:error];
+    id<MTLBuffer> uniformBuffer = inputs ?
+        [_commands uploadBytes:&parameters length:sizeof(parameters)
+                         offset:&uniformOffset error:error] : nil;
+    id<MTLBuffer> program = nil;
+    if (uniformBuffer) {
+        if (cachedBuffer) {
+            NSError *registrationError = nil;
+            if ([_commands addResource:cachedBuffer error:&registrationError])
+                program = cachedBuffer;
         }
+        if (!program)
+            program = [_commands uploadBytes:instructions
+                                      length:slots * sizeof(*instructions)
+                                      offset:&programOffset
+                                       error:error];
+    }
+    if (!program || ![_commands addResource:output error:error]) {
+        [_commands cancel];
+        return nil;
     }
     id<MTL4ComputeCommandEncoder> encoder =
         [_commands.commandBuffer computeCommandEncoder];
@@ -275,10 +335,10 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
         [_commands cancel];
         return nil;
     }
-    [_arguments setAddress:inputs.gpuAddress atIndex:0];
+    [_arguments setAddress:inputs.gpuAddress + inputOffset atIndex:0];
     [_arguments setAddress:output.gpuAddress atIndex:1];
-    [_arguments setAddress:uniformBuffer.gpuAddress atIndex:2];
-    [_arguments setAddress:program.gpuAddress atIndex:3];
+    [_arguments setAddress:uniformBuffer.gpuAddress + uniformOffset atIndex:2];
+    [_arguments setAddress:program.gpuAddress + programOffset atIndex:3];
     [encoder setArgumentTable:_arguments];
     [encoder setComputePipelineState:_pipeline];
     [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
@@ -304,6 +364,17 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
             return nil;
         }
     }
-    return [[NV2AMetalStateResult alloc] initWithSnapshot:snapshot];
+    NV2AMetalStateResult *result =
+        [[NV2AMetalStateResult alloc] initWithSnapshot:snapshot];
+    if (result && result.constants.length == sizeof(snapshot->constants) &&
+        result.written.length == sizeof(snapshot->dirty)) {
+        if (!memo)
+            [self cacheDecodedTokens:tokenPrefix
+                               slots:slots
+                        instructions:instructions];
+        else if (!_decodedBuffer)
+            _decodedBuffer = [self newDecodedProgramBuffer:memo];
+    }
+    return result;
 }
 @end

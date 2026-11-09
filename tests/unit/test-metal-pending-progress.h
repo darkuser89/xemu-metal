@@ -164,24 +164,38 @@ static void pending_progress_contracts(void)
     }
     inputs = @[ inputs[0], array(20, 3) ];
     cursor = progress_begin(j, inputs);
+    NSError *error = nil;
+    assert(![j prepareCompletedProgress:cursor error:&error] && error);
+    failures++;
     progress_publish(j, cursor, nil);
     NV2AMetalPendingSpan *span = tags(2, 1, 2, 1);
     progress_publish(j, cursor, span);
     progress_reference(ref, inputs, 1, span);
     progress_equal(j, ref);
     comparisons++;
-    for (NV2AMetalPendingJournal *journal in @[ j, ref ]) {
-        NSError *error = nil;
-        NV2AMetalPendingPlan *plan = [journal planInputs:inputs
-                                     preservingLastArray:YES
-                                                   error:&error];
-        NV2AMetalPendingUpdate *update =
-            [journal preparePlan:plan
-                        suffixes:@[ NSNull.null, NSNull.null ]
-                           error:&error];
-        assert(update && [journal commitUpdate:update error:&error]);
-        assert([journal consumeUpdate:update error:&error] && !error);
-    }
+    error = nil;
+    assert(![ref prepareCompletedProgress:cursor error:&error] && error);
+    failures++;
+    error = nil;
+    NV2AMetalPendingUpdate *completed =
+        [j prepareCompletedProgress:cursor error:&error];
+    NV2AMetalPendingPlan *referencePlan =
+        [ref planInputs:inputs preservingLastArray:YES error:&error];
+    NV2AMetalPendingUpdate *referenceUpdate =
+        [ref preparePlan:referencePlan
+                suffixes:@[ NSNull.null, NSNull.null ]
+                   error:&error];
+    assert(completed && referenceUpdate && !error &&
+           [completed.streams isEqual:referenceUpdate.streams] &&
+           completed.streams[1] == j.retainedStreams[1]);
+    assert([j commitUpdate:completed error:&error] &&
+           [ref commitUpdate:referenceUpdate error:&error]);
+    assert(![j prepareCompletedProgress:cursor error:&error] && error);
+    failures++;
+    error = nil;
+    assert([j consumeUpdate:completed error:&error] &&
+           [ref consumeUpdate:referenceUpdate error:&error] && !error);
+    progress_equal(j, ref);
     uint32_t words[] = { 30, 31, 7 };
     inputs = @[ indices(words, 3) ];
     cursor = progress_begin(j, inputs);
@@ -190,7 +204,7 @@ static void pending_progress_contracts(void)
     progress_reference(ref, inputs, 0, span);
     progress_equal(j, ref);
     comparisons++;
-    NSError *error = nil;
+    error = nil;
     cursor = progress_begin(j, inputs);
     assert(![ref commitNextSuffix:nil progress:cursor error:&error] && error);
     failures++;

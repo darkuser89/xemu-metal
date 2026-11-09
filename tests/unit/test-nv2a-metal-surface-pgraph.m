@@ -10,6 +10,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #pragma clang diagnostic pop
 #import "hw/xbox/nv2a/pgraph/metal/surface-pgraph.h"
+#import <objc/runtime.h>
 
 static NV2AState *state;
 static MemAccessCallback *hook;
@@ -181,6 +182,89 @@ static void clear(NV2AMetalPGRAPHSurfaces *s)
     require([s markColorWritten:YES zetaWritten:s.zeta != nil error:&error],
             error);
 }
+
+static unsigned release_downloads, release_submits, release_waits;
+static BOOL (*release_download)(id, SEL, id<MTLBuffer>, NSUInteger, BOOL, BOOL,
+                                BOOL, NV2AMetalCommands *, NSError **);
+static BOOL (*release_submit)(id, SEL, NSError **);
+static BOOL (*release_wait)(id, SEL, NV2AMetalSubmission *, NSError **);
+
+static BOOL release_fail_second_download(id object, SEL selector,
+                                        id<MTLBuffer> destination,
+                                        NSUInteger offset, BOOL swizzle,
+                                        BOOL flip, BOOL downscale,
+                                        NV2AMetalCommands *commands,
+                                        NSError **error)
+{
+    if (++release_downloads == 2) {
+        if (error)
+            *error = [NSError errorWithDomain:@"test.surface-release"
+                                         code:1
+                                     userInfo:nil];
+        return NO;
+    }
+    return release_download(object, selector, destination, offset, swizzle, flip,
+                            downscale, commands, error);
+}
+
+static BOOL release_count_submit(id object, SEL selector, NSError **error)
+{
+    release_submits++;
+    return release_submit(object, selector, error);
+}
+
+static BOOL release_count_wait(id object, SEL selector,
+                               NV2AMetalSubmission *submission, NSError **error)
+{
+    release_waits++;
+    return release_wait(object, selector, submission, error);
+}
+
+static void release_color_depth(NV2AMetalPGRAPHSurfaces *surfaces)
+{
+    NV2AMetalCommands *commands = surfaces.cache.commands;
+    NV2AMetalSubmission *previous = commands.lastSubmitted;
+    NV2AMetalSurfaceRecording *clear_recording = surfaces.cache.recording;
+    PGRAPHState *pg = &state->pgraph;
+    const unsigned vga_before = vga_dirty, texture_before = texture_dirty;
+    NSError *error = nil;
+    Method download = class_getInstanceMethod(
+        NV2AMetalSurfaceTransfer.class,
+        @selector(encodeDownloadToBuffer:offset:swizzle:flip:downscale:commands:error:));
+    Method submit = class_getInstanceMethod(
+        NV2AMetalCommands.class, @selector(submitWithError:));
+    Method wait = class_getInstanceMethod(
+        NV2AMetalCommands.class, @selector(waitForSubmission:error:));
+    release_download = (void *)method_setImplementation(
+        download, (IMP)release_fail_second_download);
+    release_submit = (void *)method_setImplementation(
+        submit, (IMP)release_count_submit);
+    release_wait = (void *)method_setImplementation(wait, (IMP)release_count_wait);
+    release_downloads = release_submits = release_waits = 0;
+    assert(![surfaces releaseColor:NO zeta:NO error:&error] &&
+           [error.domain isEqualToString:@"test.surface-release"]);
+    method_setImplementation(download, (IMP)release_download);
+    assert(release_downloads == 2 && !release_submits && !release_waits &&
+           commands.lastSubmitted == previous &&
+           commands.sealedBufferCount == 1 && !clear_recording.submitted);
+    assert(surfaces.color.dirty && surfaces.zeta.dirty &&
+           pg->surface_color.draw_dirty && pg->surface_zeta.draw_dirty &&
+           vga_dirty == vga_before && texture_dirty == texture_before);
+    error = nil;
+    require([surfaces releaseColor:NO zeta:NO error:&error], error);
+    method_setImplementation(submit, (IMP)release_submit);
+    method_setImplementation(wait, (IMP)release_wait);
+    assert(release_submits == 1 && release_waits == 1 &&
+           clear_recording.submitted && commands.lastSubmitted != previous);
+    assert(!surfaces.color.dirty && !surfaces.zeta.dirty &&
+           !pg->surface_color.draw_dirty && !pg->surface_zeta.draw_dirty &&
+           vga_dirty == vga_before + 2 && texture_dirty == texture_before + 2);
+    assert(!memcmp(state->vram_ptr + 576, (uint8_t[]){255, 0, 255, 255}, 4) &&
+           !memcmp(state->vram_ptr + 4160, (uint8_t[]){255, 255}, 2));
+    puts("Unmonitored CPU release: color/depth share one submit and wait; "
+         "failed second download preserves both dirty surfaces, exact retry PASS");
+}
+
 static void replacement_bindings(NV2AMetalPGRAPHSurfaces *surfaces)
 {
     NSError *error = nil;
@@ -381,6 +465,86 @@ static void clear_register_tests(NV2AMetalPGRAPHSurfaces *surfaces)
     checks++;
 }
 
+static void clear_upload_tests(NV2AMetalPGRAPHSurfaces *surfaces)
+{
+    NSError *error = nil;
+    PGRAPHState *pg = &state->pgraph;
+    SurfaceShape original = pg->surface_shape;
+    pg->surface_shape = (SurfaceShape){
+        .color_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+        .zeta_format = NV097_SET_SURFACE_FORMAT_ZETA_Z24S8,
+        .clip_width = 8,
+        .clip_height = 4,
+    };
+    pg->surface_zeta.pitch = 40;
+    pg->regs_[NV_PGRAPH_CLEARRECTX] = 7 << 16;
+    pg->regs_[NV_PGRAPH_CLEARRECTY] = 3 << 16;
+    pg->regs_[NV_PGRAPH_COLORCLEARVALUE] = 0x6612abff;
+    pg->regs_[NV_PGRAPH_ZSTENCILCLEARVALUE] = 0x1234565a;
+    const uint32_t all = NV097_CLEAR_SURFACE_COLOR | NV097_CLEAR_SURFACE_Z |
+                         NV097_CLEAR_SURFACE_STENCIL;
+    const NSUInteger colorAddress =
+        color_dma.address + pg->surface_color.offset;
+    const NSUInteger zetaAddress = zeta_dma.address + pg->surface_zeta.offset;
+    memset(state->vram_ptr + colorAddress, 0x31, 4 * 40);
+    memset(state->vram_ptr + zetaAddress, 0x31, 4 * 40);
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NSData *reads = [cache valueForKey:@"pendingReads"];
+    require([surfaces clearSurface:all error:&error], error);
+    assert(!reads.length && surfaces.color.dirty && surfaces.zeta.dirty);
+    [cache cancel];
+    assert(surfaces.color.needsUpload && surfaces.zeta.needsUpload &&
+           !surfaces.color.dirty && !surfaces.zeta.dirty);
+    assert(ldl_le_p(state->vram_ptr + colorAddress) == 0x31313131 &&
+           ldl_le_p(state->vram_ptr + zetaAddress) == 0x31313131);
+    require([surfaces clearSurface:all error:&error], error);
+    assert(!reads.length);
+    expected_zeta_byte = 0x5a;
+    require([surfaces flushWithError:&error], error);
+    for (unsigned y = 0; y < 4; y++) {
+        for (unsigned x = 0; x < 8; x++) {
+            assert(ldl_le_p(state->vram_ptr + colorAddress + y * 40 + x * 4) ==
+                   0x6612abff);
+            assert(ldl_le_p(state->vram_ptr + zetaAddress + y * 40 + x * 4) ==
+                   0x1234565a);
+        }
+        assert(ldq_le_p(state->vram_ptr + colorAddress + y * 40 + 32) ==
+               UINT64_C(0x3131313131313131));
+        assert(ldq_le_p(state->vram_ptr + zetaAddress + y * 40 + 32) ==
+               UINT64_C(0x3131313131313131));
+    }
+
+    pg->regs_[NV_PGRAPH_ZSTENCILCLEARVALUE] = 0xffffff00;
+    require([surfaces clearSurface:NV097_CLEAR_SURFACE_Z error:&error], error);
+    assert(reads.length);
+    require([surfaces flushWithError:&error], error);
+    assert((uint32_t)ldl_le_p(state->vram_ptr + zetaAddress) == 0xffffff5a);
+
+    require([surfaces prepareColor:YES zeta:NO error:&error], error);
+    NV2AMetalCachedSurface *larger = surfaces.color;
+    [cache cancel];
+    /* Submission retains the old read list and starts a new one. */
+    reads = [cache valueForKey:@"pendingReads"];
+    assert(larger.needsUpload && !reads.length);
+    pg->surface_shape.clip_width = 4;
+    pg->regs_[NV_PGRAPH_CLEARRECTX] = 3 << 16;
+    pg->regs_[NV_PGRAPH_COLORCLEARVALUE] = 0xff107eff;
+    require([surfaces clearSurface:NV097_CLEAR_SURFACE_COLOR error:&error],
+            error);
+    assert(surfaces.color == larger && reads.length);
+    require([surfaces flushWithError:&error], error);
+    for (unsigned y = 0; y < 4; y++)
+        for (unsigned x = 0; x < 8; x++)
+            assert((uint32_t)ldl_le_p(state->vram_ptr + colorAddress + y * 40 +
+                                      x * 4) ==
+                   (x < 4 ? 0xff107eff : 0x6612abff));
+    pg->surface_shape = original;
+    pg->surface_zeta.pitch = 24;
+    puts("PGRAPH clear uploads: full color/depth/stencil skips both uploads; "
+         "cancel/retry, pitch tails, depth-only stencil and larger reuse PASS");
+    checks++;
+}
+
 static QemuMutex test_bql;
 static __thread bool test_bql_held;
 bool bql_locked(void)
@@ -431,7 +595,9 @@ static void *crossing_cpu_read(void *opaque)
     return NULL;
 }
 
-int main(void)
+#include "test-metal-color-zeta-binding.h"
+
+int main(int argc, char **argv)
 {
     @autoreleasepool {
         state = g_new0(NV2AState, 1);
@@ -474,6 +640,21 @@ int main(void)
         require(surfaces != nil, error);
         assert(!hook && surfaces.cache.vram.contents == state->vram_ptr);
         qemu_mutex_lock(&pg->lock);
+        if (argc == 2 && !strcmp(argv[1], "--color-zeta-identity")) {
+            color_zeta_binding_tests(surfaces);
+            require([surfaces closeWithError:&error], error);
+            assert(!hook);
+            qemu_mutex_unlock(&pg->lock);
+            surfaces = nil;
+            qemu_event_destroy(&kicked);
+            qemu_mutex_destroy(&pg->lock);
+            qemu_mutex_destroy(&state->pfifo.lock);
+            qemu_mutex_destroy(&test_bql);
+            free(state->vram_ptr);
+            g_free(state->vram);
+            g_free(state);
+            return 0;
+        }
         require([surfaces prepareColor:YES zeta:YES error:&error], error);
         assert(registered_hooks->len == 1 && hook->addr == 0 &&
                hook->len == 8192);
@@ -571,6 +752,10 @@ int main(void)
         NV2AMetalCachedSurface *old = surfaces.color;
         pg->frame_time = 5;
         require([surfaces prepareColor:YES zeta:NO error:&error], error);
+        /* Eviction with a CPU hook submits writebacks asynchronously. */
+        require([surfaces.cache
+                    waitForSubmission:surfaces.cache.commands.lastSubmitted
+                                error:&error], error);
         assert(!old.valid && surfaces.color.valid && vga_dirty == 2);
         checks++;
         clear(surfaces);
@@ -590,13 +775,12 @@ int main(void)
         tcg_allowed = false;
         pg->surface_color.write_enabled_cache = true;
         pg->surface_zeta.write_enabled_cache = true;
-        require([surfaces releaseColor:NO zeta:NO error:&error], error);
-        assert(!surfaces.color.dirty && !surfaces.zeta.dirty);
-        puts("Unmonitored CPU release: synchronous color/depth download PASS");
+        release_color_depth(surfaces);
         tcg_allowed = true;
         require([surfaces flushWithError:&error], error);
         replacement_bindings(surfaces);
         clear_register_tests(surfaces);
+        clear_upload_tests(surfaces);
         require([surfaces.cache prepareGPUReadAtAddress:32768
                                                  length:16
                                                   error:&error],
@@ -647,6 +831,7 @@ int main(void)
                "held PASS\n");
         printf("Dynamic CPU hooks: initially absent, GPU sources/targets "
                "protected, adjacent ranges merged PASS\n");
+        color_zeta_binding_tests(surfaces);
         require([surfaces closeWithError:&error], error);
         require([surfaces closeWithError:&error], error);
         assert(!hook);

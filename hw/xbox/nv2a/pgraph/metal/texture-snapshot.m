@@ -146,27 +146,18 @@ BOOL nv2a_metal_texture_snapshot_validate(NSData *data, NSError **error)
     TextureLayout image;
     return decode(data, &image, error);
 }
-static BOOL transfer(id<MTLTexture> texture, id<MTLBuffer> buffer,
-                     const TextureLayout *image, BOOL upload,
-                     NV2AMetalCommands *commands, NSError **error)
+static BOOL encode_transfer(id<MTLTexture> texture, id<MTLBuffer> buffer,
+                            const TextureLayout *image, BOOL upload,
+                            NV2AMetalCommands *commands, NSError **error)
 {
-    if (commands.commandBuffer)
-        return snapshot_error(error,
-                              @"Texture snapshot needs an idle recording");
-    if (![commands beginWithError:error])
-        return NO;
     if (![commands addResource:texture error:error] ||
-        ![commands addResource:buffer error:error]) {
-        [commands cancel];
+        ![commands addResource:buffer error:error])
         return NO;
-    }
     id<MTL4ComputeCommandEncoder> encoder =
         [commands.commandBuffer computeCommandEncoder];
-    if (!encoder) {
-        [commands cancel];
+    if (!encoder)
         return snapshot_error(error,
                               @"Cannot encode texture snapshot transfer");
-    }
     [encoder barrierAfterQueueStages:MTLStageAll
                         beforeStages:MTLStageBlit
                    visibilityOptions:MTL4VisibilityOptionDevice];
@@ -200,78 +191,66 @@ static BOOL transfer(id<MTLTexture> texture, id<MTLBuffer> buffer,
               beforeQueueStages:MTLStageAll
               visibilityOptions:MTL4VisibilityOptionDevice];
     [encoder endEncoding];
-    if (![commands submitWithError:error] ||
-        ![commands waitUntilIdleWithError:error]) {
-        [commands cancel];
-        return NO;
-    }
     return YES;
 }
-NSData *nv2a_metal_texture_snapshot(id<MTLTexture> texture,
-                                    NV2AMetalCommands *commands,
-                                    NSError **error)
+static BOOL snapshot_layout(id<MTLTexture> texture, id<MTLDevice> device,
+                            TextureLayout *image, NSError **error)
 {
     unsigned type = texture.textureType == MTLTextureType2D   ? 1 :
                     texture.textureType == MTLTextureType3D   ? 2 :
                     texture.textureType == MTLTextureTypeCube ? 3 :
                                                                 0;
-    TextureLayout image;
     unsigned storage;
     if (!texture || !nv2a_metal_texture_storage(texture, &storage) ||
-        texture.device != commands.device || texture.sampleCount != 1 ||
+        texture.device != device || texture.sampleCount != 1 ||
         texture.arrayLength != 1 ||
         !layout(type, (unsigned)texture.width, (unsigned)texture.height,
                 (unsigned)texture.depth, (unsigned)texture.mipmapLevelCount,
-                storage, &image, error)) {
-        snapshot_error(error,
-                       @"Snapshot requires a supported native texture layout");
-        return nil;
-    }
-    if (image.stagingSize > commands.device.maxBufferLength) {
-        snapshot_error(error, @"Texture snapshot exceeds device buffer length");
-        return nil;
-    }
-    id<MTLBuffer> buffer =
-        [commands.device newBufferWithLength:image.stagingSize
-                                     options:MTLResourceStorageModeShared];
-    if (!buffer || !transfer(texture, buffer, &image, NO, commands, error))
-        return nil;
+                storage, image, error))
+        return snapshot_error(error,
+                              @"Snapshot requires a supported native texture layout");
+    if (image->stagingSize > device.maxBufferLength)
+        return snapshot_error(error, @"Texture snapshot exceeds device buffer length");
+    return YES;
+}
+
+static NSData *pack_snapshot(id<MTLBuffer> buffer, const TextureLayout *image)
+{
     NSMutableData *data =
-        [NSMutableData dataWithLength:image.headerWords * 4 + image.packedSize];
+        [NSMutableData dataWithLength:image->headerWords * 4 + image->packedSize];
     uint32_t header[] = { 0x4d345458,
-                          image.storage == NV2AMetalTextureStorageFloat32 ? 1u :
+                          image->storage == NV2AMetalTextureStorageFloat32 ? 1u :
                                                                             2u,
-                          type,
-                          image.width,
-                          image.height,
-                          image.depth,
-                          image.levels,
-                          (uint32_t)(image.packedSize >> 32),
-                          (uint32_t)image.packedSize,
-                          image.storage };
-    unsigned wordBytes = image.storage == NV2AMetalTextureStorageHalf4 ||
-                                 image.bytesPerPixel == 2 ?
+                          image->type,
+                          image->width,
+                          image->height,
+                          image->depth,
+                          image->levels,
+                          (uint32_t)(image->packedSize >> 32),
+                          (uint32_t)image->packedSize,
+                          image->storage };
+    unsigned wordBytes = image->storage == NV2AMetalTextureStorageHalf4 ||
+                                 image->bytesPerPixel == 2 ?
                              2 :
                              4;
     uint8_t *output = data.mutableBytes;
-    for (unsigned i = 0; i < image.headerWords; i++)
+    for (unsigned i = 0; i < image->headerWords; i++)
         write_word(output + i * 4, header[i]);
-    for (unsigned i = 0; i < image.count; i++) {
-        TextureSlice s = image.slices[i];
+    for (unsigned i = 0; i < image->count; i++) {
+        TextureSlice s = image->slices[i];
         for (NSUInteger z = 0; z < s.depth; z++) {
             for (NSUInteger y = 0; y < s.height; y++) {
                 const uint8_t *source = (const uint8_t *)buffer.contents +
                                         s.offset + z * s.image + y * s.row;
                 uint8_t *target =
-                    output + image.headerWords * 4 + s.packedOffset +
-                    (z * s.height + y) * s.width * image.bytesPerPixel;
-                if (image.storage == NV2AMetalTextureStorageUnorm8 ||
-                    image.storage == NV2AMetalTextureStorageSnorm8) {
-                    memcpy(target, source, s.width * 4);
+                    output + image->headerWords * 4 + s.packedOffset +
+                    (z * s.height + y) * s.width * image->bytesPerPixel;
+                if (nv2a_metal_texture_storage_byte_lanes(image->storage)) {
+                    memcpy(target, source, s.width * image->bytesPerPixel);
                     continue;
                 }
                 for (NSUInteger x = 0;
-                     x < s.width * image.bytesPerPixel / wordBytes; x++) {
+                     x < s.width * image->bytesPerPixel / wordBytes; x++) {
                     if (wordBytes == 2) {
                         uint16_t word;
                         memcpy(&word, source + x * 2, 2);
@@ -288,58 +267,125 @@ NSData *nv2a_metal_texture_snapshot(id<MTLTexture> texture,
     }
     return [data copy];
 }
-id<MTLTexture> nv2a_metal_texture_restore(NSData *data,
-                                          NV2AMetalCommands *commands,
-                                          NSError **error)
+
+NSArray<NSData *> *nv2a_metal_texture_snapshot_images(
+    NSArray<id<MTLTexture>> *textures, NSUInteger byteLimit,
+    NV2AMetalCommands *commands, NSError **error)
 {
-    TextureLayout image;
-    if (!decode(data, &image, error))
-        return nil;
-    if (image.stagingSize > commands.device.maxBufferLength) {
-        snapshot_error(error, @"Texture snapshot exceeds device buffer length");
+    TextureLayout layouts[4];
+    const NSUInteger batchBytes = 64 * 1024 * 1024;
+    NSUInteger count = textures.count;
+    if (!count)
+        return @[];
+    if (count > sizeof(layouts) / sizeof(layouts[0]) ||
+        commands.commandBuffer || commands.sealedBufferCount) {
+        snapshot_error(error, @"Texture snapshots require up to four images and an idle recording");
         return nil;
     }
+    for (NSUInteger i = 0; i < count; i++) {
+        if (!snapshot_layout(textures[i], commands.device, &layouts[i], error))
+            return nil;
+        NSUInteger bytes = layouts[i].headerWords * 4 + layouts[i].packedSize;
+        if (bytes > byteLimit) {
+            snapshot_error(error, @"Texture snapshots exceed host memory bound");
+            return nil;
+        }
+        byteLimit -= bytes;
+    }
+
+    NSMutableArray<NSData *> *images = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger first = 0; first < count;) {
+        @autoreleasepool {
+            if (![commands beginWithError:error])
+                return nil;
+            id<MTLBuffer> buffers[4] = { nil };
+            NSUInteger next = first, stagingBytes = 0;
+            for (; next < count; next++) {
+                const TextureLayout *image = &layouts[next];
+                if (stagingBytes && (stagingBytes >= batchBytes ||
+                                     image->stagingSize > batchBytes - stagingBytes))
+                    break;
+                id<MTLBuffer> buffer = [commands.device
+                    newBufferWithLength:image->stagingSize
+                                options:MTLResourceStorageModeShared];
+                if (!buffer)
+                    snapshot_error(error, @"Cannot allocate texture snapshot staging");
+                if (!buffer || !encode_transfer(textures[next], buffer, image,
+                                                 NO, commands, error)) {
+                    [commands cancel];
+                    return nil;
+                }
+                buffers[next - first] = buffer;
+                stagingBytes += image->stagingSize;
+            }
+            if (![commands submitWithError:error] ||
+                ![commands waitUntilIdleWithError:error]) {
+                [commands cancel];
+                return nil;
+            }
+            for (NSUInteger i = first; i < next; i++)
+                [images addObject:pack_snapshot(buffers[i - first], &layouts[i])];
+            first = next;
+        }
+    }
+    return images;
+}
+
+NSData *nv2a_metal_texture_snapshot(id<MTLTexture> texture,
+                                    NV2AMetalCommands *commands,
+                                    NSError **error)
+{
+    if (!texture) {
+        snapshot_error(error, @"Snapshot requires a native texture");
+        return nil;
+    }
+    return nv2a_metal_texture_snapshot_images(@[ texture ], NSUIntegerMax,
+                                               commands, error).firstObject;
+}
+static id<MTLTexture> encode_restore(NSData *data, const TextureLayout *image,
+                                     NV2AMetalCommands *commands,
+                                     NSError **error)
+{
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor new];
-    descriptor.textureType = texture_type(image.type);
-    descriptor.pixelFormat = image.format;
-    descriptor.swizzle = nv2a_metal_texture_storage_swizzle(image.storage);
-    descriptor.width = image.width;
-    descriptor.height = image.height;
-    descriptor.depth = image.depth;
-    descriptor.mipmapLevelCount = image.levels;
+    descriptor.textureType = texture_type(image->type);
+    descriptor.pixelFormat = image->format;
+    descriptor.swizzle = nv2a_metal_texture_storage_swizzle(image->storage);
+    descriptor.width = image->width;
+    descriptor.height = image->height;
+    descriptor.depth = image->depth;
+    descriptor.mipmapLevelCount = image->levels;
     descriptor.storageMode = MTLStorageModePrivate;
     descriptor.usage =
         MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     id<MTLTexture> texture =
         [commands.device newTextureWithDescriptor:descriptor];
     id<MTLBuffer> buffer =
-        [commands.device newBufferWithLength:image.stagingSize
+        [commands.device newBufferWithLength:image->stagingSize
                                      options:MTLResourceStorageModeShared];
     if (!texture || !buffer) {
         snapshot_error(error, @"Cannot allocate texture snapshot resources");
         return nil;
     }
-    unsigned wordBytes = image.storage == NV2AMetalTextureStorageHalf4 ||
-                                 image.bytesPerPixel == 2 ?
+    unsigned wordBytes = image->storage == NV2AMetalTextureStorageHalf4 ||
+                                 image->bytesPerPixel == 2 ?
                              2 :
                              4;
     const uint8_t *input = data.bytes;
-    for (unsigned i = 0; i < image.count; i++) {
-        TextureSlice s = image.slices[i];
+    for (unsigned i = 0; i < image->count; i++) {
+        TextureSlice s = image->slices[i];
         for (NSUInteger z = 0; z < s.depth; z++) {
             for (NSUInteger y = 0; y < s.height; y++) {
                 const uint8_t *source =
-                    input + image.headerWords * 4 + s.packedOffset +
-                    (z * s.height + y) * s.width * image.bytesPerPixel;
+                    input + image->headerWords * 4 + s.packedOffset +
+                    (z * s.height + y) * s.width * image->bytesPerPixel;
                 uint8_t *target = (uint8_t *)buffer.contents + s.offset +
                                   z * s.image + y * s.row;
-                if (image.storage == NV2AMetalTextureStorageUnorm8 ||
-                    image.storage == NV2AMetalTextureStorageSnorm8) {
-                    memcpy(target, source, s.width * 4);
+                if (nv2a_metal_texture_storage_byte_lanes(image->storage)) {
+                    memcpy(target, source, s.width * image->bytesPerPixel);
                     continue;
                 }
                 for (NSUInteger x = 0;
-                     x < s.width * image.bytesPerPixel / wordBytes; x++) {
+                     x < s.width * image->bytesPerPixel / wordBytes; x++) {
                     if (wordBytes == 2) {
                         uint16_t word =
                             (uint16_t)source[x * 2] << 8 | source[x * 2 + 1];
@@ -352,6 +398,62 @@ id<MTLTexture> nv2a_metal_texture_restore(NSData *data,
             }
         }
     }
-    return transfer(texture, buffer, &image, YES, commands, error) ? texture :
-                                                                     nil;
+    return encode_transfer(texture, buffer, image, YES, commands, error) ?
+               texture : nil;
+}
+
+NSArray<id<MTLTexture>> *nv2a_metal_texture_restore_images(
+    NSArray<NSData *> *images, NV2AMetalCommands *commands, NSError **error)
+{
+    const NSUInteger batchBytes = 64 * 1024 * 1024;
+    if (!images.count)
+        return @[];
+    if (commands.commandBuffer) {
+        snapshot_error(error, @"Texture snapshot needs an idle recording");
+        return nil;
+    }
+
+    NSMutableArray<id<MTLTexture>> *textures =
+        [NSMutableArray arrayWithCapacity:images.count];
+    NSUInteger pending = 0;
+    for (NSData *data in images) {
+        TextureLayout image;
+        if (!decode(data, &image, error))
+            goto fail;
+        if (image.stagingSize > commands.device.maxBufferLength) {
+            snapshot_error(error, @"Texture snapshot exceeds device buffer length");
+            goto fail;
+        }
+        /* Keep padded staging bounded while still allowing a large image to
+         * use a dedicated submission, as in the single-image path. */
+        if (pending && (pending >= batchBytes ||
+                        image.stagingSize > batchBytes - pending)) {
+            if (![commands submitWithError:error] ||
+                ![commands waitUntilIdleWithError:error])
+                goto fail;
+            pending = 0;
+        }
+        if (!pending && ![commands beginWithError:error])
+            goto fail;
+        id<MTLTexture> texture = encode_restore(data, &image, commands, error);
+        if (!texture)
+            goto fail;
+        [textures addObject:texture];
+        pending += image.stagingSize;
+    }
+    if (![commands submitWithError:error] ||
+        ![commands waitUntilIdleWithError:error])
+        goto fail;
+    return textures;
+fail:
+    [commands cancel];
+    return nil;
+}
+
+id<MTLTexture> nv2a_metal_texture_restore(NSData *data,
+                                          NV2AMetalCommands *commands,
+                                          NSError **error)
+{
+    return nv2a_metal_texture_restore_images(@[ data ], commands, error)
+        .firstObject;
 }

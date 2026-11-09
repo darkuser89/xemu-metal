@@ -10,6 +10,9 @@
 #include "hw/xbox/nv2a/pgraph/psh_regs.h"
 #import "hw/xbox/nv2a/pgraph/metal/draw-pgraph.h"
 #import "hw/xbox/nv2a/pgraph/metal/fetch-pgraph.h"
+#import "hw/xbox/nv2a/pgraph/metal/lru-cache.h"
+#import "hw/xbox/nv2a/pgraph/metal/pending-journal.h"
+#import "hw/xbox/nv2a/pgraph/metal/pixel-pgraph.h"
 #import "hw/xbox/nv2a/pgraph/metal/pixel-shader.h"
 
 static NV2AState *state;
@@ -20,8 +23,8 @@ static CPUState cpu;
 static DMAObject dma[5];
 static bool texture_dirty[16];
 static unsigned groups, draws, rejected, notifications;
-static uint32_t reported, report_values[64];
-static bool report_seen[64];
+static unsigned report_dma_loads;
+static hwaddr report_remap_after_load;
 static const char *active_case = "setup";
 bool tcg_allowed = true;
 uint64_t memory_region_size(MemoryRegion *mr)
@@ -37,17 +40,37 @@ void *memory_region_get_ram_ptr(MemoryRegion *mr)
 DMAObject nv_dma_load(NV2AState *d, hwaddr object)
 {
     assert(d == state && object >= 16 && object <= 80 && object % 16 == 0);
-    return dma[object / 16 - 1];
+    DMAObject *entry = &dma[object / 16 - 1];
+    DMAObject snapshot = *entry;
+    if (object == d->pgraph.dma_report) {
+        report_dma_loads++;
+        if (report_remap_after_load) {
+            entry->address = report_remap_after_load;
+            report_remap_after_load = 0;
+        }
+    }
+    return snapshot;
 }
-void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
-                                         uint32_t result)
+
+static uint8_t *report_bytes(unsigned slot)
 {
-    unsigned offset = parameter & NV097_GET_REPORT_OFFSET;
-    assert(d == state && (parameter >> 24) == 1 && !(offset % 16) &&
-           offset / 16 < 64);
-    report_seen[offset / 16] = true;
-    report_values[offset / 16] = result;
-    reported = result; /* Full RAM layout is tested with real common PGRAPH. */
+    hwaddr object = state->pgraph.dma_report;
+    assert(object >= 16 && object <= 80 && !(object % 16) && slot < 64);
+    return state->vram_ptr + (dma[object / 16 - 1].address & 0x07ffffff) +
+           slot * 16;
+}
+
+static bool report_was_written(unsigned slot)
+{
+    const uint8_t *bytes = report_bytes(slot);
+    return ldq_le_p(bytes) == UINT64_C(0x0011223344556677) &&
+           !ldl_le_p(bytes + 12);
+}
+
+static uint32_t report_value(unsigned slot)
+{
+    assert(report_was_written(slot));
+    return ldl_le_p(report_bytes(slot) + 8);
 }
 hwaddr nv_clip_gpu_tile_blit(NV2AState *d, hwaddr address, hwaddr length)
 {
@@ -1243,7 +1266,7 @@ static void failure_and_lifecycle(void)
             draws++;
             require([draw.reports getReport:1u << 24 error:&error], error);
             require([draw.reports processWithError:&error], error);
-            assert(reported == 28 && pg->draw_time == 1);
+            assert(report_value(0) == 28 && pg->draw_time == 1);
             qemu_mutex_unlock(&pg->lock);
             color(1, 1, 0xffff0000); // Counting did not read back color pixels.
             read_vram(1024, 256);
@@ -1307,8 +1330,8 @@ static void failure_and_lifecycle(void)
 #import "hw/xbox/nv2a/pgraph/metal/vertex-pgraph.h"
 #import "hw/xbox/nv2a/pgraph/metal/geometry.h"
 #include <objc/runtime.h>
-static id fail_geometry(id owner, SEL selector, id<MTLBuffer> vertices,
-                        NSUInteger firstVertex, NSUInteger count,
+static unsigned fail_geometry_calls;
+static id fail_geometry(id owner, SEL selector, NV2AMetalVertexSlice *slice,
                         enum NV2AMetalPrimitive primitive,
                         const NV2AMetalGeometryRasterConfig *config,
                         BOOL smooth, BOOL first, BOOL perspective,
@@ -1316,15 +1339,14 @@ static id fail_geometry(id owner, SEL selector, id<MTLBuffer> vertices,
 {
     (void)owner;
     (void)selector;
-    (void)vertices;
-    (void)firstVertex;
-    (void)count;
+    (void)slice;
     (void)primitive;
     (void)config;
     (void)smooth;
     (void)first;
     (void)perspective;
     (void)commands;
+    fail_geometry_calls++;
     if (error)
         *error = [NSError errorWithDomain:@"xemu.test.geometry-fault"
                                      code:1
@@ -1479,13 +1501,14 @@ static void context_boundary_tests(void)
     error = nil;
     Method method = class_getInstanceMethod(
         [NV2AMetalGeometry class],
-        @selector(encodeNativeRasterVertices:first:count:primitive:config:
-                  smooth:firstProvoking:zPerspective:commands:error:));
+        @selector(encodeNativeRasterSlice:primitive:config:smooth:
+                  firstProvoking:zPerspective:commands:error:));
     assert(method);
+    unsigned beforeGeometry = fail_geometry_calls;
     IMP original = method_setImplementation(method, (IMP)fail_geometry);
     BOOL ok = [draw flushDrawWithError:&error];
     method_setImplementation(method, original);
-    assert(!ok && error);
+    assert(!ok && error && fail_geometry_calls == beforeGeometry + 1);
 
     expect_context(191, 15, 3, YES);
     NV2AMetalPGRAPHVertexState *retained =
@@ -1505,19 +1528,23 @@ static BOOL injected_draw_failure(BOOL active, NSError **error)
 {
     Method method = class_getInstanceMethod(
         [NV2AMetalGeometry class],
-        @selector(encodeNativeRasterVertices:first:count:primitive:config:
-                  smooth:firstProvoking:zPerspective:commands:error:));
+        @selector(encodeNativeRasterSlice:primitive:config:smooth:
+                  firstProvoking:zPerspective:commands:error:));
     assert(method);
+    unsigned beforeGeometry = fail_geometry_calls;
     IMP original = method_setImplementation(method, (IMP)fail_geometry);
     BOOL ok =
         active ? [draw flushDrawWithError:error] : [draw drawWithError:error];
     method_setImplementation(method, original);
+    assert(fail_geometry_calls == beforeGeometry + 1);
     return ok;
 }
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *(*retry_fetch_original)(
-    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, NSError **);
+    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, BOOL, uint64_t,
+    NSError **);
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *(*retry_inline_original)(
-    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, NSError **);
+    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, BOOL, uint64_t,
+    NSError **);
 static NSUInteger retry_fetch_expected;
 static unsigned retry_fetch_cases;
 static uint64_t retry_fetch_saved;
@@ -1544,18 +1571,27 @@ static NV2AMetalFetchResult *retry_capture_probe(
         assert(count == captured &&
                current ==
                    (retry_capture_gpu_current ? captured - 1 : NSNotFound) &&
-               first == 0 && indexOffset == 0);
+               first == 0);
         assert(prefix == (retry_fetch_kind ?
                               captured - retry_fetch_expected :
                               retry_capture_input - retry_fetch_expected));
+        if (retry_fetch_kind != 1 || !captured)
+            assert(!indices && indexOffset == 0);
         if (retry_fetch_kind == 1) {
-            assert(indexSize == (captured ? 4u : 0u) &&
-                   indices.length == captured * 4);
-            if (!captured)
-                assert(!indices);
-            retry_capture_saved += retry_capture_input * 4 - indices.length;
+            assert(indexSize == (captured ? sizeof(uint32_t) : 0));
+            if (captured) {
+                NSUInteger bytes = captured * sizeof(uint32_t);
+                NSUInteger firstIndex = retry_capture_input - captured;
+                assert(indices && indexOffset % sizeof(uint32_t) == 0 &&
+                       indexOffset <= indices.length &&
+                       bytes <= indices.length - indexOffset);
+                assert(!memcmp((const char *)indices.contents + indexOffset,
+                               state->pgraph.inline_elements + firstIndex,
+                               bytes));
+            }
+            retry_capture_saved +=
+                (retry_capture_input - captured) * sizeof(uint32_t);
         } else if (retry_fetch_kind >= 2) {
-            assert(!indices);
             if (!captured ||
                 (retry_fetch_kind == 2 &&
                  !state->pgraph.vertex_attributes[0].inline_buffer_populated)) {
@@ -1594,35 +1630,38 @@ static void retry_fetch_check(NSArray<NV2AMetalPGRAPHFetchBatch *> *batches,
     assert(batch.fetch.attributes.length ==
            records * sizeof(NV2AMetalProgramInput));
     assert(batch.fetch.faults.length ==
-           (records ? records + 1 : 0) * sizeof(uint32_t));
-    retry_fetch_saved +=
-        prefix * (sizeof(NV2AMetalProgramInput) + sizeof(uint32_t));
+           (records ? sizeof(uint32_t) : 0));
+    retry_fetch_saved += prefix * sizeof(NV2AMetalProgramInput);
     retry_fetch_cases++;
 }
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *
 retry_inline_probe(id object, SEL selector, NSArray<NSNumber *> *prefixes,
-                   NV2AMetalPendingInput *input, NSError **error)
+                   NV2AMetalPendingInput *input, BOOL readonly,
+                   uint64_t proofLanes, NSError **error)
 {
+    (void)readonly;
     retry_capture_input =
         prefixes[0].unsignedIntegerValue + retry_fetch_expected;
     retry_capture_active = YES;
     retry_capture_gpu_current = NO;
-    NSArray *batches =
-        retry_inline_original(object, selector, prefixes, input, error);
+    NSArray *batches = retry_inline_original(object, selector, prefixes, input,
+                                             NO, proofLanes, error);
     retry_capture_active = NO;
     retry_fetch_check(batches, prefixes, NO, error);
     return batches;
 }
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *
 retry_fetch_probe(id object, SEL selector, NSArray<NSNumber *> *prefixes,
-                  NV2AMetalPendingInput *input, NSError **error)
+                  NV2AMetalPendingInput *input, BOOL readonly,
+                  uint64_t proofLanes, NSError **error)
 {
+    (void)readonly;
     retry_capture_input =
         prefixes[0].unsignedIntegerValue + retry_fetch_expected;
     retry_capture_active = YES;
     retry_capture_gpu_current = YES;
-    NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
-        retry_fetch_original(object, selector, prefixes, input, error);
+    NSArray<NV2AMetalPGRAPHFetchBatch *> *batches = retry_fetch_original(
+        object, selector, prefixes, input, NO, proofLanes, error);
     retry_capture_active = NO;
     retry_fetch_check(batches, prefixes, YES, error);
     return batches;
@@ -1631,13 +1670,15 @@ static void pending_retry_tests(void)
 {
     Method fetchMethod = class_getInstanceMethod(
         NV2AMetalPGRAPHFetch.class,
-        @selector(encodeIndependentSnapshotsWithPrefixes:indexedInput:error:));
+        @selector(encodeIndependentSnapshotsWithPrefixes:indexedInput:
+                  deduplicateReadonly:proofAttributeLanes:error:));
     assert(fetchMethod);
     retry_fetch_original =
         (void *)method_setImplementation(fetchMethod, (IMP)retry_fetch_probe);
     Method inlineMethod = class_getInstanceMethod(
         NV2AMetalPGRAPHFetch.class,
-        @selector(encodeCurrentSnapshotsWithPrefixes:indexedInput:error:));
+        @selector(encodeCurrentSnapshotsWithPrefixes:indexedInput:
+                  deduplicateReadonly:proofAttributeLanes:error:));
     assert(inlineMethod);
     retry_inline_original =
         (void *)method_setImplementation(inlineMethod, (IMP)retry_inline_probe);
@@ -2053,6 +2094,16 @@ static void fixed_nop_input_tests(void)
          "PASS");
 }
 
+static unsigned raw_hidden_plans;
+static NV2AMetalPendingPlan *(*raw_hidden_original_plan)(
+    id, SEL, NSArray<NV2AMetalPendingInput *> *, BOOL, NSError **);
+static NV2AMetalPendingPlan *raw_hidden_plan(
+    id object, SEL selector, NSArray<NV2AMetalPendingInput *> *inputs,
+    BOOL preserve, NSError **error)
+{
+    raw_hidden_plans++;
+    return raw_hidden_original_plan(object, selector, inputs, preserve, error);
+}
 static void raw_hidden_last_tests(void)
 {
     unsigned cases = 0;
@@ -2096,8 +2147,15 @@ static void raw_hidden_last_tests(void)
                             error);
                     require([draw beginWithError:&error], error);
                 }
+                Method plan = class_getInstanceMethod(
+                    NV2AMetalPendingJournal.class,
+                    @selector(planInputs:preservingLastArray:error:));
+                raw_hidden_original_plan = (void *)method_setImplementation(
+                    plan, (IMP)raw_hidden_plan);
+                raw_hidden_plans = 0;
                 pg->draw_arrays_length = 2;
                 require([draw flushDrawWithError:&error], error);
+                assert(raw_hidden_plans == 1);
                 expect_context(191, 15, 9, programmed && enabled);
                 pg->draw_arrays_length = 0;
                 pg->inline_elements_length = 4;
@@ -2109,7 +2167,10 @@ static void raw_hidden_last_tests(void)
                 expect_context(191, 15, 9, programmed && enabled);
                 pg->inline_elements[1] = 7;
                 error = nil;
+                raw_hidden_plans = 0;
                 require([draw endWithError:&error], error);
+                assert(raw_hidden_plans == 1);
+                method_setImplementation(plan, (IMP)raw_hidden_original_plan);
                 expect_context(191, 15, 10, programmed && enabled);
                 assert(!memcmp(original, pg->vertex_attributes,
                                sizeof(original)) &&
@@ -2123,7 +2184,7 @@ static void raw_hidden_last_tests(void)
     groups++;
     puts("Raw Surface0 hidden-last:8 fixed/program/write/restore cases; three "
          "ranges, N-1 consume, changed indexed-prefix rejection, suffix once "
-         "and Current/VRAM preserved PASS");
+         "and one plan per XF consume, Current/VRAM preserved PASS");
 }
 
 static void raw_pending_correlation_tests(void)
@@ -2219,16 +2280,188 @@ static NV2AMetalPixelDraw *(*group_original_encode)(
     BOOL, NV2AMetalCommands *, NSError **);
 static NSMutableSet *group_encoders;
 static unsigned group_calls, group_fail_at, group_emissions;
+static unsigned group_binding_exports, group_polygon_exports[3];
+static unsigned group_constant_uploads;
+static unsigned group_attachment_checks;
+static unsigned group_sample_checks, group_alias_at;
+static unsigned group_pipeline_lookups;
+static unsigned group_program_change_at;
+static __weak NV2AMetalLRUCache *group_pipeline_cache;
+static __weak NSData *group_pipeline_probe;
+static id (*group_original_pipeline_lookup)(id, SEL, id);
+static __weak id<MTLTexture> group_sampled;
+static __weak id<MTLTexture> group_color, group_fallback;
+static id<MTLSamplerState> group_sampler, group_alternate_sampler;
+static __weak id<MTLSamplerState> group_active_sampler;
+static unsigned group_sampler_change_at, group_texture_id_reads,
+                group_sampler_id_reads;
+static MTLResourceID (*group_original_texture_id)(id, SEL);
+static MTLResourceID (*group_original_sampler_id)(id, SEL);
+static __weak NV2AMetalDrawState *group_raster;
+static unsigned group_pipeline_retentions, group_raster_retentions,
+                group_depth_retentions;
+static unsigned group_sample_registrations, group_color_registrations,
+                group_fallback_registrations, group_sampler_retentions;
+static BOOL (*group_original_resource)(id, SEL, id<MTLResource>, NSError **);
+static BOOL (*group_original_keep_alive)(id, SEL, id, NSError **);
+static NSUInteger (*group_original_sample_count)(id, SEL);
+static id (*group_original_attachment)(id, SEL, NSUInteger);
+static id<MTLBuffer> (*group_original_upload)(
+    id, SEL, const void *, NSUInteger, NSUInteger *, NSError **);
+static BOOL (*group_original_bindings)(id, SEL, NV2AMetalPixelTexture *,
+                                       NSError **);
+static NV2AMetalPixelUniforms (*group_original_uniforms)(
+    id, SEL, enum NV2AMetalPolygonMode);
 static BOOL (*group_original_emit)(id, SEL, id<MTL4RenderCommandEncoder>,
                                    NV2AMetalCommands *, NSError **);
-static BOOL group_emit(id owner, SEL selector,
-                       id<MTL4RenderCommandEncoder> encoder,
-                       NV2AMetalCommands *commands, NSError **error)
+static BOOL (*group_original_range_emit)(id, SEL, id<MTL4RenderCommandEncoder>,
+                                         NV2AMetalCommands *, NSUInteger,
+                                         NSUInteger, NSError **);
+static BOOL group_bindings(id owner, SEL selector,
+                           NV2AMetalPixelTexture *bindings, NSError **error)
+{
+    group_binding_exports++;
+    return group_original_bindings(owner, selector, bindings, error);
+}
+static NV2AMetalPixelUniforms group_uniforms(id owner, SEL selector,
+                                             enum NV2AMetalPolygonMode mode)
+{
+    assert((unsigned)mode <= NV2AMetalPolygonLine);
+    group_polygon_exports[mode]++;
+    return group_original_uniforms(owner, selector, mode);
+}
+static id<MTLBuffer> group_upload(id owner, SEL selector, const void *bytes,
+                                  NSUInteger length, NSUInteger *offset,
+                                  NSError **error)
+{
+    if (length == sizeof(NV2AMetalPixelUniforms) +
+                  sizeof(NV2AMetalPixelStorageInfo) +
+                  sizeof(NV2AMetalPolygonProjection))
+        group_constant_uploads++;
+    return group_original_upload(owner, selector, bytes, length, offset, error);
+}
+static id group_attachment(id owner, SEL selector, NSUInteger index)
+{
+    if (index == 7)
+        group_attachment_checks++;
+    return group_original_attachment(owner, selector, index);
+}
+static NSUInteger group_sample_count(id owner, SEL selector)
+{
+    if (owner == group_sampled)
+        group_sample_checks++;
+    return group_original_sample_count(owner, selector);
+}
+static MTLResourceID group_texture_id(id owner, SEL selector)
+{
+    group_texture_id_reads += owner == group_sampled;
+    return group_original_texture_id(owner, selector);
+}
+static MTLResourceID group_sampler_id(id owner, SEL selector)
+{
+    group_sampler_id_reads += owner == group_active_sampler;
+    return group_original_sampler_id(owner, selector);
+}
+static BOOL group_resource(id owner, SEL selector, id<MTLResource> resource,
+                           NSError **error)
+{
+    group_sample_registrations += resource == group_sampled;
+    group_color_registrations += resource == group_color;
+    group_fallback_registrations += resource == group_fallback;
+    return group_original_resource(owner, selector, resource, error);
+}
+static BOOL group_keep_alive(id owner, SEL selector, id object, NSError **error)
+{
+    group_sampler_retentions +=
+        object == group_sampler || object == group_alternate_sampler;
+    if (group_raster) {
+        group_pipeline_retentions +=
+            [object conformsToProtocol:@protocol(MTLRenderPipelineState)];
+        group_raster_retentions += object == group_raster;
+        group_depth_retentions += object == group_raster.depthStencil;
+    }
+    return group_original_keep_alive(owner, selector, object, error);
+}
+static id group_pipeline_lookup(id owner, SEL selector, id key)
+{
+    if (owner == group_pipeline_cache) {
+        assert(key == group_pipeline_probe);
+        group_pipeline_lookups++;
+    }
+    return group_original_pipeline_lookup(owner, selector, key);
+}
+static unsigned group_viewport_writes, group_cull_writes, group_depth_writes;
+static void (*group_original_viewport)(id, SEL, MTLViewport);
+static void (*group_original_cull)(id, SEL, MTLCullMode);
+static void (*group_original_depth)(id, SEL, id<MTLDepthStencilState>);
+static void group_viewport(id owner, SEL selector, MTLViewport viewport)
+{
+    group_viewport_writes++;
+    group_original_viewport(owner, selector, viewport);
+}
+static void group_cull(id owner, SEL selector, MTLCullMode mode)
+{
+    group_cull_writes++;
+    group_original_cull(owner, selector, mode);
+}
+static void group_depth(id owner, SEL selector, id<MTLDepthStencilState> depth)
+{
+    group_depth_writes++;
+    group_original_depth(owner, selector, depth);
+}
+static BOOL group_emit_observed(id owner, SEL selector,
+                                id<MTL4RenderCommandEncoder> encoder,
+                                NV2AMetalCommands *commands, NSError **error,
+                                BOOL ranged, NSUInteger first, NSUInteger count)
 {
     assert(encoder);
     group_emissions++;
     [group_encoders addObject:encoder];
-    return group_original_emit(owner, selector, encoder, commands, error);
+    if (!group_sampler)
+        return ranged ?
+                   group_original_range_emit(owner, selector, encoder, commands,
+                                             first, count, error) :
+                   group_original_emit(owner, selector, encoder, commands,
+                                       error);
+    Class type = object_getClass(encoder);
+    Method viewport = class_getInstanceMethod(type, @selector(setViewport:));
+    Method cull = class_getInstanceMethod(type, @selector(setCullMode:));
+    Method depth =
+        class_getInstanceMethod(type, @selector(setDepthStencilState:));
+    assert(viewport && cull && depth);
+    group_viewport_writes = group_cull_writes = group_depth_writes = 0;
+    group_original_viewport =
+        (void *)method_setImplementation(viewport, (IMP)group_viewport);
+    group_original_cull =
+        (void *)method_setImplementation(cull, (IMP)group_cull);
+    group_original_depth =
+        (void *)method_setImplementation(depth, (IMP)group_depth);
+    BOOL ok =
+        ranged ? group_original_range_emit(owner, selector, encoder, commands,
+                                           first, count, error) :
+                 group_original_emit(owner, selector, encoder, commands, error);
+    method_setImplementation(viewport, (IMP)group_original_viewport);
+    method_setImplementation(cull, (IMP)group_original_cull);
+    method_setImplementation(depth, (IMP)group_original_depth);
+    unsigned expected = group_emissions == 1;
+    assert(group_viewport_writes == expected && group_cull_writes == expected &&
+           group_depth_writes == expected);
+    return ok;
+}
+static BOOL group_emit(id owner, SEL selector,
+                       id<MTL4RenderCommandEncoder> encoder,
+                       NV2AMetalCommands *commands, NSError **error)
+{
+    return group_emit_observed(owner, selector, encoder, commands, error, NO, 0,
+                               0);
+}
+static BOOL group_range_emit(id owner, SEL selector,
+                             id<MTL4RenderCommandEncoder> encoder,
+                             NV2AMetalCommands *commands, NSUInteger first,
+                             NSUInteger count, NSError **error)
+{
+    return group_emit_observed(owner, selector, encoder, commands, error, YES,
+                               first, count);
 }
 static NV2AMetalPixelDraw *group_encode(
     id owner, SEL selector, NV2AMetalGeometryResult *geometry,
@@ -2245,9 +2478,73 @@ static NV2AMetalPixelDraw *group_encode(
                                      userInfo:nil];
         return nil;
     }
-    return group_original_encode(owner, selector, geometry, offset, count,
-                                 uniforms, textures, pass, raster, rasterClass,
-                                 ignore, commands, error);
+    if (!group_sampler)
+        return group_original_encode(owner, selector, geometry, offset, count,
+                                     uniforms, textures, pass, raster,
+                                     rasterClass, ignore, commands, error);
+    Method attachment = class_getInstanceMethod(
+        object_getClass(pass.colorAttachments),
+        @selector(objectAtIndexedSubscript:));
+    assert(attachment);
+    group_original_attachment =
+        (void *)method_setImplementation(attachment, (IMP)group_attachment);
+    group_sampled = textures[0].texture;
+    group_raster = raster;
+    group_color = pass.colorAttachments[0].texture;
+    group_fallback = [[owner valueForKey:@"fallbacks"] valueForKey:@"dummy2D"];
+    Method sampleCount = class_getInstanceMethod(object_getClass(group_sampled),
+                                                 @selector(sampleCount));
+    assert(sampleCount);
+    group_original_sample_count =
+        (void *)method_setImplementation(sampleCount, (IMP)group_sample_count);
+    group_pipeline_cache = [owner valueForKey:@"fragmentPipelines"];
+    group_pipeline_probe = [owner valueForKey:@"fragmentLookupKey"];
+    Method lookup = class_getInstanceMethod(NV2AMetalLRUCache.class,
+                                            @selector(objectForKeyedSubscript:));
+    assert(lookup && group_pipeline_cache && group_pipeline_probe);
+    group_original_pipeline_lookup =
+        (void *)method_setImplementation(lookup, (IMP)group_pipeline_lookup);
+    NV2AMetalPixelTexture sliceTextures[4];
+    memcpy(sliceTextures, textures, sizeof(sliceTextures));
+    group_active_sampler = group_calls == group_sampler_change_at ?
+                               group_alternate_sampler : group_sampler;
+    sliceTextures[0].sampler = group_active_sampler;
+    Method textureID = class_getInstanceMethod(object_getClass(group_sampled),
+                                                @selector(gpuResourceID));
+    Method samplerID = class_getInstanceMethod(object_getClass(group_active_sampler),
+                                                @selector(gpuResourceID));
+    assert(textureID && samplerID && textureID != samplerID);
+    group_original_texture_id =
+        (void *)method_setImplementation(textureID, (IMP)group_texture_id);
+    group_original_sampler_id =
+        (void *)method_setImplementation(samplerID, (IMP)group_sampler_id);
+    if (group_calls == group_alias_at) {
+        sliceTextures[0].texture = group_color;
+    }
+    NV2AMetalPixelUniforms changedProgram;
+    if (group_calls == group_program_change_at) {
+        changedProgram = *uniforms;
+        /* B changes the compiled key, but A is zero, so the pixels agree. */
+        changedProgram.combiner.final_inputs[0] |= PS_REGISTER_ONE << 16;
+        uniforms = &changedProgram;
+    }
+    NV2AMetalPixelDraw *result =
+        group_original_encode(owner, selector, geometry, offset, count,
+                              uniforms, sliceTextures, pass, raster, rasterClass,
+                              ignore, commands, error);
+    method_setImplementation(attachment, (IMP)group_original_attachment);
+    method_setImplementation(sampleCount, (IMP)group_original_sample_count);
+    method_setImplementation(lookup, (IMP)group_original_pipeline_lookup);
+    method_setImplementation(textureID, (IMP)group_original_texture_id);
+    method_setImplementation(samplerID, (IMP)group_original_sampler_id);
+    NSDictionary *entries = [group_pipeline_cache valueForKey:@"entries"];
+    for (NSData *key in entries)
+        assert(key != group_pipeline_probe);
+    group_sampled = nil;
+    group_active_sampler = nil;
+    group_raster = nil;
+    group_color = group_fallback = nil;
+    return result;
 }
 static void render_group_contract_test(void)
 {
@@ -2259,30 +2556,118 @@ static void render_group_contract_test(void)
     Method emit = class_getInstanceMethod(
         NV2AMetalPixelDraw.class,
         @selector(encodeWithRenderEncoder:commands:error:));
-    assert(method && emit);
+    Method rangeEmit = class_getInstanceMethod(
+        NV2AMetalPixelDraw.class,
+        @selector(
+            encodeWithRenderEncoder:commands:firstVertex:vertexCount:error:));
+    Method bindings = class_getInstanceMethod(NV2AMetalPGRAPHPixelState.class,
+                                               @selector(copyTextureBindings:error:));
+    Method uniforms = class_getInstanceMethod(NV2AMetalPGRAPHPixelState.class,
+                                               @selector(uniformsForPolygon:));
+    Method upload = class_getInstanceMethod(NV2AMetalCommands.class,
+                                           @selector(uploadBytes:length:offset:error:));
+    Method resource = class_getInstanceMethod(NV2AMetalCommands.class,
+                                              @selector(addResource:error:));
+    Method keepAlive = class_getInstanceMethod(NV2AMetalCommands.class,
+                                               @selector(keepAlive:error:));
+    assert(method && emit && rangeEmit && bindings && uniforms && upload &&
+           resource && keepAlive);
+    MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
+    sampler.supportArgumentBuffers = YES;
+    sampler.minFilter = sampler.magFilter = MTLSamplerMinMagFilterLinear;
+    group_sampler =
+        [surfaces.cache.commands.device newSamplerStateWithDescriptor:sampler];
+    sampler.maxAnisotropy = 2;
+    group_alternate_sampler =
+        [surfaces.cache.commands.device newSamplerStateWithDescriptor:sampler];
+    assert(group_sampler && group_alternate_sampler &&
+           group_sampler != group_alternate_sampler);
     uint8_t reference[256];
-    for (unsigned attempt = 0; attempt < 3; attempt++) {
-        if (attempt != 2) {
+    for (unsigned attempt = 0; attempt < 7; attempt++) {
+        BOOL failed = attempt == 1 || attempt == 3;
+        BOOL changedProgram = attempt == 5;
+        BOOL changedSampler = attempt == 6;
+        if (!attempt || failed || changedProgram || changedSampler) {
             fixture();
             load_face_scene();
-            state->pgraph.regs_[NV_PGRAPH_SETUPRASTER] = 1 << 2;
+            /* Four real whole-geometry packets retain the third-call
+             * program/sampler changes after mixed packet consolidation. */
+            state->pgraph.draw_arrays_length = 2;
+            state->pgraph.draw_arrays_count[0] = 3;
+            state->pgraph.draw_arrays_start[1] = 3;
+            state->pgraph.draw_arrays_count[1] = 3;
+            texture_registers(NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8,
+                              32);
+            cpu_write(32768, 256);
+            memset(state->vram_ptr + 32768, 0x77, 256);
+            state->pgraph.regs_[NV_PGRAPH_SETUPRASTER] =
+                (1 << 2) | NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE;
+            state->pgraph.regs_[NV_PGRAPH_ZOFFSETBIAS] = 0x3f800000; /* 1.0 */
         }
         group_calls = group_emissions = 0;
+        group_binding_exports = group_constant_uploads = 0;
+        group_attachment_checks = group_sample_checks = 0;
+        group_pipeline_lookups = 0;
+        group_sample_registrations = group_color_registrations = 0;
+        group_fallback_registrations = group_sampler_retentions = 0;
+        group_pipeline_retentions = group_raster_retentions =
+            group_depth_retentions = 0;
+        group_texture_id_reads = group_sampler_id_reads = 0;
+        memset(group_polygon_exports, 0, sizeof(group_polygon_exports));
         group_fail_at = attempt == 1 ? 2 : 0;
+        group_alias_at = attempt == 3 ? 2 : 0;
+        group_program_change_at = changedProgram ? 3 : 0;
+        group_sampler_change_at = changedSampler ? 3 : 0;
         group_encoders = [NSMutableSet new];
         group_original_encode =
             (void *)method_setImplementation(method, (IMP)group_encode);
         group_original_emit =
             (void *)method_setImplementation(emit, (IMP)group_emit);
+        group_original_range_emit =
+            (void *)method_setImplementation(rangeEmit, (IMP)group_range_emit);
+        group_original_bindings =
+            (void *)method_setImplementation(bindings, (IMP)group_bindings);
+        group_original_uniforms =
+            (void *)method_setImplementation(uniforms, (IMP)group_uniforms);
+        group_original_upload =
+            (void *)method_setImplementation(upload, (IMP)group_upload);
+        group_original_resource =
+            (void *)method_setImplementation(resource, (IMP)group_resource);
+        group_original_keep_alive =
+            (void *)method_setImplementation(keepAlive, (IMP)group_keep_alive);
         qemu_mutex_lock(&state->pgraph.lock);
         BOOL ok = [draw drawWithError:&error];
         qemu_mutex_unlock(&state->pgraph.lock);
         method_setImplementation(method, (IMP)group_original_encode);
         method_setImplementation(emit, (IMP)group_original_emit);
-        assert(group_encoders.count == (attempt == 1 ? 0 : 1));
-        if (attempt == 1) {
+        method_setImplementation(rangeEmit, (IMP)group_original_range_emit);
+        method_setImplementation(bindings, (IMP)group_original_bindings);
+        method_setImplementation(uniforms, (IMP)group_original_uniforms);
+        method_setImplementation(upload, (IMP)group_original_upload);
+        method_setImplementation(resource, (IMP)group_original_resource);
+        method_setImplementation(keepAlive, (IMP)group_original_keep_alive);
+        assert(group_binding_exports == 1 &&
+               group_polygon_exports[NV2AMetalPolygonFill] == 1 &&
+               group_polygon_exports[NV2AMetalPolygonPoint] == 1 &&
+               group_polygon_exports[NV2AMetalPolygonLine] == 0);
+        assert(group_constant_uploads == (failed ? 1 : changedProgram ? 3 : 2));
+        unsigned expectedSamples = changedSampler ? 3 : 1;
+        assert(group_attachment_checks == 2 && group_sample_checks == expectedSamples);
+        assert(group_pipeline_lookups == (failed ? 1 : changedProgram ? 4 : 2));
+        assert(group_pipeline_retentions == group_pipeline_lookups &&
+               group_raster_retentions == 1 && group_depth_retentions == 1);
+        assert(group_sample_registrations == expectedSamples &&
+               group_color_registrations == 1 && group_fallback_registrations == 1 &&
+               group_sampler_retentions == expectedSamples);
+        assert(group_texture_id_reads == expectedSamples &&
+               group_sampler_id_reads == expectedSamples);
+        assert(group_encoders.count == (failed ? 0 : 1));
+        if (failed) {
             assert(!ok && !group_emissions && group_calls == 2 &&
-                   [error.domain isEqualToString:@"test.render-group"]);
+                   (attempt == 1 ?
+                        [error.domain isEqualToString:@"test.render-group"] :
+                        [error.localizedDescription isEqualToString:
+                            @"Invalid Metal pixel texture or feedback alias"]));
             assert(!surfaces.cache.commands.commandBuffer &&
                    state->pgraph.draw_time == 0);
             read_vram(1024, 256);
@@ -2301,8 +2686,16 @@ static void render_group_contract_test(void)
         }
         group_encoders = nil;
     }
+    group_sampler = group_alternate_sampler = nil;
+    group_program_change_at = 0;
     puts("PGRAPH render group: four ordered front/back topology slices use "
-         "one encoder; second-slice preparation failure opens no raster pass, "
+         "one encoder, one attachment/texture validation and two constant uploads; "
+         "two pipeline probes for a stable program; a changed program "
+         "checks the cache again; stable IDs reused, sampler changes rebind; "
+         "shared resource registrations and retention; "
+         "one viewport/cull/depth-stencil setup and one export per binding "
+         "set/polygon mode; "
+         "second-slice preparation failure or alias opens no raster pass, "
          "preserves "
          "draw time and retry reproduces 256 reference bytes PASS");
     groups++;
@@ -2320,9 +2713,52 @@ static void render_group_contract_test(void)
 #include "test-metal-draw-batches.h"
 #include "test-metal-begin-capture.h"
 #include "test-metal-textured-begin.h"
+#include "test-metal-palette-producers.h"
 #include "test-metal-inline-fixed.h"
 #include "test-metal-raster-chains.h"
 #include "test-metal-visibility-pool.h"
+#include "test-metal-indexed-readonly.h"
+#include "test-metal-bound-writer-pgraph.h"
+#include "test-metal-writer-chain-pgraph.h"
+#include "test-metal-quad-modes-pgraph.h"
+#include "test-metal-polygon-modes-pgraph.h"
+#include "test-metal-genuine-polygon-pgraph.h"
+#include "test-metal-compact-lines-pgraph.h"
+#include "test-metal-pgraph-producer-prefix.h"
+#include "test-metal-cpu-prefix-pgraph.h"
+#include "test-metal-prepared-ranges-pgraph.h"
+#include "test-metal-upload-prefix-pgraph.h"
+#include "test-metal-compact-polygon-wire-pgraph.h"
+#include "test-metal-compact-polygon-fill-pgraph.h"
+#include "test-metal-rtt-prefix-pgraph.h"
+#include "test-metal-index-capture-growth-pgraph.h"
+#include "test-metal-index-fallback-pgraph.h"
+#include "test-metal-fixed-uniform-pgraph.h"
+#include "test-metal-surface-pool-pgraph.h"
+#include "test-metal-inline-input-reuse-pgraph.h"
+#include "test-metal-zero-sample-query.h"
+#include "test-metal-never-sample-query.h"
+#include "test-metal-download-prefix-pgraph.h"
+#include "test-metal-completed-download-pgraph.h"
+#include "test-metal-float-proof-pgraph.h"
+#include "test-metal-array-float-windows-pgraph.h"
+#include "test-metal-float-summary-memo-pgraph.h"
+#include "test-metal-exact-arithmetic-pgraph.h"
+#include "test-metal-exact-selection-pgraph.h"
+#include "test-metal-scaled-x8-pgraph.h"
+#include "test-metal-swizzled-rtt-pgraph.h"
+#include "test-metal-dense-stream-pgraph.h"
+#include "test-metal-clear-continuation-pgraph.h"
+#include "test-metal-packed1555-rtt-pgraph.h"
+#include "test-metal-raster-texture-upload-pgraph.h"
+#include "test-metal-readonly-index-plan-reuse-pgraph.h"
+#include "test-metal-program-capture-reuse.h"
+#include "test-metal-program-capture-reuse-pgraph.h"
+#include "test-metal-geometry-continuation.h"
+#include "test-metal-geometry-continuation-pgraph.h"
+#include "test-metal-capture-preview-order-pgraph.h"
+#include "test-metal-completed-texture-upload-pgraph.h"
+#include "test-metal-polygon-window-clip-pgraph.h"
 
 int main(int argc, char **argv)
 {
@@ -2342,6 +2778,201 @@ int main(int argc, char **argv)
                                                  surfaces:surfaces
                                                     error:&error];
         require(draw != nil, error);
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--polygon-window-clip-pgraph")))
+            polygon_window_clip_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--polygon-window-clip-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--completed-texture-upload-pgraph")))
+            completed_texture_upload_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--completed-texture-upload-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--capture-preview-order-pgraph")))
+            capture_preview_order_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--capture-preview-order-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--geometry-continuation")))
+            geometry_continuation_tests();
+        if (argc == 2 && !strcmp(argv[1], "--geometry-continuation"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--geometry-continuation-pgraph")))
+            geometry_continuation_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--geometry-continuation-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--program-capture-reuse")))
+            program_capture_reuse_tests();
+        if (argc == 2 && !strcmp(argv[1], "--program-capture-reuse"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--program-capture-reuse-pgraph")))
+            program_capture_reuse_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--program-capture-reuse-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--readonly-index-plan-reuse-pgraph")))
+            readonly_index_plan_reuse_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--readonly-index-plan-reuse-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--raster-texture-upload-pgraph")))
+            raster_texture_upload_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--raster-texture-upload-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--packed1555-rtt-pgraph")))
+            packed1555_rtt_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--packed1555-rtt-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--float-summary-memo-pgraph")))
+            float_summary_memo_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--float-summary-memo-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--clear-continuation-pgraph")))
+            clear_continuation_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--clear-continuation-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--dense-stream-pgraph")))
+            dense_stream_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--dense-stream-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--swizzled-rtt-pgraph")))
+            swizzled_rtt_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--swizzled-rtt-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--scaled-x8-pgraph")))
+            scaled_x8_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--scaled-x8-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--exact-selection-pgraph")))
+            exact_selection_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--exact-selection-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--exact-arithmetic-pgraph")))
+            exact_arithmetic_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--exact-arithmetic-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--array-float-windows-pgraph")))
+            array_float_windows_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--array-float-windows-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--float-proof-pgraph")))
+            float_proof_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--float-proof-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--inline-input-reuse-pgraph")))
+            inline_input_reuse_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--inline-input-reuse-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--surface-pool-pgraph")))
+            surface_pool_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--surface-pool-pgraph"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--fixed-uniform-pgraph")))
+            fixed_uniform_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--fixed-uniform-pgraph"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--index-fallback-pgraph")))
+            index_fallback_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--index-fallback-pgraph"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--index-capture-growth-pgraph")))
+            index_capture_growth_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--index-capture-growth-pgraph"))
+            return 0;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--completed-download-pgraph")))
+            completed_download_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--completed-download-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--download-prefix-pgraph")))
+            download_prefix_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--download-prefix-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--rtt-prefix-pgraph")))
+            rtt_prefix_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--rtt-prefix-pgraph"))
+            return 0;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--compact-polygon-fill-pgraph")))
+            compact_polygon_fill_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--compact-polygon-fill-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--compact-polygon-wire-pgraph")))
+            compact_polygon_wire_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--compact-polygon-wire-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--upload-prefix-pgraph")))
+            upload_prefix_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--upload-prefix-pgraph"))
+            goto close;
+        if (argc == 1 ||
+            (argc == 2 && !strcmp(argv[1], "--prepared-ranges-pgraph")))
+            prepared_ranges_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--prepared-ranges-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--cpu-prefix-pgraph")))
+            cpu_prefix_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--cpu-prefix-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--compact-lines-pgraph")))
+            compact_lines_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--compact-lines-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--writer-chain-pgraph")))
+            writer_chain_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--writer-chain-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--genuine-polygons-pgraph")))
+            genuine_polygon_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--genuine-polygons-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--snapshot-producer-prefix")))
+            snapshot_producer_prefix_tests();
+        if (argc == 2 && !strcmp(argv[1], "--snapshot-producer-prefix"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--polygon-modes-pgraph")))
+            polygon_modes_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--polygon-modes-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--quad-modes-pgraph")))
+            quad_modes_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--quad-modes-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--bound-writer-pgraph")))
+            bound_writer_pgraph_tests();
+        if (argc == 2 && !strcmp(argv[1], "--bound-writer-pgraph"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--indexed-readonly")))
+            indexed_readonly_tests();
+        if (argc == 2 && !strcmp(argv[1], "--indexed-readonly"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--never-sample-query")))
+            never_sample_query_tests();
+        if (argc == 2 && !strcmp(argv[1], "--never-sample-query"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--zero-sample-query")))
+            zero_sample_query_tests();
+        if (argc == 2 && !strcmp(argv[1], "--zero-sample-query"))
+            goto close;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--visibility-pool")))
             visibility_pool_tests();
         if (argc == 2 && !strcmp(argv[1], "--visibility-pool"))
@@ -2357,6 +2988,10 @@ int main(int argc, char **argv)
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--textured-begin")))
             textured_begin_tests();
         if (argc == 2 && !strcmp(argv[1], "--textured-begin"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--palette-producers")))
+            palette_producer_tests();
+        if (argc == 2 && !strcmp(argv[1], "--palette-producers"))
             goto close;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--draw-attachments")))
             draw_attachment_tests();
@@ -2392,6 +3027,32 @@ int main(int argc, char **argv)
             queued_constant_raster_tests();
             goto close;
         }
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--constant-float-queued")))
+            queued_constant_float_tests(NO, 0);
+        if (argc == 2 && !strcmp(argv[1], "--constant-float-queued"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--constant-typed-queued")))
+            queued_constant_float_tests(YES, 0);
+        if (argc == 2 && !strcmp(argv[1], "--constant-typed-queued"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--large-scale-queued")))
+            queued_constant_float_tests(NO, 13);
+        if (argc == 2 && !strcmp(argv[1], "--large-scale-queued"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--large-union-queued")))
+            queued_constant_float_tests(NO, 14);
+        if (argc == 2 && !strcmp(argv[1], "--large-union-queued"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--large-reciprocal-queued")))
+            for (unsigned reciprocal = 15; reciprocal <= 20; reciprocal++)
+                queued_constant_float_tests(NO, reciprocal);
+        if (argc == 2 && !strcmp(argv[1], "--large-reciprocal-queued"))
+            goto close;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--constant-reciprocal-queued")))
+            for (unsigned reciprocal = 1; reciprocal <= 12; reciprocal++)
+                queued_constant_float_tests(NO, reciprocal);
+        if (argc == 2 && !strcmp(argv[1], "--constant-reciprocal-queued"))
+            goto close;
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--xf-only-queued")))
             queued_xf_tests();
         if (argc == 2 && !strcmp(argv[1], "--xf-only-queued"))

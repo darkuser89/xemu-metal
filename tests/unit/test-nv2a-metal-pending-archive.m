@@ -102,6 +102,9 @@ static void check(NSArray *inputs, NSArray *vertices, unsigned limit)
     restores++;
     roundtrips++;
 }
+
+#include "test-metal-indexed-archive-cpu.h"
+
 int main(void)
 {
     @autoreleasepool {
@@ -183,6 +186,7 @@ int main(void)
                "zero/NaN/Inf/subnormal bits preserved, no Metal "
                "device/queue/dispatch\n",
                roundtrips, restores, rejections);
+        compact_archive_tests();
     }
     return 0;
 }

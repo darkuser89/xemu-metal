@@ -31,7 +31,7 @@ static uint32_t batch_report(void)
     require([draw.reports getReport:1u << 24 error:&error], error);
     require([draw.reports processWithError:&error], error);
     qemu_mutex_unlock(&state->pgraph.lock);
-    return reported;
+    return report_value(0);
 }
 static void draw_batch_tests(void)
 {

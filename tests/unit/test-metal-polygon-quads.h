@@ -12,14 +12,12 @@ static NV2AMetalPixelShader *pq_comparison_shader(BOOL previous)
     NSError *error = nil;
     NSString *source = sampling_force_gradients(@(pq_pixel_source));
     NSString *gate =
-        @"        if (!pixel_quad_helpers("
-         "NV2A_COMBINER_SHADER_STAGE_PROGRAM(u.combiner),\n"
-         "                                u.legacy_spec_const, u.textures)) {\n"
-         "            if (!(coverage > 0))\n"
+        @"            if (!needs_helpers) {\n"
+         "                if (!(coverage > 0))\n"
+         "                    discard_fragment();\n"
+         "            } else if (!quad_or(uint(coverage > 0))) {\n"
          "                discard_fragment();\n"
-         "        } else if (!quad_or(uint(coverage > 0))) {\n"
-         "            discard_fragment();\n"
-         "        }\n";
+         "            }\n";
     assert([source componentsSeparatedByString:gate].count == 2);
     NSString *replacement =
         previous ? @"        if "

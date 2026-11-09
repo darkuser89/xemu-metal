@@ -16,6 +16,44 @@ static BOOL adapter_error(NSError **error, NSString *message)
                             userInfo:@{ NSLocalizedDescriptionKey : message }];
     return NO;
 }
+
+static BOOL replaces_surface(const NV2AMetalBlitConfig *c,
+                             const NV2AMetalBlitLayout *blit,
+                             NV2AMetalCachedSurface *surface)
+{
+    if (c->operation != NV09F_SET_OPERATION_SRCCOPY ||
+        c->destination_offset > surface.address ||
+        (c->source_offset < surface.address + surface.reservationLength &&
+         surface.address < c->source_offset + blit->source_length))
+        return NO;
+
+    NV2AMetalSurfaceConfig config = surface.transfer.config;
+    NV2AMetalSurfaceLayout layout;
+    if (!nv2a_metal_surface_layout(&config, &layout, NULL))
+        return NO;
+    NSUInteger start = surface.address - c->destination_offset;
+    if (start > blit->destination_length ||
+        layout.source_length > blit->destination_length - start)
+        return NO;
+    if (!c->rows || c->row_bytes == c->destination_pitch)
+        return YES;
+
+    /* Pitched texel intervals must lie inside actual write rows. The final
+     * clipped tail can cover the last row, but gaps cannot cover texels. */
+    NSUInteger rows = config.swizzle ? 1 : config.height;
+    NSUInteger bytes = config.swizzle ? layout.source_length :
+                                        config.width * layout.bytes_per_pixel;
+    for (NSUInteger y = 0; y < rows; y++) {
+        NSUInteger offset = start + y * config.pitch;
+        NSUInteger row = offset / c->destination_pitch;
+        NSUInteger available = row < c->rows  ? c->row_bytes :
+                               row == c->rows ? c->tail_bytes :
+                                                0;
+        if (offset % c->destination_pitch + bytes > available)
+            return NO;
+    }
+    return YES;
+}
 @implementation NV2AMetalPGRAPHBlit {
     NV2AState *_d;
     NV2AMetalSurfaceCache *_cache;
@@ -111,35 +149,27 @@ static BOOL adapter_error(NSError **error, NSString *message)
     NV2AMetalCachedSurface *binding =
         [_cache surfaceContainingAddress:(NSUInteger)dest_base];
     BOOL bound_dest = binding && binding.address == dest_base;
-    /* Preserve earlier guest commands on this queue. All validation precedes
-     * cache changes; partial destination updates preserve untouched GPU pixels.
-     * No render bytes are copied/converted on the CPU. */
-    if (![_cache submitWithError:error] ||
-        ![_cache prepareGPUReadAtAddress:c.source_offset
-                                  length:l.source_length
-                                   error:error] ||
-        ![_cache invalidateAddress:c.destination_offset
-                            length:l.destination_length
-                             error:error])
+    NV2AMetalSubmission *submission = nil;
+    /* Keep the caller's open section out of the blit's cancellation scope. */
+    if (_cache.recording && ![_cache submitWithError:error])
         return NO;
-    if (![_cache prepareGPUReadAtAddress:c.source_offset
-                                  length:l.source_length
-                                   error:error] ||
-        ![_cache prepareGPUWriteAtAddress:c.destination_offset
-                                    length:l.destination_length
-                                     error:error] ||
-        ![_blit encodeSource:_cache.vram
+    if (![_cache prepareGPUBlitFrom:NSMakeRange(c.source_offset, l.source_length)
+                                 to:NSMakeRange(c.destination_offset,
+                                                l.destination_length)
+                   replacingSurface:^BOOL(NV2AMetalCachedSurface *s) {
+                     return replaces_surface(&c, &l, s);
+                   } error:error])
+        goto fail;
+    if (![_blit encodeSource:_cache.vram
                  destination:_cache.vram
                       config:&c
                     commands:_cache.commands
                        error:error] ||
-        ![_cache submitWithError:error]) {
-        [_cache cancel];
-        return NO;
-    }
+        ![_cache submitWithError:error])
+        goto fail;
     /* Publish this blit's writes and earlier feedback prefix. Independent
      * readers of other VRAM spans remain owned by their original queues. */
-    NV2AMetalSubmission *submission = _cache.commands.lastSubmitted;
+    submission = _cache.commands.lastSubmitted;
     if (![_cache waitForSubmission:submission error:error] ||
         ![_cache noticeTextureDirtyAtAddress:c.destination_offset
                                       length:l.destination_length
@@ -159,5 +189,8 @@ static BOOL adapter_error(NSError **error, NSString *message)
     memory_region_set_client_dirty(_d->vram, c.destination_offset,
                                    l.destination_length, DIRTY_MEMORY_NV2A_TEX);
     return YES;
+fail:
+    [_cache cancel];
+    return NO;
 }
 @end

@@ -116,9 +116,7 @@ static BOOL overlap_complete(id object, SEL selector, NSError **error)
         NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
             [object valueForKey:@"encodedBatches"];
         assert(batches.count);
-        ((uint32_t *)batches[0].fetch.faults.contents)[0] = 1;
-        *(uint32_t *)((uint8_t *)batches[0].fetch.faults.contents +
-                      batches[0].fetch.faultSummaryOffset) = 1;
+        *(uint32_t *)batches[0].fetch.faults.contents = 1;
     }
     return overlap_original_complete(object, selector, error);
 }
@@ -169,7 +167,7 @@ static void fetch_overlap_tests(void)
             NV2AMetalPGRAPHFetch.class, @selector(completeWithError:));
         Method capture = class_getInstanceMethod(
             NV2AMetalPGRAPHPixelState.class,
-            @selector(initWithState:textures:device:frozenRaster:error:));
+            @selector(initWithState:textures:device:reusingRaster:error:));
         Method pixel = class_getInstanceMethod(
             NV2AMetalPGRAPHDraw.class, @selector(pixelForColor:depth:error:));
         assert(submit && complete && capture && pixel);

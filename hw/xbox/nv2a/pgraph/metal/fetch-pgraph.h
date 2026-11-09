@@ -13,6 +13,11 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) BOOL indexed;
 /* Full guest input count and the ordinal of the compact decoded suffix. */
 @property(nonatomic, readonly) NSUInteger inputVertexCount, firstDecodedVertex;
+/* Optional immutable LE32 logical-suffix ordinal -> physical XF ordinal map.
+ * Only an explicitly readonly indexed capture may compact repeated indices.
+ * Current is separate and is never an extra XF invocation. */
+@property(nonatomic, readonly, nullable) NSData *remap;
+@property(nonatomic, readonly) NSUInteger physicalVertexCount;
 @end
 
 /* PGRAPH-thread/pg.lock only. Captures live DrawArrays/InlineElements/Inline-
@@ -38,6 +43,13 @@ API_AVAILABLE(macos(26.0))
 + (instancetype)new NS_UNAVAILABLE;
 - (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)prepareWithError:
     (NSError *_Nullable *_Nullable)error;
+/* Full fetch on the same surface queue as prepareWithError:. Reuse only an
+ * immutable indexed input captured in this pg.lock interval; pass nil for
+ * other input kinds. Every input vertex and GPU Current are still decoded,
+ * and completion validates faults before publishing Current. */
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    prepareWithIndexedInput:(nullable NV2AMetalPendingInput *)input
+                      error:(NSError *_Nullable *_Nullable)error;
 /* Split producer encoding from completion so readonly XF can follow the fetch
  * in the same recording. Complete validates faults and publishes Current only
  * after GPU completion. Cancel an encoded producer if later encoding fails. */
@@ -48,6 +60,14 @@ API_AVAILABLE(macos(26.0))
  * queue. Complete validates GPU faults before publishing Current. */
 - (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
     encodeIndependentSnapshotsWithError:(NSError *_Nullable *_Nullable)error;
+/* Same full independent-queue encoding and completion contract, reusing a
+ * captured indexed input as above. No cached prefix, deduplication or host
+ * Current capture is enabled. Complete separately with completeWithError:. */
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeIndependentSnapshotsWithIndexedInput:
+        (nullable NV2AMetalPendingInput *)input
+                                         error:(NSError *_Nullable *_Nullable)
+                                                   error;
 /* Prefixes come from the Pending plan, one per input batch. Sources and full
  * DMA bounds are still captured/validated; only suffix attributes are emitted.
  * CPU-owned inline/index snapshots retain the suffix and the selected Current
@@ -66,6 +86,25 @@ API_AVAILABLE(macos(26.0))
                               indexedInput:
                                   (nullable NV2AMetalPendingInput *)input
                                      error:(NSError *_Nullable *_Nullable)error;
+/* Caller must prove that XF is nonwriting before opting in. Only the new
+ * indexed suffix is deduplicated, in stable first-occurrence order. Without
+ * an immutable indexed input or a reduction, the ordinary path is retained. */
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeIndependentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                              indexedInput:
+                                  (nullable NV2AMetalPendingInput *)input
+                       deduplicateReadonly:(BOOL)deduplicateReadonly
+                                     error:(NSError *_Nullable *_Nullable)error;
+/* Optional numerical evidence for program-address dependencies. Capture is
+ * bounded by FloatProofMaximumWords across the ENTIRE request; unready sources
+ * or exhausted budget leave every result unproven without changing errors. */
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeIndependentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                              indexedInput:
+                                  (nullable NV2AMetalPendingInput *)input
+                       deduplicateReadonly:(BOOL)deduplicateReadonly
+                       proofAttributeLanes:(uint64_t)proofAttributeLanes
+                                     error:(NSError *_Nullable *_Nullable)error;
 /* Pure input/layout check; encoding still validates and owns the sources. */
 + (BOOL)canCaptureInlineCurrentForState:(nullable NV2AState *)state;
 /* CPU-owned InlineBuffer or a validated interleaved InlineArray. Capture
@@ -76,6 +115,11 @@ API_AVAILABLE(macos(26.0))
  */
 - (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
     encodeInlineCurrentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                                       error:
+                                           (NSError *_Nullable *_Nullable)error;
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeInlineCurrentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                         proofAttributeLanes:(uint64_t)proofAttributeLanes
                                        error:
                                            (NSError *_Nullable *_Nullable)error;
 - (BOOL)completeInlineCurrentSnapshotsWithError:
@@ -89,9 +133,27 @@ API_AVAILABLE(macos(26.0))
  * Fetch attributes, fault buffers or dispatch. Generic completion still checks
  * any decoded suffix faults before accepting the captured Current. */
 - (BOOL)canCaptureCurrentForInput:(nullable NV2AMetalPendingInput *)input;
+/* Preview input domains for queue selection, without a read lease. Only
+ * format/count/stride-zero/inline fields are meaningful. A version-checked
+ * earlier Current can refine a fixed DMA source to its decoded inline value.
+ * Final admission requires a fresh bound Fetch proof for every executed range. */
+- (void)getSourcePreview:(NV2AMetalFetchUniforms *)preview
+              attributes:(uint16_t)attributes;
 - (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
     encodeCurrentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
                           indexedInput:(nullable NV2AMetalPendingInput *)input
+                                 error:(NSError *_Nullable *_Nullable)error;
+/* Same explicit nonwriting contract as the independent capture overload. */
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeCurrentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                          indexedInput:(nullable NV2AMetalPendingInput *)input
+                   deduplicateReadonly:(BOOL)deduplicateReadonly
+                                 error:(NSError *_Nullable *_Nullable)error;
+- (nullable NSArray<NV2AMetalPGRAPHFetchBatch *> *)
+    encodeCurrentSnapshotsWithPrefixes:(NSArray<NSNumber *> *)prefixes
+                          indexedInput:(nullable NV2AMetalPendingInput *)input
+                   deduplicateReadonly:(BOOL)deduplicateReadonly
+                   proofAttributeLanes:(uint64_t)proofAttributeLanes
                                  error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)completeCurrentSnapshotsWithError:(NSError *_Nullable *_Nullable)error;
 /* Submit the encoded producer without waiting or publishing Current. This

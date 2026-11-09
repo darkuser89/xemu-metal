@@ -3,13 +3,19 @@
 #ifndef TEST_METAL_VISIBILITY_POOL_H
 #define TEST_METAL_VISIBILITY_POOL_H
 static NV2AMetalCommands *vp_wait_commands;
+static id<MTLSharedEvent> vp_release_on_wait;
 static unsigned vp_waits;
 static BOOL (*vp_original_wait)(id, SEL, NV2AMetalSubmission *, NSError **);
 static BOOL vp_wait(id owner, SEL selector, NV2AMetalSubmission *submission,
                     NSError **error)
 {
-    if (owner == vp_wait_commands)
+    if (owner == vp_wait_commands) {
         vp_waits++;
+        if (vp_release_on_wait) {
+            vp_release_on_wait.signaledValue = 1;
+            vp_release_on_wait = nil;
+        }
+    }
     return vp_original_wait(owner, selector, submission, error);
 }
 static void vp_write(NV2AMetalPGRAPHReports *reports,
@@ -53,6 +59,254 @@ static void vp_get(NV2AMetalPGRAPHReports *reports, unsigned index)
 {
     NSError *error = nil;
     require([reports getReport:1u << 24 | index * 16 error:&error], error);
+}
+static NV2AMetalCommands *vp_gated_producer(id<MTLDevice> device,
+                                            id<MTLSharedEvent> gate)
+{
+    NSError *error = nil;
+    NV2AMetalCommands *producer =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    require(producer != nil, error);
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(producer, queueIvar);
+    assert(queue && gate);
+    [queue waitForEvent:gate value:1];
+    require([producer beginWithError:&error] != nil, error);
+    id<MTLBuffer> buffer =
+        [device newBufferWithLength:8 options:MTLResourceStorageModePrivate];
+    require(buffer && [producer addResource:buffer error:&error], error);
+    id<MTL4ComputeCommandEncoder> encoder =
+        [producer.commandBuffer computeCommandEncoder];
+    assert(encoder);
+    [encoder fillBuffer:buffer range:NSMakeRange(0, 8) value:1];
+    [encoder endEncoding];
+    require([producer submitWithError:&error], error);
+    return producer;
+}
+static void vp_oldest_recording_test(void)
+{
+    fixture();
+    qemu_mutex_lock(&state->pgraph.lock);
+    state->pgraph.dma_report = 80;
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NV2AMetalCommands *commands = cache.commands;
+    const NSUInteger capacity = 64;
+    NV2AMetalPGRAPHReports *reports =
+        [[NV2AMetalPGRAPHReports alloc] initWithState:state
+                                                cache:cache
+                                      counterCapacity:capacity];
+    NV2AMetalVisibilityCounter *first = [reports allocateCounterWithError:&error];
+    NSMutableArray<NV2AMetalVisibilityCounter *> *reservations =
+        [NSMutableArray new];
+    for (NSUInteger i = 1; i < capacity - 1; i++) {
+        NV2AMetalVisibilityCounter *reserved =
+            [reports allocateCounterWithError:&error];
+        require(reserved != nil, error);
+        [reservations addObject:reserved];
+    }
+    NV2AMetalVisibilityCounter *second = [reports allocateCounterWithError:&error];
+    require(first && second, error);
+    NV2AMetalPGRAPHQuery *query = [reports beginQuery];
+    id<MTLSharedEvent> earlyGate = [commands.device newSharedEvent];
+    id<MTLSharedEvent> laterGate = [commands.device newSharedEvent];
+    NV2AMetalCommands *early = vp_gated_producer(commands.device, earlyGate);
+    NV2AMetalCommands *later = vp_gated_producer(commands.device, laterGate);
+    NV2AMetalCommands *producers[] = { early, later };
+    NV2AMetalVisibilityCounter *counters[] = { second, first };
+    for (unsigned i = 0; i < 2; i++) {
+        NV2AMetalCommands *producer = producers[i];
+        require([cache prepareGPUReadAtAddress:0 length:0 error:&error] &&
+                    [commands orderAfterSubmission:producer.lastSubmitted
+                                       fromCommands:producer
+                                               error:&error],
+                error);
+        if (i == 1)
+            for (NV2AMetalVisibilityCounter *reserved in reservations) {
+                if (reserved == reservations.lastObject)
+                    continue;
+                require([reports recordCounter:reserved error:&error], error);
+            }
+        vp_write(reports, counters[i], query, i + 3);
+        require([cache submitWithError:&error], error);
+    }
+    NV2AMetalSubmission *last = commands.lastSubmitted;
+    assert(last && ![last completedWithError:&error] && !error);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!laterGate.signaledValue)
+                         laterGate.signaledValue = 2;
+                   });
+    vp_wait_commands = commands;
+    vp_release_on_wait = earlyGate;
+    vp_waits = 0;
+    SEL retireSelector = sel_registerName("retireCounterAtIndex:");
+    Method retireMethod = class_getInstanceMethod(NV2AMetalPGRAPHReports.class,
+                                                  retireSelector);
+    assert(retireMethod);
+    BOOL (*originalRetire)(id, SEL, NSUInteger) =
+        (void *)method_getImplementation(retireMethod);
+    __block NSUInteger retireChecks = 0;
+    IMP retireSpy = imp_implementationWithBlock(
+        ^BOOL(NV2AMetalPGRAPHReports *owner, NSUInteger index) {
+            if (owner == reports)
+                retireChecks++;
+            return originalRetire(owner, retireSelector, index);
+        });
+    method_setImplementation(retireMethod, retireSpy);
+    NV2AMetalVisibilityCounter *hole = reservations.lastObject;
+    [reports cancelCounter:hole];
+    NV2AMetalVisibilityCounter *replacement =
+        [reports allocateCounterWithError:&error];
+    require(replacement != nil, error);
+    assert(replacement.offset == hole.offset && !retireChecks && !vp_waits &&
+           !earlyGate.signaledValue && !laterGate.signaledValue &&
+           commands.lastSubmitted == last);
+    NV2AMetalVisibilityCounter *reuse = [reports allocateCounterWithError:&error];
+    method_setImplementation(retireMethod, (IMP)originalRetire);
+    assert(imp_removeBlock(retireSpy));
+    require(reuse != nil, error);
+    assert(retireChecks == 3 && vp_waits == 1 &&
+           earlyGate.signaledValue == 1 &&
+           !laterGate.signaledValue && ![last completedWithError:&error] &&
+           !error && reuse.offset == second.offset && !second.buffer &&
+           first.buffer == reuse.buffer);
+    [reports cancelCounter:reuse];
+    [reports cancelCounter:replacement];
+    vp_wait_commands = nil;
+    laterGate.signaledValue = 1;
+    require([cache waitForSubmission:last error:&error], error);
+    for (NV2AMetalVisibilityCounter *reserved in reservations)
+        [reports cancelCounter:reserved];
+    vp_get(reports, 0);
+    [reports endQuery:query];
+    require([reports processWithError:&error], error);
+    assert(report_value(0) == 7);
+    qemu_mutex_unlock(&state->pgraph.lock);
+    puts("Visibility pool submission scope: reverse reservation order; oldest "
+         "recording frees one slot while later GPU work stays gated PASS");
+    puts("Visibility pool pressure lookup: three retirement checks for 64 "
+         "slots sharing two recordings, including the oldest after its wait PASS");
+    puts("Visibility pool free slot: a sparse vacancy bypasses all busy "
+         "counter retirement checks and GPU waits PASS");
+}
+static void vp_report_prefix_test(BOOL snapshot)
+{
+    fixture();
+    qemu_mutex_lock(&state->pgraph.lock);
+    state->pgraph.dma_report = 80;
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NV2AMetalCommands *commands = cache.commands;
+    NV2AMetalPGRAPHReports *reports =
+        [[NV2AMetalPGRAPHReports alloc] initWithState:state cache:cache
+                                     counterCapacity:2];
+    NV2AMetalPGRAPHQuery *query = [reports beginQuery];
+    id<MTLSharedEvent> gate = [commands.device newSharedEvent];
+    Ivar queueIvar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(commands, queueIvar);
+    assert(reports && query && queue && gate);
+    [queue waitForEvent:gate value:1];
+    NV2AMetalSurfaceRecording *latest = nil;
+    NV2AMetalVisibilityCounter *counters[2] = { nil, nil };
+    for (unsigned i = 0; i < 2; i++) {
+        NV2AMetalVisibilityCounter *counter =
+            [reports allocateCounterWithError:&error];
+        counters[i] = counter;
+        require(counter && [cache prepareGPUReadAtAddress:0 length:0 error:&error],
+                error);
+        latest = cache.recording;
+        vp_write(reports, counter, query, i + 3);
+        require([cache submitWithError:&error], error);
+    }
+    vp_get(reports, 0);
+    vp_get(reports, 1);
+    vp_get(reports, 2);
+    [reports endQuery:query];
+    vp_get(reports, 3);
+    NSArray *queued = [reports valueForKey:@"reports"];
+    assert(queued.count == 4);
+    NSArray *firstQueries = [queued[0] valueForKey:@"queries"];
+    assert(firstQueries.count == 1);
+    for (unsigned i = 1; i < 4; i++)
+        assert(![[queued[i] valueForKey:@"queries"] count]);
+    require([cache prepareGPUReadAtAddress:0 length:0 error:&error], error);
+    NV2AMetalSurfaceRecording *pending = cache.recording;
+
+    SEL selector = @selector(waitForRecording:error:);
+    Method method = class_getInstanceMethod(NV2AMetalSurfaceCache.class,
+                                            selector);
+    assert(method);
+    BOOL (*original)(id, SEL, NV2AMetalSurfaceRecording *, NSError **) =
+        (void *)method_getImplementation(method);
+    __block unsigned waits = 0;
+    __block unsigned receiptLookups = 0;
+    __block NV2AMetalSurfaceRecording *selected = nil;
+    IMP spy = imp_implementationWithBlock(
+        ^BOOL(NV2AMetalSurfaceCache *owner, NV2AMetalSurfaceRecording *token,
+              NSError **failure) {
+            selected = token;
+            waits++;
+            gate.signaledValue = 1;
+            return original(owner, selector, token, failure);
+        });
+    method_setImplementation(method, spy);
+    SEL receiptSelector = @selector(waitForSubmission:error:);
+    Method receiptMethod = class_getInstanceMethod(NV2AMetalSurfaceCache.class,
+                                                   receiptSelector);
+    assert(receiptMethod);
+    BOOL (*originalReceipt)(id, SEL, NV2AMetalSubmission *, NSError **) =
+        (void *)method_getImplementation(receiptMethod);
+    IMP receiptSpy = imp_implementationWithBlock(
+        ^BOOL(NV2AMetalSurfaceCache *owner, NV2AMetalSubmission *submission,
+              NSError **failure) {
+            if (owner == cache)
+                receiptLookups++;
+            return originalReceipt(owner, receiptSelector, submission, failure);
+        });
+    method_setImplementation(receiptMethod, receiptSpy);
+    memset(report_bytes(0), 0xa5, 4 * 16);
+    NSData *wire = nil;
+    BOOL ok;
+    if (snapshot) {
+        wire = [reports snapshotWithActiveQuery:nil error:&error];
+        ok = wire != nil;
+    } else {
+        ok = [reports processWithError:&error];
+    }
+    method_setImplementation(method, (IMP)original);
+    method_setImplementation(receiptMethod, (IMP)originalReceipt);
+    assert(imp_removeBlock(spy));
+    assert(imp_removeBlock(receiptSpy));
+    require(ok, error);
+    assert(waits == 1 && !receiptLookups && selected == latest && latest.completed &&
+           cache.recording == pending && !pending.submitted);
+    assert(!counters[0].buffer && !counters[1].buffer &&
+           ![[firstQueries[0] valueForKey:@"buffers"] count]);
+    puts("Visibility recording lookup: direct submission prefix without a "
+         "receipt scan PASS");
+    if (snapshot) {
+        const uint8_t expected[] = { 0, 0, 0, 0, 0, 0, 0, 7 };
+        assert(!report_was_written(0) && wire.length >= 28 + sizeof(expected) &&
+               !memcmp((const uint8_t *)wire.bytes + 28, expected,
+                       sizeof(expected)));
+        assert([wire isEqualToData:[reports snapshotWithActiveQuery:nil
+                                                              error:&error]]);
+        require([reports processWithError:&error], error);
+        assert(cache.recording == pending && !pending.submitted);
+    }
+    for (unsigned i = 0; i < 4; i++)
+        assert(report_was_written(i) && report_value(i) == 7);
+    puts("Visibility empty reports: four FIFO writes use one counter prefix PASS");
+    puts("Visibility report counters: first read releases completed slots "
+         "and preserves the raw result PASS");
+    [cache cancel];
+    qemu_mutex_unlock(&state->pgraph.lock);
+    puts(snapshot ? "Visibility report snapshot: exact counter bytes, one "
+                    "producer wait, later open section preserved PASS" :
+                    "Visibility report prefix: two gated submissions use one "
+                    "recording wait and leave the later open section intact PASS");
 }
 static void vp_draw_pressure_tests(void)
 {
@@ -225,13 +479,14 @@ static void visibility_pool_tests(void)
         vp_write(reports, c, query, 7);
         NSData *snapshot = [reports snapshotWithActiveQuery:query error:&error];
         require(snapshot != nil, error);
+        assert(![[query valueForKey:@"buffers"] count]);
         vp_get(reports, 2);
         [reports endQuery:query];
         require([reports processWithError:&error], error);
         unsigned divisor = scale * scale;
-        assert(report_values[0] == (UINT32_MAX - 2) / divisor &&
-               report_values[1] == 2 / divisor &&
-               report_values[2] == 9 / divisor);
+        assert(report_value(0) == (UINT32_MAX - 2) / divisor &&
+               report_value(1) == 2 / divisor &&
+               report_value(2) == 9 / divisor);
         NV2AMetalPGRAPHReports *restored =
             [[NV2AMetalPGRAPHReports alloc] initWithState:state
                                                     cache:cache
@@ -245,12 +500,12 @@ static void visibility_pool_tests(void)
         vp_get(restored, 2);
         [restored endQuery:active];
         for (unsigned i = 0; i < 3; i++)
-            report_seen[i] = false;
+            memset(report_bytes(i), 0xa5, 16);
         require([restored processWithError:&error], error);
-        assert(report_seen[0] && report_seen[1] && report_seen[2] &&
-               report_values[0] == (UINT32_MAX - 2) / divisor &&
-               report_values[1] == 2 / divisor &&
-               report_values[2] == 9 / divisor);
+        assert(report_was_written(0) && report_was_written(1) && report_was_written(2) &&
+               report_value(0) == (UINT32_MAX - 2) / divisor &&
+               report_value(1) == 2 / divisor &&
+               report_value(2) == 9 / divisor);
         [reports clear];
         query = [reports beginQuery];
         uint32_t total = 0;
@@ -266,7 +521,7 @@ static void visibility_pool_tests(void)
             if (i % 17 == 16) {
                 unsigned index = 4 + i / 17;
                 vp_get(reports, index);
-                report_seen[index] = false;
+                memset(report_bytes(index), 0xa5, 16);
             }
         }
         uint32_t expected[7];
@@ -280,8 +535,8 @@ static void visibility_pool_tests(void)
         [reports endQuery:query];
         require([reports processWithError:&error], error);
         for (unsigned i = 0; i < 7; i++)
-            assert(report_seen[4 + i] && report_values[4 + i] == expected[i]);
-        assert(report_values[12] == total / divisor);
+            assert(report_was_written(4 + i) && report_value(4 + i) == expected[i]);
+        assert(report_value(12) == total / divisor);
         [reports clear];
         query = [reports beginQuery];
         a = [reports allocateCounterWithError:&error];
@@ -294,7 +549,7 @@ static void visibility_pool_tests(void)
         vp_get(reports, 13);
         [reports endQuery:query];
         require([reports processWithError:&error], error);
-        assert(report_values[13] == 1 / divisor);
+        assert(report_value(13) == 1 / divisor);
         a = [reports allocateCounterWithError:&error];
         require(a != nil, error);
         require([cache prepareGPUReadAtAddress:0 length:0 error:&error] &&
@@ -311,6 +566,9 @@ static void visibility_pool_tests(void)
         [restored discard];
         qemu_mutex_unlock(&pg->lock);
     }
+    vp_oldest_recording_test();
+    vp_report_prefix_test(NO);
+    vp_report_prefix_test(YES);
     vp_draw_pressure_tests();
     vp_wait_commands = nil;
     method_setImplementation(wait, (IMP)vp_original_wait);

@@ -142,8 +142,53 @@ static void cache_idle_CPU_work(CacheIdleWaitProbe *probe)
 }
 @end
 
+static void cache_idle_watch_word_test(id<MTLDevice> device)
+{
+    const NSUInteger boundary = 64 * 4096;
+    NSError *error = nil;
+    NV2AMetalCommands *commands =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    id<MTLBuffer> ram = [device newBufferWithLength:boundary + 4096
+                                           options:MTLResourceStorageModeShared];
+    require(commands && ram, error);
+    NV2AMetalSurfaceCache *cache =
+        [[NV2AMetalSurfaceCache alloc] initWithCommands:commands vram:ram
+                                           didWriteVRAM:nil error:&error];
+    require(cache != nil, error);
+    NV2AMetalVRAMReadSpan spans[] = {
+        { boundary - 32, 4 }, { boundary + 16, 4 },
+        { boundary - 16, 4 }, { boundary - 4, 8 },
+    };
+    BOOL ready = NO;
+    require([cache tryIdleCPUReadSpans:spans count:4 completed:&ready error:&error] &&
+                ready,
+            error);
+    require([cache prepareGPUWriteAtAddress:boundary + 4 length:4 error:&error],
+            error);
+    require([cache tryIdleCPUReadSpans:spans count:4 completed:&ready error:&error] &&
+                ready,
+            error);
+    spans[3].length++;
+    require([cache tryIdleCPUReadSpans:spans count:4 completed:&ready error:&error],
+            error);
+    assert(!ready);
+    [cache cancel];
+    require([cache tryIdleCPUReadSpans:spans count:4 completed:&ready error:&error] &&
+                ready,
+            error);
+    require([cache prepareGPUWriteAtAddress:boundary - 16 length:4 error:&error] &&
+                [cache tryIdleCPUReadSpans:spans count:4 completed:&ready error:&error],
+            error);
+    assert(!ready);
+    [cache cancel];
+    checks++;
+    puts("CPU VRAM watch words: repeated and crossing ranges distinguish "
+         "adjacent bytes, new watches and cancelled writes PASS");
+}
+
 static void cache_idle_guard_tests(id<MTLDevice> device)
 {
+    cache_idle_watch_word_test(device);
     for (unsigned mode = 0; mode < 4; mode++) {
         NSError *error = nil;
         CacheIdleWaitCommands *commands =
@@ -231,6 +276,8 @@ static void cache_idle_guard_tests(id<MTLDevice> device)
         [queue waitForEvent:probe.gate value:1];
         require([cache submitWithError:&error], error);
         assert(token.submitted && !token.completed && !published);
+        if (probe.nested)
+            encode_vram_copy(cache, 60604, 4);
         commands.failCompletion = mode == 3;
         commands.probe = probe;
         BOOL ok = probe.nested ? [cache prepareCPUAccessAtAddress:65000

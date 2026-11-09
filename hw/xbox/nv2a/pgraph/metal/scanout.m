@@ -1,6 +1,7 @@
 /* Native framebuffer/PVIDEO composition from gl/display.c.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "scanout.h"
+#import "shader-library.h"
 #include "texture-alias.h"
 #include "scanout-source.h"
 #include "color-format.h"
@@ -40,6 +41,7 @@ static BOOL readable(id<MTLTexture> texture, id<MTLDevice> device)
 @implementation NV2AMetalScanout {
     id<MTLDevice> _device;
     MTLPixelFormat _format;
+    NV2AMetalShaderLibrary *_module;
     id<MTLRenderPipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
     id<MTLTexture> _dummy;
@@ -61,35 +63,28 @@ static BOOL readable(id<MTLTexture> texture, id<MTLDevice> device)
     }
     _device = device;
     _format = format;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler)
-        return nil;
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    ld.options.mathMode = MTLMathModeSafe;
-    ld.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!library)
+    _module = [NV2AMetalShaderLibrary sharedWithDevice:device
+                                               source:metal_shader_source
+                                                error:error];
+    if (!_module)
         return nil;
     MTL4LibraryFunctionDescriptor *vs = [MTL4LibraryFunctionDescriptor new];
-    vs.library = library;
+    vs.library = _module.library;
     vs.name = @"nv2a_scanout_vertex";
     MTL4LibraryFunctionDescriptor *fs = [MTL4LibraryFunctionDescriptor new];
-    fs.library = library;
+    fs.library = _module.library;
     fs.name = @"nv2a_scanout_fragment";
     MTL4RenderPipelineDescriptor *pd = [MTL4RenderPipelineDescriptor new];
     pd.vertexFunctionDescriptor = vs;
     pd.fragmentFunctionDescriptor = fs;
     pd.colorAttachments[0].pixelFormat = format;
     pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
-    _pipeline = [compiler newRenderPipelineStateWithDescriptor:pd
-                                           compilerTaskOptions:nil
-                                                         error:error];
+    id<MTL4Compiler> compiler = _module.compiler;
+    @synchronized (compiler) {
+        _pipeline = [compiler newRenderPipelineStateWithDescriptor:pd
+                                               compilerTaskOptions:nil
+                                                             error:error];
+    }
     if (!_pipeline)
         return nil;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
@@ -167,19 +162,17 @@ static BOOL readable(id<MTLTexture> texture, id<MTLDevice> device)
     id<MTLTexture> ov = u->overlay_enable ? overlay : _dummy;
     NV2AMetalScanoutUniforms snapshot = *u;
     nv2a_metal_color_bits(_format, snapshot.color_bits);
-    id<MTLBuffer> constants =
-        [_device newBufferWithBytes:&snapshot
-                             length:sizeof(*u)
-                            options:MTLResourceStorageModeShared];
-    if (!constants)
-        return scanout_error(error, @"Cannot allocate scanout uniforms");
-    if (![commands addResource:source error:error] ||
+    NSUInteger offset;
+    id<MTLBuffer> constants = [commands uploadBytes:&snapshot
+                                             length:sizeof(snapshot)
+                                             offset:&offset
+                                              error:error];
+    if (!constants || ![commands addResource:source error:error] ||
         ![commands addResource:ov error:error] ||
         ![commands addResource:target error:error] ||
-        ![commands addResource:constants error:error] ||
         ![commands keepAlive:self error:error])
         return NO;
-    [_arguments setAddress:constants.gpuAddress atIndex:0];
+    [_arguments setAddress:constants.gpuAddress + offset atIndex:0];
     [_arguments setTexture:source.gpuResourceID atIndex:0];
     [_arguments setTexture:ov.gpuResourceID atIndex:1];
     MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];

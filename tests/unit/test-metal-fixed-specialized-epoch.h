@@ -2,15 +2,20 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef TEST_METAL_FIXED_SPECIALIZED_EPOCH_H
 #define TEST_METAL_FIXED_SPECIALIZED_EPOCH_H
+@interface NV2AMetalVertexFixed (FixedEpochGeneralTest)
+- (id<MTLComputePipelineState>)generalPipelineCompact:(BOOL)compact
+                                               error:(NSError **)error;
+@end
 @interface FixedEpochGeneral : NV2AMetalVertexFixed
 @end
 @implementation FixedEpochGeneral
 - (id<MTLComputePipelineState>)pipelineForUniforms:
                                    (const NV2AMetalFixedUniforms *)u
                                            compact:(BOOL)compact
+                                             error:(NSError **)error
 {
     (void)u;
-    return [self valueForKey:compact ? @"rasterPipeline" : @"pipeline"];
+    return [self generalPipelineCompact:compact error:error];
 }
 @end
 static void fixed_specialized_epoch_tests(NV2AMetalCommands *commands)

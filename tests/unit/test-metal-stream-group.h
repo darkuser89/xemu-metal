@@ -39,18 +39,18 @@ static id stream_partial(id owner, SEL selector, id plan, NSUInteger count,
 static unsigned stream_geometry_calls, stream_expected_geometry,
     stream_geometry_fail_at;
 static NSArray *(*stream_original_geometry)(
-    id, SEL, id<MTLBuffer>, NSUInteger, NSUInteger, enum NV2AMetalPrimitive,
+    id, SEL, NV2AMetalVertexSlice *, enum NV2AMetalPrimitive,
     const NV2AMetalGeometryRasterConfig *, BOOL, BOOL, BOOL,
     NV2AMetalCommands *, NSError **);
-static NSArray *stream_geometry(id owner, SEL selector, id<MTLBuffer> vertices,
-                                NSUInteger firstVertex, NSUInteger count,
+static NSArray *stream_geometry(id owner, SEL selector,
+                                NV2AMetalVertexSlice *slice,
                                 enum NV2AMetalPrimitive primitive,
                                 const NV2AMetalGeometryRasterConfig *config,
                                 BOOL smooth, BOOL first, BOOL perspective,
                                 NV2AMetalCommands *commands, NSError **error)
 {
     assert(!group_calls); /* No raster before the final geometry producer. */
-    assert(!stream_relocate_span || firstVertex == 3);
+    assert(!stream_relocate_span || slice.firstVertex == 3);
     if (++stream_geometry_calls == stream_geometry_fail_at) {
         if (error)
             *error = [NSError errorWithDomain:@"test.stream-geometry"
@@ -58,9 +58,9 @@ static NSArray *stream_geometry(id owner, SEL selector, id<MTLBuffer> vertices,
                                      userInfo:nil];
         return nil;
     }
-    return stream_original_geometry(owner, selector, vertices, firstVertex,
-                                    count, primitive, config, smooth, first,
-                                    perspective, commands, error);
+    return stream_original_geometry(owner, selector, slice, primitive, config,
+                                    smooth, first, perspective, commands,
+                                    error);
 }
 static NV2AMetalPixelDraw *stream_encode(
     id owner, SEL selector, NV2AMetalGeometryResult *geometry,
@@ -146,12 +146,53 @@ static void stream_scene(unsigned topology, unsigned operation,
         }
     }
 }
+static void stream_expected_raster_counts(NSUInteger *preparations,
+                                          NSUInteger *emissions)
+{
+    PGRAPHState *pg = &state->pgraph;
+    unsigned setup = pg->regs_[NV_PGRAPH_SETUPRASTER];
+    unsigned front = GET_MASK(setup, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    unsigned back = GET_MASK(setup, NV_PGRAPH_SETUPRASTER_BACKFACEMODE);
+    BOOL mixed = front != back;
+    /* These fixtures use either one whole geometry packet or the two modes
+     * of mixed TriangleList. Each mixed packet is prepared once, then drawn
+     * once per complete guest triangle in original front/back order. */
+    assert(!mixed || (pg->primitive_mode == PRIM_TYPE_TRIANGLES &&
+                      front == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_FILL &&
+                      back == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE));
+    NSUInteger minimum;
+    switch (pg->primitive_mode) {
+    case PRIM_TYPE_TRIANGLES:
+    case PRIM_TYPE_TRIANGLE_STRIP:
+        minimum = 3;
+        break;
+    case PRIM_TYPE_QUADS:
+        minimum = 4;
+        break;
+    case PRIM_TYPE_LINE_LOOP:
+        minimum = 2;
+        break;
+    default:
+        abort();
+    }
+    *preparations = *emissions = 0;
+    for (unsigned i = 0; i < pg->draw_arrays_length; i++) {
+        NSUInteger count = pg->draw_arrays_count[i];
+        if (count < minimum)
+            continue;
+        *preparations += mixed ? 2 : 1;
+        *emissions += mixed ? 2 * (count / 3) : 1;
+    }
+}
 static BOOL stream_draw(unsigned expected, NSError **error)
 {
+    assert(state->pgraph.draw_arrays_length == expected);
+    NSUInteger preparations, emissions;
+    stream_expected_raster_counts(&preparations, &emissions);
     Method geometry = class_getInstanceMethod(
         NV2AMetalGeometry.class,
-        @selector(encodeNativeRasterVertices:first:count:primitive:config:
-                  smooth:firstProvoking:zPerspective:commands:error:));
+        @selector(encodeNativeRasterSlice:primitive:config:smooth:
+                  firstProvoking:zPerspective:commands:error:));
     Method pixel = class_getInstanceMethod(
         NV2AMetalPixelShader.class,
         @selector(prepareGeometry:offset:count:uniforms:textures:pass:drawState:
@@ -159,7 +200,11 @@ static BOOL stream_draw(unsigned expected, NSError **error)
     Method emit = class_getInstanceMethod(
         NV2AMetalPixelDraw.class,
         @selector(encodeWithRenderEncoder:commands:error:));
-    assert(geometry && pixel && emit);
+    Method rangeEmit = class_getInstanceMethod(
+        NV2AMetalPixelDraw.class,
+        @selector(
+            encodeWithRenderEncoder:commands:firstVertex:vertexCount:error:));
+    assert(geometry && pixel && emit && rangeEmit);
     stream_geometry_calls = group_calls = group_emissions = 0;
     stream_expected_geometry = expected;
     group_encoders = [NSMutableSet new];
@@ -169,6 +214,8 @@ static BOOL stream_draw(unsigned expected, NSError **error)
         (void *)method_setImplementation(pixel, (IMP)stream_encode);
     group_original_emit =
         (void *)method_setImplementation(emit, (IMP)group_emit);
+    group_original_range_emit =
+        (void *)method_setImplementation(rangeEmit, (IMP)group_range_emit);
     Method plan = class_getInstanceMethod(
         NV2AMetalPendingJournal.class,
         @selector(planInputs:preservingLastArray:error:));
@@ -201,11 +248,12 @@ static BOOL stream_draw(unsigned expected, NSError **error)
     method_setImplementation(geometry, (IMP)stream_original_geometry);
     method_setImplementation(pixel, (IMP)group_original_encode);
     method_setImplementation(emit, (IMP)group_original_emit);
+    method_setImplementation(rangeEmit, (IMP)group_original_range_emit);
     if (ok) {
-        assert(stream_progress_calls == 1 && stream_plan_calls == 3);
+        assert(stream_progress_calls == 1 && stream_plan_calls == 1);
         assert(stream_geometry_calls == expected);
-        assert(group_emissions == group_calls);
-        assert(group_encoders.count == (group_calls ? 1 : 0));
+        assert(group_calls == preparations && group_emissions == emissions);
+        assert(group_encoders.count == (emissions ? 1 : 0));
     }
     return ok;
 }
@@ -216,7 +264,7 @@ static uint32_t stream_report(void)
     require([draw.reports getReport:1u << 24 error:&error], error);
     require([draw.reports processWithError:&error], error);
     qemu_mutex_unlock(&state->pgraph.lock);
-    return reported;
+    return report_value(0);
 }
 static void stream_group_contract_tests(void)
 {
@@ -338,7 +386,7 @@ static void stream_group_contract_tests(void)
         "PGRAPH stream group: %u exact color/depth-stencil/Current/query "
         "pairs, "
         "%llu samples; %u separate reference passes versus %u grouped passes; "
-        "all geometry precedes raster, three plans/one progress/zero prefix updates per draw, four late-failure/retry cases PASS\n",
+        "all geometry precedes raster, one plan/one progress/zero prefix updates per draw, four late-failure/retry cases PASS\n",
         pairs, (unsigned long long)samples, referencePasses, groupedPasses);
     groups++;
 }

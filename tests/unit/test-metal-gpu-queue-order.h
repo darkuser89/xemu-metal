@@ -33,12 +33,15 @@ static void check_gpu_queue_order(void)
            error);
     assert(target.commandBuffer == recording &&
            !targetQueue.foreignWaits.count);
-    assert([target orderAfterSubmission:first
-                           fromCommands:source
-                                  error:&error]);
-    assert([target orderAfterSubmission:first
-                           fromCommands:source
-                                  error:&error]);
+    for (unsigned i = 0; i < 128; i++)
+        assert([target orderAfterSubmission:first
+                               fromCommands:source
+                                      error:&error]);
+    id slot = [target valueForKey:@"current"];
+    NSArray *registered = [slot valueForKey:@"waits"];
+    NSMapTable *receipts = [slot valueForKey:@"waitReceipts"];
+    assert(registered.count == 1 && receipts.count == 1 &&
+           [receipts objectForKey:first]);
     assert(!targetQueue.foreignWaits.count);
     assert([target sealWithError:&error]);
     assert([source beginWithError:&error] && [source submitWithError:&error]);
@@ -49,6 +52,13 @@ static void check_gpu_queue_order(void)
                                   error:&error]);
     [target cancelUnsealed];
     assert(!targetQueue.foreignWaits.count && target.sealedBufferCount == 1);
+    assert(registered.count == 1 && receipts.count == 1 &&
+           [receipts objectForKey:first] && ![receipts objectForKey:second]);
+    assert([target beginWithError:&error] &&
+           [target orderAfterSubmission:second fromCommands:source error:&error]);
+    assert(registered.count == 2 && receipts.count == 2 &&
+           [receipts objectForKey:second]);
+    [target cancelUnsealed];
     assert([target submitWithError:&error]);
     assert(targetQueue.foreignWaits.count == 1 &&
            [targetQueue.foreignWaits[0][1] unsignedLongLongValue] == 1);
@@ -128,6 +138,7 @@ static void check_gpu_queue_order(void)
     [target cancel];
     [other.queue completeWithError:nil];
     assert([target waitUntilIdleWithError:&error]);
+    assert(!registered.count && !receipts.count);
     /* Registered waits keep a native source queue/event alive even after
      * the source owner disappears; full idle releases that retention. */
     __weak TestQueue *weakQueue;
@@ -155,7 +166,8 @@ static void check_gpu_queue_order(void)
     /* A later successful callback cannot discard an earlier pending wait on
      * the same native event. Exercise callback order independently of GPU
      * execution order. */
-    @autoreleasepool {
+    for (unsigned mode = 0; mode < 4; mode++) @autoreleasepool {
+        BOOL reverse = mode & 1, mixedEvents = mode & 2;
         TestDevice *reordered = [TestDevice new];
         reordered.supported = reordered.freshQueues = YES;
         NV2AMetalCommands *producer =
@@ -166,6 +178,13 @@ static void check_gpu_queue_order(void)
             [[NV2AMetalCommands alloc] initWithDevice:(id)reordered
                                                 error:&error];
         TestQueue *consumerQueue = reordered.queue;
+        NV2AMetalCommands *readyProducer =
+            [[NV2AMetalCommands alloc] initWithDevice:(id)reordered
+                                                error:&error];
+        TestQueue *readyQueue = reordered.queue;
+        assert([readyProducer beginWithError:&error] &&
+               [readyProducer submitWithError:&error]);
+        NV2AMetalSubmission *becomesReady = readyProducer.lastSubmitted;
         assert([producer beginWithError:&error] &&
                [producer submitWithError:&error]);
         NV2AMetalSubmission *earlier = producer.lastSubmitted;
@@ -176,15 +195,70 @@ static void check_gpu_queue_order(void)
         [producerQueue completeWithError:nil];
         assert(![earlier completedWithError:NULL] &&
                [later completedWithError:NULL]);
+        SEL feedbackSelector = @selector(completedWithError:);
+        Method feedback = class_getInstanceMethod(NV2AMetalSubmission.class,
+                                                   feedbackSelector);
+        assert(feedback);
+        BOOL (*original)(id, SEL, NSError **) =
+            (void *)method_getImplementation(feedback);
+        __block unsigned earlierChecks = 0, laterChecks = 0, readyChecks = 0;
+        IMP spy = imp_implementationWithBlock(
+            ^BOOL(NV2AMetalSubmission *receipt, NSError **failure) {
+                earlierChecks += receipt == earlier;
+                laterChecks += receipt == later;
+                readyChecks += receipt == becomesReady;
+                return original(receipt, feedbackSelector, failure);
+            });
+        method_setImplementation(feedback, spy);
         assert([consumer beginWithError:&error]);
-        assert([consumer orderAfterSubmission:earlier
+        assert([consumer orderAfterSubmission:reverse ? later : earlier
                                  fromCommands:producer
                                         error:&error]);
-        assert([consumer orderAfterSubmission:later
+        if (mixedEvents && !reverse)
+            assert([consumer orderAfterSubmission:becomesReady
+                                     fromCommands:readyProducer
+                                            error:&error]);
+        assert([consumer orderAfterSubmission:reverse ? earlier : later
                                  fromCommands:producer
                                         error:&error]);
+        if (mixedEvents && reverse)
+            assert([consumer orderAfterSubmission:becomesReady
+                                     fromCommands:readyProducer
+                                            error:&error]);
+        [readyQueue completeWithError:nil];
+        for (unsigned i = 0; i < 2; i++) {
+            if (mixedEvents)
+                assert([consumer orderAfterSubmission:becomesReady
+                                         fromCommands:readyProducer
+                                                error:&error]);
+            assert([consumer orderAfterSubmission:later fromCommands:producer
+                                            error:&error]);
+        }
+        SEL factorySelector = @selector(mapTableWithKeyOptions:valueOptions:);
+        Method factory = class_getClassMethod(NSMapTable.class, factorySelector);
+        assert(factory);
+        NSMapTable *(*originalFactory)(id, SEL, NSPointerFunctionsOptions,
+                                       NSPointerFunctionsOptions) =
+            (void *)method_getImplementation(factory);
+        __block unsigned tables = 0;
+        IMP factorySpy = imp_implementationWithBlock(
+            ^NSMapTable *(Class cls, NSPointerFunctionsOptions keys,
+                          NSPointerFunctionsOptions values) {
+                tables++;
+                return originalFactory(cls, factorySelector, keys, values);
+            });
+        method_setImplementation(factory, factorySpy);
         assert([consumer submitWithError:&error]);
+        method_setImplementation(factory, (IMP)originalFactory);
+        assert(imp_removeBlock(factorySpy));
+        assert(tables == (mixedEvents ? 1u : 0u));
+        method_setImplementation(feedback, (IMP)original);
+        assert(imp_removeBlock(spy));
+        assert(earlierChecks == 2 && laterChecks == 1 &&
+               readyChecks == (mixedEvents ? 2u : 0u));
         assert(consumerQueue.foreignWaits.count == 1 &&
+               ((TestEvent *)consumerQueue.foreignWaits[0][0]).queue ==
+                   producerQueue &&
                [consumerQueue.foreignWaits[0][1] unsignedLongLongValue] == 2);
         [producerQueue completeWithError:nil];
         [consumerQueue completeWithError:nil];
@@ -196,5 +270,13 @@ static void check_gpu_queue_order(void)
          "coalescing,sealed-prefix/suffix cancellation,no later-source "
          "drain,late source error preserves recording,source-owner destruction "
          "and bounded lifetime PASS (CPU only)");
+    puts("Metal GPU wait index: 128 duplicate registrations keep one receipt; "
+         "suffix cancellation, retry and idle release preserve membership PASS");
+    puts("Metal GPU event groups: a pending earlier receipt keeps the maximum "
+         "timeline wait in either order; another completed event is skipped PASS");
+    puts("Metal GPU wait feedback: confirmed success is reused at registration "
+         "and submit; pending receipts are checked again PASS");
+    puts("Metal GPU event table: zero grouping tables for one event, "
+         "one for mixed events; out-of-order feedback still gates the batch PASS");
 }
 #endif

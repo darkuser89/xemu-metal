@@ -4,7 +4,7 @@
 #define TEST_METAL_DIRTY_NOTICE_H
 
 @interface DirtyNoticeCommands : NV2AMetalCommands
-@property(nonatomic) unsigned submits, waits;
+@property(nonatomic) unsigned submits, producerSubmits, waits;
 @property(nonatomic) id<MTLSharedEvent> gate;
 @end
 @implementation DirtyNoticeCommands
@@ -13,7 +13,17 @@
     _submits++;
     return [super submitWithError:error];
 }
-- (BOOL)waitUntilIdleWithError:(NSError **)error
+- (NV2AMetalSubmission *)submitProducersThroughSectionCount:(NSUInteger)count
+                                                batchSerial:
+                                                    (uint64_t)batchSerial
+                                                      error:(NSError **)error
+{
+    _producerSubmits++;
+    return [super submitProducersThroughSectionCount:count
+                                         batchSerial:batchSerial
+                                               error:error];
+}
+- (void)noteWait
 {
     _waits++;
     /* Release only if production actually waits. Safe cases require the gate
@@ -21,7 +31,17 @@
      */
     if (_gate && !_gate.signaledValue)
         _gate.signaledValue = 1;
+}
+- (BOOL)waitUntilIdleWithError:(NSError **)error
+{
+    [self noteWait];
     return [super waitUntilIdleWithError:error];
+}
+- (BOOL)waitForSubmission:(NV2AMetalSubmission *)submission
+                    error:(NSError **)error
+{
+    [self noteWait];
+    return [super waitForSubmission:submission error:error];
 }
 @end
 
@@ -206,6 +226,7 @@ static void dirty_notice_tests(id<MTLDevice> device)
             if (submitted)
                 require([cache submitWithError:&error], error);
             unsigned submits = commands.submits, waits = commands.waits;
+            unsigned producerSubmits = commands.producerSubmits;
             uint64_t before = 0, after = 0;
             require([cache sourceVersionAtAddress:address
                                            length:4
@@ -217,9 +238,29 @@ static void dirty_notice_tests(id<MTLDevice> device)
                                                 error:&error];
             if (!conflict || conflict >= 3) {
                 require(ok, error);
-                assert(commands.gate.signaledValue == 1 &&
-                       commands.submits == submits + !submitted &&
-                       commands.waits == waits + 1 && token.completed);
+                BOOL prefix = !submitted && !conflict;
+                BOOL expected =
+                    commands.gate.signaledValue == 1 &&
+                    commands.submits == submits + (!submitted && !prefix) &&
+                    commands.waits == waits + 1 &&
+                    (prefix ? commands.producerSubmits == producerSubmits + 1 &&
+                                  token.producersCompleted &&
+                                  token.cpuHazardsRetired && !token.submitted &&
+                                  !token.completed && !token.cancelled :
+                              token.completed);
+                if (!expected)
+                    fprintf(stderr,
+                            "Dirty notice submitted=%u conflict=%u prefix=%d: "
+                            "gate=%llu full=%u/%u producer=%u/%u waits=%u/%u "
+                            "token producers=%d hazards=%d submitted=%d "
+                            "completed=%d cancelled=%d\n",
+                            submitted, conflict, prefix,
+                            (unsigned long long)commands.gate.signaledValue,
+                            commands.submits, submits, commands.producerSubmits,
+                            producerSubmits, commands.waits, waits,
+                            token.producersCompleted, token.cpuHazardsRetired,
+                            token.submitted, token.completed, token.cancelled);
+                assert(expected);
                 assert(*(uint32_t *)output.contents == 0x33333333);
                 if (conflict == 3)
                     assert(*(uint32_t *)((uint8_t *)ram.contents + address) ==

@@ -12,8 +12,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSArray<NV2AMetalPendingInput *> *)
     inputsWithState:(PGRAPHState *_Nullable)state
               error:(NSError *_Nullable *_Nullable)error;
-/* Previous inputs must be the journal's accepted snapshots. Equality is
- * checked against the live indices under pg.lock before any reuse. */
+/* Previous inputs must be the journal's accepted snapshots. Array ranges
+ * and live indices are checked under pg.lock before immutable reuse. */
 + (nullable NSArray<NV2AMetalPendingInput *> *)
     inputsWithState:(PGRAPHState *_Nullable)state
       reusingInputs:(nullable NSArray<NV2AMetalPendingInput *> *)previous

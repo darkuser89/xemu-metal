@@ -326,6 +326,7 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
 
 - (NV2AMetalCachedSurface *)prepare:(BOOL)color
                        forRendering:(BOOL)forRendering
+                      selectingOnly:(BOOL)selectOnly
                               error:(NSError **)error
 {
     PGRAPHState *pg = &_d->pgraph;
@@ -383,7 +384,7 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         .scale = pg->surface_scale_factor,
         .color = color,
         .swizzle = swizzle,
-        .floating_depth = !!(setup & NV_PGRAPH_SETUPRASTER_Z_FORMAT),
+        .floating_depth = !color && !!(setup & NV_PGRAPH_SETUPRASTER_Z_FORMAT),
     };
     NV2AMetalSurfaceLayout layout;
     if (!nv2a_metal_surface_layout(&c, &layout, error)) {
@@ -417,12 +418,17 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
             return nil;
         }
     }
+    uint32_t frame = pg->frame_time;
     NV2AMetalCachedSurface *entry =
-        [_cache prepareSurfaceAtAddress:address
-                                 config:&c
-                                  frame:(uint32_t)pg->frame_time
-                           forRendering:forRendering
-                                  error:error];
+        selectOnly ? [_cache selectSurfaceAtAddress:address
+                                             config:&c
+                                              frame:frame
+                                              error:error] :
+                     [_cache prepareSurfaceAtAddress:address
+                                              config:&c
+                                               frame:frame
+                                        forRendering:forRendering
+                                               error:error];
     if (entry) {
         s->buffer_dirty = false;
         pg->surface_binding_dim.width = entry.transfer.config.width;
@@ -471,6 +477,18 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         forRendering:(BOOL)forRendering
                error:(NSError **)error
 {
+    return [self prepareColor:color
+                         zeta:zeta
+                 forRendering:forRendering
+                selectingOnly:NO
+                        error:error];
+}
+- (BOOL)prepareColor:(BOOL)color
+                zeta:(BOOL)zeta
+        forRendering:(BOOL)forRendering
+       selectingOnly:(BOOL)selectOnly
+               error:(NSError **)error
+{
     if (qatomic_read(&_closed)) {
         return pgraph_surface_error(error,
                                     @"Native PGRAPH surfaces are closed");
@@ -489,7 +507,10 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         return NO;
     }
     if (color) {
-        _color = [self prepare:YES forRendering:forRendering error:error];
+        _color = [self prepare:YES
+                  forRendering:forRendering
+                 selectingOnly:selectOnly
+                         error:error];
         if (!_color) {
             return NO;
         }
@@ -497,7 +518,10 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         _color = nil;
     }
     if (zeta) {
-        _zeta = [self prepare:NO forRendering:forRendering error:error];
+        _zeta = [self prepare:NO
+                 forRendering:forRendering
+                selectingOnly:selectOnly
+                        error:error];
         if (!_zeta) {
             return NO;
         }
@@ -508,7 +532,8 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
     } else {
         _zeta = nil;
     }
-    return [self prepareCurrentAttachments:error forRendering:forRendering];
+    return selectOnly ||
+           [self prepareCurrentAttachments:error forRendering:forRendering];
 }
 
 - (NV2AMetalSurfaceBindings)captureBindings
@@ -529,6 +554,24 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
 }
 - (BOOL)prepareBindings:(NV2AMetalSurfaceBindings)bindings
            forRendering:(BOOL)forRendering
+                  error:(NSError **)error
+{
+    return [self prepareBindings:bindings
+                    forRendering:forRendering
+                   selectingOnly:NO
+                           error:error];
+}
+- (BOOL)selectBindingsForClear:(NV2AMetalSurfaceBindings)bindings
+                         error:(NSError **)error
+{
+    return [self prepareBindings:bindings
+                    forRendering:NO
+                   selectingOnly:YES
+                           error:error];
+}
+- (BOOL)prepareBindings:(NV2AMetalSurfaceBindings)bindings
+           forRendering:(BOOL)forRendering
+          selectingOnly:(BOOL)selectOnly
                   error:(NSError **)error
 {
     if (qatomic_read(&_closed))
@@ -589,12 +632,17 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
                 return NO;
             }
         }
-        prepared[i] =
-            [_cache prepareSurfaceAtAddress:parts[i].address
-                                     config:&c
-                                      frame:(uint32_t)_d->pgraph.frame_time
-                               forRendering:forRendering
-                                      error:error];
+        uint32_t frame = _d->pgraph.frame_time;
+        prepared[i] = selectOnly ?
+                          [_cache selectSurfaceAtAddress:parts[i].address
+                                                  config:&c
+                                                   frame:frame
+                                                   error:error] :
+                          [_cache prepareSurfaceAtAddress:parts[i].address
+                                                   config:&c
+                                                    frame:frame
+                                             forRendering:forRendering
+                                                    error:error];
         if (!prepared[i])
             return NO;
     }
@@ -603,7 +651,8 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         return pgraph_surface_error(error, @"Overlapping bound attachments");
     _color = prepared[0];
     _zeta = prepared[1];
-    return [self prepareCurrentAttachments:error forRendering:forRendering];
+    return selectOnly ||
+           [self prepareCurrentAttachments:error forRendering:forRendering];
 }
 - (BOOL)releaseColor:(BOOL)color zeta:(BOOL)zeta error:(NSError **)error
 {
@@ -650,19 +699,18 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
                                     @"Native PGRAPH surfaces are closed");
     NV2AMetalCachedSurface *parts[] = { color ? _color : nil,
                                         zeta ? _zeta : nil };
+    NSMutableArray<NV2AMetalCachedSurface *> *selected = [NSMutableArray new];
     for (unsigned i = 0; i < 2; i++)
-        if (parts[i].valid && parts[i].dirty &&
-            ![_cache prepareCPUAccessAtAddress:parts[i].address
-                                        length:parts[i].reservationLength
-                                         write:NO
-                                         error:error])
-            return NO;
+        if (parts[i].valid && parts[i].dirty)
+            [selected addObject:parts[i]];
+    if (selected.count && ![_cache downloadSurfacesForCPU:selected error:error])
+        return NO;
     _d->pgraph.surface_color.draw_dirty = _color.dirty;
     _d->pgraph.surface_zeta.draw_dirty = _zeta.dirty;
     return YES;
 }
 
-- (BOOL)prepareClearColor:(BOOL)color zeta:(BOOL)zeta error:(NSError **)error
+- (BOOL)selectClearColor:(BOOL)color zeta:(BOOL)zeta error:(NSError **)error
 {
     PGRAPHState *pg = &_d->pgraph;
     pg->surface_shape.z_format = !!(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
@@ -678,7 +726,11 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
                                                                       nil;
     NV2AMetalCachedSurface *retainedZeta =
         !zeta && !shape_changed && !pg->surface_zeta.buffer_dirty ? _zeta : nil;
-    BOOL ok = [self prepareColor:color zeta:zeta error:error];
+    BOOL ok = [self prepareColor:color
+                            zeta:zeta
+                    forRendering:NO
+                   selectingOnly:YES
+                           error:error];
     NV2AMetalCachedSurface *retained[] = { retainedColor, retainedZeta };
     for (unsigned i = 0; ok && i < 2; i++) {
         NV2AMetalCachedSurface *old = retained[i];
@@ -686,25 +738,21 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         if (!old.valid)
             continue;
         if (other &&
-            (old.transfer.texture.width != other.transfer.texture.width ||
-             old.transfer.texture.height != other.transfer.texture.height)) {
+            (old.transfer.nativeWidth != other.transfer.nativeWidth ||
+             old.transfer.nativeHeight != other.transfer.nativeHeight)) {
             (i ? &pg->surface_zeta : &pg->surface_color)->buffer_dirty = true;
             continue;
         }
-        NV2AMetalSurfaceConfig config = old.transfer.config;
-        NV2AMetalCachedSurface *prepared =
-            [_cache prepareSurfaceAtAddress:old.address
-                                     config:&config
-                                      frame:(uint32_t)pg->frame_time
-                                      error:error];
-        ok = prepared != nil;
+        ok = [_cache touchSurface:old
+                            frame:(uint32_t)pg->frame_time
+                            error:error];
         if (i)
-            _zeta = prepared;
+            _zeta = ok ? old : nil;
         else
-            _color = prepared;
+            _color = ok ? old : nil;
     }
     pg->clearing = was_clearing;
-    return ok && [self prepareCurrentAttachments:error];
+    return ok;
 }
 
 - (BOOL)clearSurface:(uint32_t)parameter error:(NSError **)error
@@ -718,7 +766,8 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
                                     @"Native PGRAPH surfaces are closed");
     }
     if (!color && !zeta) {
-        return [self prepareClearColor:NO zeta:NO error:error];
+        return [self selectClearColor:NO zeta:NO error:error] &&
+               [self prepareCurrentAttachments:error];
     }
     if (color) {
         unsigned format = pg->surface_shape.color_format;
@@ -821,28 +870,155 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
     }
     BOOL was_clearing = pg->clearing;
     pg->clearing = true;
-    BOOL ok = [self prepareClearColor:color zeta:zeta error:error];
-    if (ok) {
-        ok = [_clear encodeColor:_color.transfer.texture
-                            zeta:_zeta.transfer.texture
-                          config:&c
-                        commands:_cache.commands
-                           error:error];
-    }
-    if (ok) {
-        id<MTLTexture> target =
-            _color ? _color.transfer.texture : _zeta.transfer.texture;
-        BOOL covered = c.rect.width && c.rect.height &&
-                       c.rect.x < target.width && c.rect.y < target.height;
-        BOOL writes_zeta = (parameter & NV097_CLEAR_SURFACE_Z) ||
-                           ((parameter & NV097_CLEAR_SURFACE_STENCIL) &&
-                            _zeta.transfer.texture.pixelFormat ==
-                                MTLPixelFormatDepth32Float_Stencil8);
-        if (covered && (color || writes_zeta)) {
-            ok = [self markColorWritten:color
-                            zetaWritten:writes_zeta
-                                  error:error];
+    BOOL ok = [self selectClearColor:color zeta:zeta error:error];
+    BOOL replaceColor = NO, replaceZeta = NO;
+    BOOL continuation = NO, rasterScope = NO;
+    MTL4RenderPassDescriptor *parent = nil;
+    @try {
+        if (ok) {
+            NV2AMetalClearAttachmentLayout
+                colorLayout = { _color.transfer.nativePixelFormat,
+                                _color.transfer.nativeWidth,
+                                _color.transfer.nativeHeight },
+                zetaLayout = { _zeta.transfer.nativePixelFormat,
+                               _zeta.transfer.nativeWidth,
+                               _zeta.transfer.nativeHeight };
+            BOOL loadClear = nv2a_metal_clear_layout_uses_load_actions(
+                _color ? &colorLayout : NULL, _zeta ? &zetaLayout : NULL, &c);
+            replaceColor = loadClear && color;
+            replaceZeta = loadClear && (parameter & NV097_CLEAR_SURFACE_Z) &&
+                          (zetaLayout.pixel_format !=
+                               MTLPixelFormatDepth32Float_Stencil8 ||
+                           (parameter & NV097_CLEAR_SURFACE_STENCIL));
+            if (!loadClear) {
+                parent = [_cache.commands copyPendingRasterPass];
+                id<MTLTexture> oldColor = parent.colorAttachments[0].texture;
+                id<MTLTexture> oldZeta = parent.depthAttachment.texture;
+                BOOL sameLayout =
+                    (_color != nil) == (oldColor != nil) &&
+                    (_zeta != nil) == (oldZeta != nil) &&
+                    (!_color || !_color.needsUpload) &&
+                    (!_zeta || !_zeta.needsUpload) &&
+                    (!_color ||
+                     (oldColor.pixelFormat == colorLayout.pixel_format &&
+                      oldColor.width == colorLayout.width &&
+                      oldColor.height == colorLayout.height)) &&
+                    (!_zeta ||
+                     (oldZeta.pixelFormat == zetaLayout.pixel_format &&
+                      oldZeta.width == zetaLayout.width &&
+                      oldZeta.height == zetaLayout.height));
+                if (sameLayout && [_clear canContinueRasterPass:parent
+                                                         config:&c]) {
+                    uint64_t batch = _cache.commands.batchSerial;
+                    /* Accept earlier successful commands before the separately
+                     * cancellable clear; pressure retains its normal Full
+                     * route. */
+                    ok = [_cache validateRasterContinuationWithError:error] &&
+                         [_cache checkpointWithError:error];
+                    if (ok && _cache.commands.hasPendingRasterPass &&
+                        _cache.commands.batchSerial == batch) {
+                        ok = [_cache beginRasterProducersWithError:error];
+                        rasterScope = continuation = ok;
+                    }
+                }
+            }
+            if (ok)
+                ok = (!_color || [_cache prepareSelectedSurface:_color
+                                             discardingContents:replaceColor
+                                                          error:error]) &&
+                     (!_zeta || [_cache prepareSelectedSurface:_zeta
+                                            discardingContents:replaceZeta
+                                                         error:error]);
         }
+        if (ok) {
+            id<MTLTexture> colorTexture =
+                [_color.transfer textureForCommands:_cache.commands
+                                              error:error];
+            id<MTLTexture> zetaTexture = nil;
+            if (!_color || colorTexture)
+                zetaTexture = [_zeta.transfer textureForCommands:_cache.commands
+                                                           error:error];
+            ok = (!_color || colorTexture) && (!_zeta || zetaTexture);
+            if (ok && continuation) {
+                /* Borrows use the actually prepared bindings. A changed target,
+                 * required upload or alias boundary keeps the old Full route.
+                 */
+                parent.colorAttachments[0].texture = colorTexture;
+                parent.depthAttachment.texture = zetaTexture;
+                parent.stencilAttachment.texture =
+                    zetaTexture.pixelFormat ==
+                            MTLPixelFormatDepth32Float_Stencil8 ?
+                        zetaTexture :
+                        nil;
+                if (!_cache.commands.hasPendingRasterPass ||
+                    ![_cache.commands rasterPassMatches:parent]) {
+                    [_cache endRasterProducers];
+                    rasterScope = continuation = NO;
+                    ok = (!_color || [_cache prepareSelectedSurface:_color
+                                                 discardingContents:NO
+                                                              error:error]) &&
+                         (!_zeta || [_cache prepareSelectedSurface:_zeta
+                                                discardingContents:NO
+                                                             error:error]);
+                    colorTexture =
+                        ok ? [_color.transfer textureForCommands:_cache.commands
+                                                           error:error] :
+                             nil;
+                    zetaTexture =
+                        ok && (!_color || colorTexture) ?
+                            [_zeta.transfer textureForCommands:_cache.commands
+                                                         error:error] :
+                            nil;
+                    ok = ok && (!_color || colorTexture) &&
+                         (!_zeta || zetaTexture);
+                }
+            }
+            if (ok && continuation) {
+                NSMutableArray<NV2AMetalCachedSurface *> *targets =
+                    [NSMutableArray new];
+                if (_color)
+                    [targets addObject:_color];
+                if (_zeta)
+                    [targets addObject:_zeta];
+                ok = [_cache prepareRasterPass:parent
+                                       targets:targets
+                                         error:error] &&
+                     [_clear encodeColor:colorTexture
+                                    zeta:zetaTexture
+                                  config:&c
+                              rasterPass:parent
+                                commands:_cache.commands
+                                   error:error];
+            } else if (ok) {
+                ok = [_clear encodeColor:colorTexture
+                                    zeta:zetaTexture
+                                  config:&c
+                                commands:_cache.commands
+                                   error:error];
+            }
+        }
+        if (ok) {
+            NV2AMetalSurfaceTransfer *target =
+                _color ? _color.transfer : _zeta.transfer;
+            BOOL covered = c.rect.width && c.rect.height &&
+                           c.rect.x < target.nativeWidth &&
+                           c.rect.y < target.nativeHeight;
+            BOOL writes_zeta = (parameter & NV097_CLEAR_SURFACE_Z) ||
+                               ((parameter & NV097_CLEAR_SURFACE_STENCIL) &&
+                                _zeta.transfer.nativePixelFormat ==
+                                    MTLPixelFormatDepth32Float_Stencil8);
+            if (covered && (color || writes_zeta))
+                ok = [self markColorWritten:color
+                                zetaWritten:writes_zeta
+                             replacingColor:replaceColor
+                              replacingZeta:replaceZeta
+                                      error:error];
+        }
+        if (ok && continuation)
+            ok = [_cache checkpointWithError:error];
+    } @finally {
+        if (rasterScope)
+            [_cache endRasterProducers];
     }
     pg->clearing = was_clearing;
     if (!ok) {
@@ -855,9 +1031,25 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
              zetaWritten:(BOOL)zeta
                    error:(NSError **)error
 {
+    return [self markColorWritten:color
+                      zetaWritten:zeta
+                   replacingColor:NO
+                    replacingZeta:NO
+                            error:error];
+}
+- (BOOL)markColorWritten:(BOOL)color
+             zetaWritten:(BOOL)zeta
+          replacingColor:(BOOL)replaceColor
+           replacingZeta:(BOOL)replaceZeta
+                   error:(NSError **)error
+{
     if (qatomic_read(&_closed) ||
-        (color && (!_color || ![_cache markWritten:_color error:error])) ||
-        (zeta && (!_zeta || ![_cache markWritten:_zeta error:error]))) {
+        (color && (!_color || ![_cache markWritten:_color
+                                  replacingContents:replaceColor
+                                              error:error])) ||
+        (zeta && (!_zeta || ![_cache markWritten:_zeta
+                                replacingContents:replaceZeta
+                                            error:error]))) {
         return pgraph_surface_error(
             error, @"Invalid native PGRAPH written attachments");
     }
@@ -1017,7 +1209,7 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
     NSError *failure = nil;
     for (NV2AMetalCPUAccess *request in requests) {
         NSError *one = nil;
-        if (![_cache prepareCPUAccessAtAddress:request.address
+        if (![_cache resolveCPUAccessAtAddress:request.address
                                         length:request.length
                                          write:request.write
                                          error:&one]) {

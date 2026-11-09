@@ -146,7 +146,7 @@ static void pgraph_fetch_suffix_tests(void)
         require(b != nil, error);
         assert(b[0].fetch.vertexCount == 0 && b[0].fetch.hasCurrent &&
                b[0].fetch.attributes.length == 256 &&
-               b[0].fetch.faults.length == 8);
+               b[0].fetch.faults.length == 4);
         pg->inline_elements[2] = 1;
         require([adapter completeWithError:&error], error);
         pg->inline_elements[2] = 0;

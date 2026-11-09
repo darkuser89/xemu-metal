@@ -1,6 +1,7 @@
 /* Isolated GPU VGA graphics vs independent byte/bit reference.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "hw/xbox/nv2a/pgraph/metal/vga.h"
+#import <objc/runtime.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -86,6 +87,49 @@ static uint32_t reference(const uint8_t *data, NV2AMetalVGARow row,
     }
     return rgb | 0xff000000;
 }
+static void decoder_startup_test(NV2AMetalVGA *vga, NV2AMetalCommands *commands,
+                                 id<MTLBuffer> data)
+{
+    NSError *error = nil;
+    id<MTL4CommandBuffer> recording = [commands beginWithError:&error];
+    require(recording != nil, error);
+    NV2AMetalVGARow row = { 0 };
+    NV2AMetalVGAUniforms u = { .width = 1, .height = 1, .mode = 8 };
+    assert(![vga encodeData:data rows:&row uniforms:&u commands:commands
+                      error:&error] && error && ![vga valueForKey:@"pipeline"]);
+    u.memory_mask = (uint32_t)data.length - 1;
+    Method allocation = class_getInstanceMethod(
+        object_getClass(commands.device),
+        @selector(newArgumentTableWithDescriptor:error:));
+    assert(allocation);
+    NSError *failure = [NSError errorWithDomain:@"test.vga.arguments"
+                                           code:1 userInfo:nil];
+    IMP injected = imp_implementationWithBlock(
+        ^id<MTL4ArgumentTable>(id<MTLDevice> device,
+                               MTL4ArgumentTableDescriptor *descriptor,
+                               NSError **result) {
+          assert(device == commands.device && descriptor.maxBufferBindCount == 3 &&
+                 descriptor.maxTextureBindCount == 1);
+          if (result)
+              *result = failure;
+          return nil;
+        });
+    IMP original = method_setImplementation(allocation, injected);
+    assert(![vga encodeData:data rows:&row uniforms:&u commands:commands
+                      error:&error] && error == failure);
+    method_setImplementation(allocation, original);
+    assert(imp_removeBlock(injected));
+    assert(commands.commandBuffer == recording && ![vga valueForKey:@"pipeline"] &&
+           ![vga valueForKey:@"arguments"]);
+    error = nil;
+    require([vga encodeData:data rows:&row uniforms:&u commands:commands
+                      error:&error] != nil, error);
+    require([commands submitWithError:&error] &&
+                [commands waitUntilIdleWithError:&error], error);
+    puts("VGA shader startup: invalid input skips compilation; failed setup "
+         "preserves the recording and a valid retry succeeds PASS");
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -103,6 +147,7 @@ int main(void)
         uint8_t *ram = data.contents;
         for (unsigned i = 0; i < data.length; i++)
             ram[i] = (i * 37 + (i >> 7) * 19 + 17) & 255;
+        decoder_startup_test(vga, commands, data);
         unsigned modes[] = { 0, 2, 4, 8, 15, 16, 24, 32, 255 }, images = 0,
                  pixels = 0, rejects = 0;
         for (unsigned m = 0; m < 9; m++)
@@ -127,6 +172,16 @@ int main(void)
                                        ((i * 29) & 255) << 8 |
                                        ((i * 61) & 255) << 16 | 0xff000000;
                     require([commands beginWithError:&error] != nil, error);
+                    if (!m && !endian && !pan) {
+                        /* Cover a row table following an existing upload. */
+                        const NV2AMetalVGARow prefix[5] = { 0 };
+                        NSUInteger offset;
+                        require([commands uploadBytes:prefix
+                                               length:sizeof(prefix)
+                                               offset:&offset
+                                                error:&error] != nil,
+                                error);
+                    }
                     id<MTLTexture> texture = [vga encodeData:data
                                                         rows:rows
                                                     uniforms:&u
@@ -295,7 +350,38 @@ int main(void)
                               error:&error]);
             rejects++;
         }
+        __block unsigned attempts = 0;
+        id<MTLTexture> wrong = [commands.device newTextureWithDescriptor:
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                      MTLPixelFormatRGBA8Unorm
+                                                              width:1
+                                                             height:1
+                                                          mipmapped:NO]];
+        assert(wrong);
+        NV2AMetalVGA *pooled = [[NV2AMetalVGA alloc]
+            initWithDevice:commands.device
+            targetAllocator:^id<MTLTexture>(MTLTextureDescriptor *descriptor) {
+                assert(descriptor.width == 8 && descriptor.height == 1 &&
+                       descriptor.usage == (MTLTextureUsageShaderRead |
+                                            MTLTextureUsageShaderWrite));
+                return ++attempts == 1 ? wrong : nil;
+            }
+            error:&error];
+        require(pooled != nil, error);
+        NV2AMetalVGARow badrow = { (uint32_t)data.length, 0 };
+        assert(![pooled encodeData:data rows:&badrow uniforms:&u
+                          commands:commands error:&error] && !attempts);
+        error = nil;
+        assert(![pooled encodeData:data rows:&row uniforms:&u
+                          commands:commands error:&error] && attempts == 1 &&
+               [error.localizedDescription containsString:@"Incompatible"]);
+        error = nil;
+        assert(![pooled encodeData:data rows:&row uniforms:&u
+                          commands:commands error:&error] && attempts == 2 &&
+               [error.localizedDescription containsString:@"Cannot allocate"]);
         [commands cancel];
+        puts("VGA target allocator: validates before acquisition and rejects "
+             "incompatible or missing targets PASS");
         printf("Metal4 VGA graphics: %u exact images, %u pixels, %u rejects "
                "PASS\n",
                images, pixels, rejects);

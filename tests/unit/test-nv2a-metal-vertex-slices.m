@@ -161,6 +161,8 @@ static NV2AMetalPixelRasterClass raster_class(NV2AMetalGeometryResult *g)
         return NV2AMetalPixelRasterDirectTriangle | g.directTriangleOptions;
     if (g.directPoints)
         return NV2AMetalPixelRasterDirectPoint;
+    if (g.directLineMode && (g.directLineOptions & NV2AMetalDirectLineTopologyMask))
+        return NV2AMetalPixelRasterDirectMappedLine | g.directLineOptions;
     if (g.directLineMode)
         return NV2AMetalPixelRasterDirectLineSmooth + g.directLineMode - 1;
     return g.expandedLines    ? NV2AMetalPixelRasterExpandedLine :
@@ -217,7 +219,7 @@ static SliceFrame *render(NSArray<id<MTLBuffer>> *buffers,
             [raw
                 addObject:read_buffer(g.vertices,
                                       g.firstVertex * sizeof(NV2AMetalVertex),
-                                      g.vertexCount * sizeof(NV2AMetalVertex))];
+                                      g.sourceVertexCount * sizeof(NV2AMetalVertex))];
             if (g.polygonProjections)
                 [projected addObject:read_buffer(g.polygonProjections, 0,
                                                  g.polygonProjections.length)];
@@ -815,12 +817,14 @@ static void bounds_and_lifetime(void)
 }
 
 #include "test-metal-msaa-blend.h"
+#include "test-metal-dense-stream-plan.h"
 
 int main(int argc, char **argv)
 {
     msaaSelf = argc == 2 && !strcmp(argv[1], "--msaa-self");
     BOOL blendOnly = argc == 2 && !strcmp(argv[1], "--blend-oracle");
-    assert(argc == 1 || msaaSelf || blendOnly);
+    BOOL denseOnly = argc == 2 && !strcmp(argv[1], "--dense-stream-plan");
+    assert(argc == 1 || msaaSelf || blendOnly || denseOnly);
     @autoreleasepool {
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
@@ -840,6 +844,10 @@ int main(int argc, char **argv)
                sampleCount:4
                      error:&error];
         require(geometry && pixels[0] && pixels[1], error);
+        if (argc == 1 || denseOnly)
+            dense_stream_plan_tests();
+        if (denseOnly)
+            return 0;
         begin();
         Class cls = object_getClass(commands.commandBuffer);
         SEL selector = @selector(computeCommandEncoder);

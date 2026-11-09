@@ -55,6 +55,10 @@ API_AVAILABLE(macos(26.0))
 - (BOOL)prepareBindings:(NV2AMetalSurfaceBindings)bindings
            forRendering:(BOOL)forRendering
                   error:(NSError *_Nullable *_Nullable)error;
+/* Restore captured bindings for a clear. The clear then decides which
+ * attachments need their previous contents before beginning GPU work. */
+- (BOOL)selectBindingsForClear:(NV2AMetalSurfaceBindings)bindings
+                         error:(NSError *_Nullable *_Nullable)error;
 /* Release guest ownership as GL/VK do. TCG access hooks preserve dirty GPU
  * attachments until an actual RAM consumer needs them; unmonitored CPUs use
  * the synchronous download path. */

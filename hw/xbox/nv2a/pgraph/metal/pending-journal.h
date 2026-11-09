@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #include <stdint.h>
 NS_ASSUME_NONNULL_BEGIN
+@class NV2AMetalSurfaceRecording;
 typedef NS_ENUM(unsigned, NV2AMetalInputKind) {
     NV2AMetalInputArrays = 1,
     NV2AMetalInputIndexed,
@@ -20,7 +21,9 @@ typedef NS_ENUM(unsigned, NV2AMetalInputKind) {
 + (nullable instancetype)arraysFrom:(NSUInteger)first count:(NSUInteger)count;
 + (nullable instancetype)indexed:(NSData *)indices;
 /* Caller keeps bytes stable during this call. Reuse requires a byte-identical
- * prefix; mutable guest storage is never retained by the descriptor. */
+ * prefix; mutable guest storage is never retained by the descriptor. Growing
+ * captures may share storage, but each returned indices view keeps its fixed
+ * length and immutable bytes for its entire lifetime. */
 + (nullable instancetype)indexedBytes:(const void *_Nullable)bytes
                                 count:(NSUInteger)count
                      matchingPrevious:
@@ -37,9 +40,17 @@ typedef NS_ENUM(unsigned, NV2AMetalInputKind) {
 @interface NV2AMetalPendingSpan : NSObject
 @property(nonatomic, readonly) id resource;
 @property(nonatomic, readonly) NSUInteger first, count;
+/* Optional producer of this span. Journal operations preserve the identity
+ * without inspecting or serializing it. */
+@property(nonatomic, readonly, nullable)
+    NV2AMetalSurfaceRecording *producerRecording;
 + (nullable instancetype)resource:(id)resource
                             first:(NSUInteger)first
                             count:(NSUInteger)count;
++ (nullable instancetype)resource:(id)resource
+                            first:(NSUInteger)first
+                            count:(NSUInteger)count
+                producerRecording:(nullable NV2AMetalSurfaceRecording *)producer;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
@@ -87,6 +98,11 @@ typedef NS_ENUM(unsigned, NV2AMetalInputKind) {
 - (BOOL)commitNextSuffix:(nullable NV2AMetalPendingSpan *)suffix
                 progress:(NV2AMetalPendingProgress *)progress
                    error:(NSError *_Nullable *_Nullable)error;
+/* Stage all streams from a completed, current cursor. Commit and consume use
+ * the usual update rules, including retaining a hidden final array range. */
+- (nullable NV2AMetalPendingUpdate *)
+    prepareCompletedProgress:(NV2AMetalPendingProgress *)progress
+                        error:(NSError *_Nullable *_Nullable)error;
 /* One result per input: a suffix span starting at its own buffer's offset, or
  * NSNull when no new vertices exist. Its count must match count-prefixCount. */
 - (nullable NV2AMetalPendingUpdate *)preparePlan:(NV2AMetalPendingPlan *)plan
@@ -109,6 +125,13 @@ typedef NS_ENUM(unsigned, NV2AMetalInputKind) {
  * and progress stay bound to their original journal. Replace the caller's
  * journal only after its queued GPU work is accepted; discard on failure. */
 - (nullable NV2AMetalPendingJournal *)copyForTransaction;
+/* Bind a current plan to the new copy, sharing its immutable inputs and
+ * prefix validation. The original plan stays bound to the original journal. */
+- (nullable NV2AMetalPendingJournal *)
+    copyForTransactionWithPlan:(NV2AMetalPendingPlan *)plan
+                     stagedPlan:(NV2AMetalPendingPlan *_Nullable *_Nonnull)
+                                    stagedPlan
+                          error:(NSError *_Nullable *_Nullable)error;
 - (void)reset;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;

@@ -7,6 +7,8 @@
  */
 #import "texture-cache.h"
 #import "lru-cache.h"
+#import "texture-storage.h"
+#import "shader-library.h"
 #include "texture-cache-types.h"
 #include "texture-cache-source.h"
 
@@ -24,28 +26,44 @@ static BOOL texture_cache_error(NSError **error, NSString *message)
     return NO;
 }
 
-/* Immutable content identity. NSArray hashes collide for equal-length keys. */
+/* A null initializer input creates an encoding-thread lookup key. Copying it
+ * freezes the current words for storage. Stored keys are immutable. */
 @interface NV2AMetalTextureKey : NSObject <NSCopying> {
     uint64_t _words[20];
     NSUInteger _hash;
+    BOOL _lookup;
 }
 - (instancetype)initWithKeyWords:(const uint64_t *)words;
+- (void)setLookupWords:(const uint64_t *)words;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
 @implementation NV2AMetalTextureKey
+- (void)loadWords:(const uint64_t *)words
+{
+    memcpy(_words, words, sizeof(_words));
+    const uint8_t *bytes = (const uint8_t *)_words;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (NSUInteger i = 0; i < sizeof(_words); i++)
+        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+    _hash = (NSUInteger)hash;
+}
+
 - (instancetype)initWithKeyWords:(const uint64_t *)words
 {
+    static const uint64_t emptyWords[20];
     self = [super init];
     if (self) {
-        memcpy(_words, words, sizeof(_words));
-        const uint8_t *bytes = (const uint8_t *)_words;
-        uint64_t hash = UINT64_C(14695981039346656037);
-        for (NSUInteger i = 0; i < sizeof(_words); i++)
-            hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-        _hash = (NSUInteger)hash;
+        _lookup = !words;
+        [self loadWords:words ? words : emptyWords];
     }
     return self;
+}
+- (void)setLookupWords:(const uint64_t *)words
+{
+    NSAssert(_lookup, @"Stored texture keys are immutable");
+    if (memcmp(_words, words, sizeof(_words)))
+        [self loadWords:words];
 }
 - (NSUInteger)hash
 {
@@ -63,41 +81,44 @@ static BOOL texture_cache_error(NSError **error, NSString *message)
 - (id)copyWithZone:(NSZone *)zone
 {
     (void)zone;
-    return self;
+    return _lookup ?
+        [[NV2AMetalTextureKey alloc] initWithKeyWords:_words] : self;
 }
 @end
 
 @interface NV2AMetalTextureContent : NSObject
 @property(nonatomic) id<MTLTexture> texture;
+/* Surface captures have no palette decoder and leave this unset. */
 @property(nonatomic) id<MTLBuffer> faults;
 @property(nonatomic) NV2AMetalSurfaceRecording *token;
 @property(nonatomic) unsigned int scale, minLevel, maxLevel;
 @property(nonatomic) BOOL rectangle, signedNormalized, depth;
 @property(nonatomic) BOOL mixedSignedHalf;
 @property(nonatomic) BOOL validated;
-/* One latest immutable binding per content; captured earlier bindings remain
- * owned by their callers even when the sampler policy changes. */
-@property(nonatomic) NV2AMetalTextureBinding *binding;
-@property(nonatomic) NV2AMetalSamplerConfig bindingPolicy;
 @end
 @implementation NV2AMetalTextureContent
 @end
 
 @interface NV2AMetalCachedTexture ()
+@property(nonatomic, readonly) NV2AMetalTextureContent *content;
 - (instancetype)initWithContent:(NV2AMetalTextureContent *)content
-                        binding:(NV2AMetalTextureBinding *)binding;
+                        binding:(NV2AMetalTextureBinding *)binding
+                         policy:(const NV2AMetalSamplerConfig *)policy;
+- (BOOL)matchesPolicy:(const NV2AMetalSamplerConfig *)policy;
 @end
 @implementation NV2AMetalCachedTexture {
-    NV2AMetalTextureContent *_content;
+    NV2AMetalSamplerConfig _policy;
     BOOL _restored;
 }
 - (instancetype)initWithContent:(NV2AMetalTextureContent *)content
                         binding:(NV2AMetalTextureBinding *)binding
+                         policy:(const NV2AMetalSamplerConfig *)policy
 {
     self = [super init];
     if (self) {
         _content = content;
         _binding = binding;
+        _policy = *policy;
         _scale = content.scale;
         _rectangle = content.rectangle;
         _signedNormalized = content.signedNormalized;
@@ -126,21 +147,40 @@ static BOOL texture_cache_error(NSError **error, NSString *message)
     _restored = YES;
     return self;
 }
+/* Compare semantic fields, never padding copied from a caller's struct. */
+- (BOOL)matchesPolicy:(const NV2AMetalSamplerConfig *)policy
+{
+    return _policy.filter == policy->filter &&
+           _policy.address == policy->address &&
+           _policy.border_color == policy->border_color &&
+           _policy.anisotropy == policy->anisotropy &&
+           _policy.min_level == policy->min_level &&
+           _policy.max_level == policy->max_level &&
+           _policy.rectangle == policy->rectangle &&
+           _policy.bordered == policy->bordered &&
+           _policy.hilo16 == policy->hilo16 &&
+           _policy.signed_channels == policy->signed_channels;
+}
 - (BOOL)decodeValidated
 {
-    return _restored || (_content.validated && _content.token.completed &&
+    return _restored || (_content.validated && _content.token.producersCompleted &&
                          !_content.token.cancelled);
+}
+- (NV2AMetalSurfaceRecording *)producerRecording
+{
+    return _content.token;
 }
 - (BOOL)validateCompletedWithError:(NSError **)error
 {
     if (self.decodeValidated)
         return YES;
-    if (_content.token.cancelled || !_content.token.completed) {
+    if (_content.token.cancelled || !_content.token.producersCompleted) {
         return texture_cache_error(
             error, @"Texture decode was cancelled or has not completed");
     }
-    uint32_t faults;
-    memcpy(&faults, _content.faults.contents, sizeof(faults));
+    uint32_t faults = 0;
+    if (_content.faults)
+        memcpy(&faults, _content.faults.contents, sizeof(faults));
     if (faults)
         return texture_cache_error(error, @"Native texture palette index fault");
     _content.validated = YES;
@@ -148,20 +188,83 @@ static BOOL texture_cache_error(NSError **error, NSString *message)
 }
 @end
 
-/* Compare semantic fields, never padding copied from a caller's struct. */
-static BOOL same_policy(const NV2AMetalSamplerConfig *a,
-                        const NV2AMetalSamplerConfig *b)
+/* A live upload still owns exact VRAM reader ranges. Keep only small raw
+ * sources, and never extend a texture's GPU lifetime through this index. */
+enum { NV2AMetalTextureComparisonBytes = 64 * 1024 };
+@interface NV2AMetalTextureComparison : NSObject
+@property(nonatomic, weak) NV2AMetalCachedTexture *texture;
+@property(nonatomic) NSData *source, *palette;
+@end
+@implementation NV2AMetalTextureComparison
+@end
+
+/* These views reinterpret the same one/two guest bytes. The capture keeps
+ * their address order; immutable Metal read swizzles supply logical RGBA. */
+static unsigned rtt_byte_storage(unsigned surface, unsigned format)
 {
-    return a->filter == b->filter && a->address == b->address &&
-           a->border_color == b->border_color &&
-           a->anisotropy == b->anisotropy && a->min_level == b->min_level &&
-           a->max_level == b->max_level && a->rectangle == b->rectangle &&
-           a->bordered == b->bordered && a->hilo16 == b->hilo16 &&
-           a->signed_channels == b->signed_channels;
+    if (surface == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8) {
+        switch (format) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+            return NV2AMetalTextureStorageByteY8;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+            return NV2AMetalTextureStorageByteAY8;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+            return NV2AMetalTextureStorageByteA8;
+        }
+    } else if (surface == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8) {
+        switch (format) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+            return NV2AMetalTextureStorageByteA8Y8;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+            return NV2AMetalTextureStorageByteG8B8;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+            return NV2AMetalTextureStorageByteR8B8;
+        }
+    }
+    return NV2AMetalTextureStorageFloat32;
+}
+
+static BOOL rtt_linear_format(unsigned format)
+{
+    return format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8 ||
+           format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8;
+}
+
+static unsigned rtt_swizzled_channel_order(unsigned format)
+{
+    switch (format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8:
+        return 1;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8:
+        return 2;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8:
+        return 3;
+    default:
+        return 0;
+    }
 }
 
 static BOOL compatible(NV2AMetalCachedSurface *s,
-                       const NV2AMetalTextureSource *source)
+                       const NV2AMetalTextureSource *source,
+                       BOOL downsampleOpaque, BOOL swizzledChannels,
+                       BOOL packed1555)
 {
     if (!s || !s.valid || s.address != source->address) {
         return NO;
@@ -179,7 +282,12 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     switch (c.format) {
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5:
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5:
-        match = t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5;
+        match =
+            t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||
+            (packed1555 &&
+             (t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5));
         bytes = 2;
         break;
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5:
@@ -196,22 +304,31 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8:
-        match = t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
-                t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
-                t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
-                t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8;
+        match =
+            t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+            t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
+            t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 ||
+            t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8 ||
+            (swizzledChannels &&
+             (t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8)) ||
+            ((c.scale == 1 || downsampleOpaque) &&
+             (t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
+              t.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8));
         bytes = 4;
+        break;
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+        bytes = c.format == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8 ? 1 : 2;
+        match = rtt_byte_storage(c.format, t.format) !=
+                NV2AMetalTextureStorageFloat32;
         break;
     default:
         break;
     }
-    BOOL linear =
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 ||
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
-        t.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8;
+    BOOL linear = rtt_linear_format(t.format);
     NSUInteger length = linear ? (NSUInteger)t.pitch * t.height :
                                  (NSUInteger)t.width * t.height * bytes;
     /* Direct copies preserve texel order only when both views use the same
@@ -219,12 +336,53 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     return match && c.swizzle != linear && source->length == length;
 }
 
+static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
+{
+    NV2AMetalSurfaceTransfer *transfer = surface.transfer;
+    MTLPixelFormat pixelFormat = transfer.nativePixelFormat;
+    MTLTextureSwizzleChannels swizzle = transfer.nativeSwizzle;
+    if (swizzle.red != MTLTextureSwizzleRed ||
+        swizzle.green != MTLTextureSwizzleGreen ||
+        swizzle.blue != MTLTextureSwizzleBlue ||
+        swizzle.alpha != MTLTextureSwizzleAlpha)
+        return NV2AMetalTextureStorageFloat32;
+    unsigned surfaceFormat = surface.transfer.config.format;
+    if ((pixelFormat == MTLPixelFormatR8Unorm &&
+         surfaceFormat == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8) ||
+        (pixelFormat == MTLPixelFormatRG8Unorm &&
+         surfaceFormat == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8))
+        return rtt_byte_storage(surfaceFormat, format);
+    if (pixelFormat == MTLPixelFormatB5G6R5Unorm &&
+        surfaceFormat == NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5)
+        return NV2AMetalTextureStoragePackedR565;
+    if (pixelFormat == MTLPixelFormatBGR5A1Unorm &&
+        (surfaceFormat == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 ||
+         surfaceFormat == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5))
+        return format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5 ||
+                       format ==
+                           NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5 ?
+                   NV2AMetalTextureStoragePackedA1555 :
+                   NV2AMetalTextureStoragePackedX1555;
+    if (pixelFormat != MTLPixelFormatBGRA8Unorm)
+        return NV2AMetalTextureStorageFloat32;
+    if (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
+        format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8)
+        return NV2AMetalTextureStorageBGRX8;
+    if (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+        format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8)
+        return NV2AMetalTextureStorageBGRA8SwapRB;
+    if (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
+        format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8)
+        return NV2AMetalTextureStorageBGRA8ARGB;
+    return NV2AMetalTextureStorageBGRA8;
+}
+
 @interface NV2AMetalTextureCache ()
 - (NV2AMetalCachedTexture *)prepareSource:(const NV2AMetalTextureSource *)source
                                   sampler:
                                       (const NV2AMetalSamplerConfig *)sampler
                                     frame:(uint64_t)frame
-                             recordGPUUse:(BOOL)recordGPUUse
+                        collectedFeedback:(BOOL *)collectedFeedback
                                     error:(NSError **)error;
 @end
 
@@ -233,8 +391,16 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     NV2AMetalTextureSampler *_sampler;
     id<MTLComputePipelineState> _capture;
     id<MTL4ArgumentTable> _arguments;
-    NV2AMetalLRUCache<NV2AMetalTextureKey *, NV2AMetalTextureContent *>
+    id<MTLComputePipelineState> _downsampleCapture;
+    id<MTL4ArgumentTable> _downsampleArguments;
+    id<MTLComputePipelineState> _downsampleChannelsCapture;
+    id<MTL4ArgumentTable> _downsampleChannelsArguments;
+    NV2AMetalTextureKey *_lookupKey;
+    NV2AMetalLRUCache<NV2AMetalTextureKey *, NV2AMetalCachedTexture *>
         *_entries;
+    /* At most 4 MiB of raw comparison bytes, separate from GPU content. */
+    NV2AMetalLRUCache<NV2AMetalTextureKey *, NV2AMetalTextureComparison *>
+        *_comparisons;
 }
 - (instancetype)initWithSurfaces:(NV2AMetalSurfaceCache *)surfaces
                            error:(NSError **)error
@@ -254,11 +420,22 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
                                                        error:error];
     _sampler = [[NV2AMetalTextureSampler alloc] initWithDevice:device
                                                          error:error];
+    if (!_upload || !_sampler)
+        return nil;
+    _lookupKey = [[NV2AMetalTextureKey alloc] initWithKeyWords:NULL];
+    _entries = [[NV2AMetalLRUCache alloc] initWithCapacity:512];
+    return self;
+}
+- (BOOL)prepareCaptureWithError:(NSError **)error
+{
+    if (_capture)
+        return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
     id<MTL4Compiler> compiler =
         [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
                                     error:error];
-    if (!_upload || !_sampler || !compiler) {
-        return nil;
+    if (!compiler) {
+        return NO;
     }
     MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
     ld.source = @(metal_shader_source);
@@ -267,27 +444,304 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     ld.options.mathMode = MTLMathModeSafe;
     id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
     if (!library) {
-        return nil;
+        return NO;
     }
     MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
     fn.library = library;
     fn.name = @"nv2a_surface_texture";
     MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
     pd.computeFunctionDescriptor = fn;
-    _capture = [compiler newComputePipelineStateWithDescriptor:pd
-                                           compilerTaskOptions:nil
-                                                         error:error];
+    id<MTLComputePipelineState> capture =
+        [compiler newComputePipelineStateWithDescriptor:pd
+                                    compilerTaskOptions:nil
+                                                  error:error];
+    if (!capture)
+        return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
     ad.maxBufferBindCount = 1;
     ad.maxTextureBindCount = 2;
     ad.initializeBindings = YES;
-    _arguments = [device newArgumentTableWithDescriptor:ad error:error];
-    if (!_capture || !_arguments) {
+    id<MTL4ArgumentTable> arguments =
+        [device newArgumentTableWithDescriptor:ad error:error];
+    if (!arguments)
+        return NO;
+    _capture = capture;
+    _arguments = arguments;
+    return YES;
+}
+/* The scaled A8/A7 -> X8 case needs the old RAM downsample semantics.
+ * The remaining source/layout checks still belong to compatible(). */
+- (BOOL)canCaptureDownsampledOpaqueSurface:(NV2AMetalCachedSurface *)surface
+                                    format:(unsigned)format
+{
+    if (!surface.valid ||
+        (format != NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 &&
+         format != NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8))
+        return NO;
+    NV2AMetalSurfaceTransfer *transfer = surface.transfer;
+    NV2AMetalSurfaceConfig c = transfer.config;
+    if (!c.color || c.scale <= 1 || !c.width || !c.height ||
+        (c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 &&
+         c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8 &&
+         c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8) ||
+        transfer.nativePixelFormat != MTLPixelFormatBGRA8Unorm ||
+        c.width > NSUIntegerMax / c.scale ||
+        c.height > NSUIntegerMax / c.scale ||
+        transfer.nativeWidth != (NSUInteger)c.width * c.scale ||
+        transfer.nativeHeight != (NSUInteger)c.height * c.scale)
+        return NO;
+    MTLTextureSwizzleChannels swizzle = transfer.nativeSwizzle;
+    return swizzle.red == MTLTextureSwizzleRed &&
+           swizzle.green == MTLTextureSwizzleGreen &&
+           swizzle.blue == MTLTextureSwizzleBlue &&
+           swizzle.alpha == MTLTextureSwizzleAlpha;
+}
+
+- (BOOL)prepareDownsampleCaptureWithError:(NSError **)error
+{
+    if (_downsampleCapture)
+        return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
+    NV2AMetalShaderLibrary *module =
+        [NV2AMetalShaderLibrary sharedWithDevice:device
+                                          source:metal_shader_source
+                                           error:error];
+    if (!module)
+        return NO;
+    id<MTLComputePipelineState> pipeline =
+        [module computeFunction:@"nv2a_surface_texture_downsample_opaque"
+                          error:error];
+    if (!pipeline)
+        return NO;
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+    ad.maxBufferBindCount = 1;
+    ad.maxTextureBindCount = 2;
+    ad.initializeBindings = YES;
+    id<MTL4ArgumentTable> arguments =
+        [device newArgumentTableWithDescriptor:ad error:error];
+    if (!arguments)
+        return NO;
+    _downsampleCapture = pipeline;
+    _downsampleArguments = arguments;
+    return YES;
+}
+
+- (NV2AMetalTextureContent *)captureDownsampledOpaque:
+                                 (NV2AMetalCachedSurface *)surface
+                                                frame:(uint64_t)frame
+                                               format:(unsigned)format
+                                                error:(NSError **)error
+{
+    surface = [_surfaces prepareSurfaceForRTTSnapshot:surface
+                                                frame:frame
+                                                error:error];
+    if (!surface)
+        return nil;
+    if (![self canCaptureDownsampledOpaqueSurface:surface format:format]) {
+        texture_cache_error(error, @"Invalid scaled opaque surface capture");
         return nil;
     }
-    _entries = [[NV2AMetalLRUCache alloc] initWithCapacity:512];
-    return self;
+    NV2AMetalSurfaceConfig c = surface.transfer.config;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:c.width
+                                    height:c.height
+                                 mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    /* Writable textures require identity swizzles. The kernel writes opaque
+     * alpha into every texel, preserving X8 reads and portable snapshots. */
+    NV2AMetalCommands *commands = _surfaces.commands;
+    id<MTLTexture> texture = [commands.device newTextureWithDescriptor:td];
+    if (!texture) {
+        texture_cache_error(error, @"Cannot allocate scaled surface capture");
+        return nil;
+    }
+    const NV2AMetalSurfaceTextureUniforms u = {
+        .width = c.width,
+        .height = c.height,
+    };
+    NSUInteger offset = 0;
+    id<MTLBuffer> uniforms = [commands uploadBytes:&u
+                                            length:sizeof(u)
+                                            offset:&offset
+                                             error:error];
+    id<MTLTexture> source =
+        uniforms ? [surface.transfer textureForCommands:commands error:error] :
+                   nil;
+    if (!source || ![commands addResource:source error:error] ||
+        ![commands addResource:texture error:error] ||
+        ![commands keepAlive:self error:error])
+        return nil;
+    id<MTL4ComputeCommandEncoder> encoder =
+        [commands.commandBuffer computeCommandEncoder];
+    if (!encoder) {
+        texture_cache_error(error,
+                            @"Cannot create scaled surface capture encoder");
+        return nil;
+    }
+    [encoder barrierAfterQueueStages:MTLStageAll
+                        beforeStages:MTLStageDispatch
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder setComputePipelineState:_downsampleCapture];
+    [_downsampleArguments setAddress:uniforms.gpuAddress + offset atIndex:0];
+    [_downsampleArguments setTexture:source.gpuResourceID atIndex:0];
+    [_downsampleArguments setTexture:texture.gpuResourceID atIndex:1];
+    [encoder setArgumentTable:_downsampleArguments];
+    [encoder dispatchThreads:MTLSizeMake(c.width, c.height, 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder barrierAfterStages:MTLStageAll
+              beforeQueueStages:MTLStageAll
+              visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder endEncoding];
+    if (![_surfaces markRTTSnapshotCaptured:surface error:error])
+        return nil;
+    NV2AMetalTextureContent *content = [NV2AMetalTextureContent new];
+    content.texture = texture;
+    content.scale = 1;
+    content.token = _surfaces.recording;
+    return content;
 }
+
+/* The first two SZ channel orders can retain scale-one source bytes with an
+ * immutable read swizzle. Other cases reproduce the old download's logical
+ * texel selection, including all eight stored alpha bits of A7 surfaces. */
+- (BOOL)canCaptureSwizzledChannelsSurface:(NV2AMetalCachedSurface *)surface
+                                   format:(unsigned)format
+{
+    if (!surface.valid || !rtt_swizzled_channel_order(format))
+        return NO;
+    NV2AMetalSurfaceTransfer *transfer = surface.transfer;
+    NV2AMetalSurfaceConfig c = transfer.config;
+    BOOL linear = format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8;
+    if (!c.color || c.swizzle == linear || !c.scale || !c.width || !c.height ||
+        (c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 &&
+         c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8 &&
+         c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8) ||
+        transfer.nativePixelFormat != MTLPixelFormatBGRA8Unorm ||
+        c.width > NSUIntegerMax / c.scale ||
+        c.height > NSUIntegerMax / c.scale ||
+        transfer.nativeWidth != (NSUInteger)c.width * c.scale ||
+        transfer.nativeHeight != (NSUInteger)c.height * c.scale)
+        return NO;
+    MTLTextureSwizzleChannels swizzle = transfer.nativeSwizzle;
+    return swizzle.red == MTLTextureSwizzleRed &&
+           swizzle.green == MTLTextureSwizzleGreen &&
+           swizzle.blue == MTLTextureSwizzleBlue &&
+           swizzle.alpha == MTLTextureSwizzleAlpha;
+}
+
+- (BOOL)prepareDownsampleChannelsCaptureWithError:(NSError **)error
+{
+    if (_downsampleChannelsCapture)
+        return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
+    NV2AMetalShaderLibrary *module =
+        [NV2AMetalShaderLibrary sharedWithDevice:device
+                                          source:metal_shader_source
+                                           error:error];
+    if (!module)
+        return NO;
+    id<MTLComputePipelineState> pipeline =
+        [module computeFunction:@"nv2a_surface_texture_downsample_channels"
+                          error:error];
+    if (!pipeline)
+        return NO;
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+    ad.maxBufferBindCount = 1;
+    ad.maxTextureBindCount = 2;
+    ad.initializeBindings = YES;
+    id<MTL4ArgumentTable> arguments =
+        [device newArgumentTableWithDescriptor:ad error:error];
+    if (!arguments)
+        return NO;
+    _downsampleChannelsCapture = pipeline;
+    _downsampleChannelsArguments = arguments;
+    return YES;
+}
+
+- (NV2AMetalTextureContent *)captureDownsampledChannels:
+                                 (NV2AMetalCachedSurface *)surface
+                                                  frame:(uint64_t)frame
+                                                 format:(unsigned)format
+                                                  error:(NSError **)error
+{
+    surface = [_surfaces prepareSurfaceForRTTSnapshot:surface
+                                                frame:frame
+                                                error:error];
+    if (!surface)
+        return nil;
+    unsigned order = rtt_swizzled_channel_order(format);
+    if (![self canCaptureSwizzledChannelsSurface:surface format:format] ||
+        (surface.transfer.config.scale == 1 && order != 3)) {
+        texture_cache_error(error, @"Invalid scaled channel surface capture");
+        return nil;
+    }
+    NV2AMetalSurfaceConfig c = surface.transfer.config;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:c.width
+                                    height:c.height
+                                 mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    /* Shader-write targets require identity swizzles. Store the logical
+     * channel order directly so snapshots need no new storage type. */
+    NV2AMetalCommands *commands = _surfaces.commands;
+    id<MTLTexture> texture = [commands.device newTextureWithDescriptor:td];
+    if (!texture) {
+        texture_cache_error(error,
+                            @"Cannot allocate scaled channel surface capture");
+        return nil;
+    }
+    const NV2AMetalSurfaceTextureUniforms u = {
+        .width = c.width,
+        .height = c.height,
+        .channel_order = order,
+    };
+    NSUInteger offset = 0;
+    id<MTLBuffer> uniforms = [commands uploadBytes:&u
+                                            length:sizeof(u)
+                                            offset:&offset
+                                             error:error];
+    id<MTLTexture> source =
+        uniforms ? [surface.transfer textureForCommands:commands error:error] :
+                   nil;
+    if (!source || ![commands addResource:source error:error] ||
+        ![commands addResource:texture error:error] ||
+        ![commands keepAlive:self error:error])
+        return nil;
+    id<MTL4ComputeCommandEncoder> encoder =
+        [commands.commandBuffer computeCommandEncoder];
+    if (!encoder) {
+        texture_cache_error(error,
+                            @"Cannot create scaled channel capture encoder");
+        return nil;
+    }
+    [encoder barrierAfterQueueStages:MTLStageAll
+                        beforeStages:MTLStageDispatch
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder setComputePipelineState:_downsampleChannelsCapture];
+    [_downsampleChannelsArguments setAddress:uniforms.gpuAddress + offset
+                                     atIndex:0];
+    [_downsampleChannelsArguments setTexture:source.gpuResourceID atIndex:0];
+    [_downsampleChannelsArguments setTexture:texture.gpuResourceID atIndex:1];
+    [encoder setArgumentTable:_downsampleChannelsArguments];
+    [encoder dispatchThreads:MTLSizeMake(c.width, c.height, 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder barrierAfterStages:MTLStageAll
+              beforeQueueStages:MTLStageAll
+              visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder endEncoding];
+    if (![_surfaces markRTTSnapshotCaptured:surface error:error])
+        return nil;
+    NV2AMetalTextureContent *content = [NV2AMetalTextureContent new];
+    content.texture = texture;
+    content.scale = 1;
+    content.token = _surfaces.recording;
+    return content;
+}
+
 - (NSUInteger)count
 {
     return _entries.count;
@@ -295,6 +749,7 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
 - (void)removeAllTextures
 {
     [_entries removeAllObjects];
+    [_comparisons removeAllObjects];
 }
 
 - (BOOL)sourceLengthForShape:(const NV2AMetalTextureShape *)shape
@@ -308,68 +763,202 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
                                    error:error];
 }
 
+/* These three guest views share the source's exact packed two-byte words.
+ * Only the new scaled path needs a bounded linear result for its final blit;
+ * existing LU X1555 captures retain their high-resolution representation. */
+- (BOOL)canCapturePacked1555Surface:(NV2AMetalCachedSurface *)surface
+                             format:(unsigned)format
+{
+    if (!surface.valid ||
+        (format != NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5 &&
+         format != NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5 &&
+         format != NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5))
+        return NO;
+    NV2AMetalSurfaceTransfer *transfer = surface.transfer;
+    NV2AMetalSurfaceConfig c = transfer.config;
+    MTLTextureSwizzleChannels swizzle = transfer.nativeSwizzle;
+    BOOL linear = format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5;
+    if (!c.color || c.swizzle == linear ||
+        (c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 &&
+         c.format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5) ||
+        transfer.nativePixelFormat != MTLPixelFormatBGR5A1Unorm ||
+        swizzle.red != MTLTextureSwizzleRed ||
+        swizzle.green != MTLTextureSwizzleGreen ||
+        swizzle.blue != MTLTextureSwizzleBlue ||
+        swizzle.alpha != MTLTextureSwizzleAlpha || !c.width || !c.height ||
+        !c.scale || c.width > UINT32_MAX / c.scale ||
+        c.height > UINT32_MAX / c.scale ||
+        transfer.nativeWidth != (NSUInteger)c.width * c.scale ||
+        transfer.nativeHeight != (NSUInteger)c.height * c.scale)
+        return NO;
+    if (c.scale > 1) {
+        /* SurfaceTransfer writes its original guest pitch. The final raw
+         * buffer-to-texture blit has the same even/pixel-width pitch limits
+         * as the existing direct surface-copy path. */
+        uint64_t span =
+            (uint64_t)(c.height - 1) * c.pitch + (uint64_t)c.width * 2;
+        if (c.width > UINT32_MAX / 2 || c.pitch < c.width * 2 ||
+            (c.pitch & 1) || c.pitch > 16384u * 2 || span > UINT32_MAX ||
+            span > _surfaces.commands.device.maxBufferLength)
+            return NO;
+    }
+    return YES;
+}
+
+- (NV2AMetalTextureContent *)captureDownsampledPacked1555:
+                                 (NV2AMetalCachedSurface *)surface
+                                                    frame:(uint64_t)frame
+                                                   format:(unsigned)format
+                                                    error:(NSError **)error
+{
+    surface = [_surfaces prepareSurfaceForRTTSnapshot:surface
+                                                frame:frame
+                                                error:error];
+    if (!surface)
+        return nil;
+    if (![self canCapturePacked1555Surface:surface format:format] ||
+        surface.transfer.config.scale <= 1) {
+        texture_cache_error(error, @"Invalid scaled packed surface capture");
+        return nil;
+    }
+    NV2AMetalSurfaceConfig c = surface.transfer.config;
+    unsigned storage = rtt_storage(surface, format);
+    NV2AMetalCommands *commands = _surfaces.commands;
+    NSUInteger length =
+        (NSUInteger)(c.height - 1) * c.pitch + (NSUInteger)c.width * 2;
+    /* Never borrow orderedTransferScratch here: encodeDownload uses that
+     * scratch for the distinct, full-resolution raw source staging. */
+    id<MTLBuffer> result =
+        [commands.device newBufferWithLength:length
+                                     options:MTLResourceStorageModePrivate];
+    if (!result) {
+        texture_cache_error(error, @"Cannot allocate packed surface result");
+        return nil;
+    }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:nv2a_metal_texture_storage_format(
+                                               storage)
+                                     width:c.width
+                                    height:c.height
+                                 mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead;
+    td.swizzle = nv2a_metal_texture_storage_swizzle(storage);
+    id<MTLTexture> texture = [commands.device newTextureWithDescriptor:td];
+    if (!texture) {
+        texture_cache_error(error, @"Cannot allocate packed surface capture");
+        return nil;
+    }
+    if (![commands addResource:result error:error] ||
+        ![commands addResource:texture error:error] ||
+        ![surface.transfer encodeDownloadToBuffer:result
+                                           offset:0
+                                          swizzle:NO
+                                             flip:NO
+                                        downscale:YES
+                                         commands:commands
+                                            error:error])
+        return nil;
+    id<MTL4ComputeCommandEncoder> encoder =
+        [commands.commandBuffer computeCommandEncoder];
+    if (!encoder) {
+        texture_cache_error(error,
+                            @"Cannot create packed surface capture encoder");
+        return nil;
+    }
+    [encoder barrierAfterQueueStages:MTLStageAll
+                        beforeStages:MTLStageBlit
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder copyFromBuffer:result
+               sourceOffset:0
+          sourceBytesPerRow:c.pitch
+        sourceBytesPerImage:0
+                 sourceSize:MTLSizeMake(c.width, c.height, 1)
+                  toTexture:texture
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [encoder barrierAfterStages:MTLStageBlit
+              beforeQueueStages:MTLStageAll
+              visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder endEncoding];
+    if (![_surfaces markRTTSnapshotCaptured:surface error:error])
+        return nil;
+    NV2AMetalTextureContent *content = [NV2AMetalTextureContent new];
+    content.texture = texture;
+    content.scale = 1;
+    content.token = _surfaces.recording;
+    return content;
+}
+
 - (NV2AMetalTextureContent *)capture:(NV2AMetalCachedSurface *)s
                                frame:(uint64_t)frame
                               format:(unsigned int)format
                                error:(NSError **)error
 {
+    unsigned storage = rtt_storage(s, format);
+    BOOL direct = storage != NV2AMetalTextureStorageFloat32;
     NV2AMetalSurfaceConfig c = s.transfer.config;
-    if (![_surfaces prepareTextureRead:s error:error])
-        return nil;
-    s = [_surfaces prepareSurfaceAtAddress:s.address
-                                    config:&c
-                                     frame:frame
-                                     error:error];
+    s = [_surfaces prepareSurfaceForRTTSnapshot:s frame:frame error:error];
     if (!s) {
         return nil;
     }
-    id<MTLTexture> input = s.transfer.texture;
-    /* BGRA8 reads, alpha replacement and channel permutations all stay on the
-     * byte lattice. Packed 5/6-bit surfaces retain Float32 capture precision.
-     */
-    MTLPixelFormat formatOut = input.pixelFormat == MTLPixelFormatBGRA8Unorm ?
-                                  MTLPixelFormatRGBA8Unorm :
-                                  MTLPixelFormatRGBA32Float;
-    MTLTextureDescriptor *td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:formatOut
-                                     width:input.width
-                                    height:input.height
-                                 mipmapped:NO];
+    MTLPixelFormat inputFormat = s.transfer.nativePixelFormat;
+    NSUInteger inputWidth = s.transfer.nativeWidth,
+               inputHeight = s.transfer.nativeHeight;
+    /* Copy compatible surfaces without sampling or conversion. The immutable
+     * read swizzle applies alpha replacement/channel order and survives
+     * snapshots. Packed formats keep the source's native read precision. */
+    MTLPixelFormat formatOut =
+        direct ? nv2a_metal_texture_storage_format(storage) :
+        inputFormat == MTLPixelFormatBGRA8Unorm ? MTLPixelFormatRGBA8Unorm :
+                                                  MTLPixelFormatRGBA32Float;
+    MTLTextureDescriptor *td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:formatOut
+                                                           width:inputWidth
+                                                          height:inputHeight
+                                                       mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
-    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    id<MTLDevice> device = _surfaces.commands.device;
-    id<MTLTexture> texture = [device newTextureWithDescriptor:td];
-    uint32_t zero = 0;
-    id<MTLBuffer> faults =
-        [device newBufferWithBytes:&zero
-                            length:sizeof(zero)
-                           options:MTLResourceStorageModeShared];
+    td.usage =
+        MTLTextureUsageShaderRead | (direct ? 0 : MTLTextureUsageShaderWrite);
+    if (direct)
+        td.swizzle = nv2a_metal_texture_storage_swizzle(storage);
+    NV2AMetalCommands *commands = _surfaces.commands;
+    id<MTLTexture> texture = [commands.device newTextureWithDescriptor:td];
+    if (!texture) {
+        texture_cache_error(error, @"Cannot allocate surface texture capture");
+        return nil;
+    }
     NV2AMetalSurfaceTextureUniforms u = {
-        .width = (unsigned int)input.width,
-        .height = (unsigned int)input.height,
+        .width = (unsigned int)inputWidth,
+        .height = (unsigned int)inputHeight,
         .channel_order =
-            format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ? 1 :
-            format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ? 2 :
-                                                                         0,
+            (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+             format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8) ?
+                1 :
+            (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
+             format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8) ?
+                2 :
+                0,
         .force_alpha =
             c.format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 ||
             c.format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5 ||
             c.format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8 ||
             c.format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8,
     };
-    id<MTLBuffer> uniforms =
-        [device newBufferWithBytes:&u
-                            length:sizeof(u)
-                           options:MTLResourceStorageModeShared];
-    NV2AMetalCommands *commands = _surfaces.commands;
-    if (!texture || !faults || !uniforms ||
-        ![commands addResource:input error:error] ||
-        ![commands addResource:texture error:error] ||
-        ![commands addResource:uniforms error:error] ||
-        ![commands keepAlive:self error:error]) {
-        texture_cache_error(error, @"Cannot retain surface texture capture");
+    NSUInteger uniformOffset = 0;
+    id<MTLBuffer> uniforms = direct ? nil :
+                                      [commands uploadBytes:&u
+                                                     length:sizeof(u)
+                                                     offset:&uniformOffset
+                                                      error:error];
+    if (!direct && !uniforms)
         return nil;
-    }
+    id<MTLTexture> input = [s.transfer textureForCommands:commands error:error];
+    if (!input || ![commands addResource:input error:error] ||
+        ![commands addResource:texture error:error] ||
+        (!direct && ![commands keepAlive:self error:error]))
+        return nil;
     id<MTL4ComputeCommandEncoder> e =
         [commands.commandBuffer computeCommandEncoder];
     if (!e) {
@@ -378,22 +967,31 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
         return nil;
     }
     [e barrierAfterQueueStages:MTLStageAll
-                  beforeStages:MTLStageDispatch
+                  beforeStages:direct ? MTLStageBlit : MTLStageDispatch
              visibilityOptions:MTL4VisibilityOptionDevice];
-    [e setComputePipelineState:_capture];
-    [_arguments setAddress:uniforms.gpuAddress atIndex:0];
-    [_arguments setTexture:input.gpuResourceID atIndex:0];
-    [_arguments setTexture:texture.gpuResourceID atIndex:1];
-    [e setArgumentTable:_arguments];
-    [e dispatchThreads:MTLSizeMake(input.width, input.height, 1)
-        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    if (direct) {
+        [e copyFromTexture:input sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(input.width, input.height, 1)
+                     toTexture:texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+    } else {
+        [e setComputePipelineState:_capture];
+        [_arguments setAddress:uniforms.gpuAddress + uniformOffset atIndex:0];
+        [_arguments setTexture:input.gpuResourceID atIndex:0];
+        [_arguments setTexture:texture.gpuResourceID atIndex:1];
+        [e setArgumentTable:_arguments];
+        [e dispatchThreads:MTLSizeMake(input.width, input.height, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    }
     [e barrierAfterStages:MTLStageAll
         beforeQueueStages:MTLStageAll
         visibilityOptions:MTL4VisibilityOptionDevice];
     [e endEncoding];
+    if (![_surfaces markRTTSnapshotCaptured:s error:error])
+        return nil;
     NV2AMetalTextureContent *content = [NV2AMetalTextureContent new];
     content.texture = texture;
-    content.faults = faults;
     content.scale = c.scale;
     content.token = _surfaces.recording;
     return content;
@@ -408,28 +1006,30 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     return [self prepareSource:source
                        sampler:sampler
                          frame:frame
-                  recordGPUUse:YES
+             collectedFeedback:NULL
                          error:error];
 }
 - (NV2AMetalCachedTexture *)captureSource:(const NV2AMetalTextureSource *)source
                                   sampler:
                                       (const NV2AMetalSamplerConfig *)sampler
                                     frame:(uint64_t)frame
+                        collectedFeedback:(BOOL *)collectedFeedback
                                     error:(NSError **)error
 {
     return [self prepareSource:source
                        sampler:sampler
                          frame:frame
-                  recordGPUUse:NO
+             collectedFeedback:collectedFeedback
                          error:error];
 }
 - (NV2AMetalCachedTexture *)prepareSource:(const NV2AMetalTextureSource *)source
                                   sampler:
                                       (const NV2AMetalSamplerConfig *)sampler
                                     frame:(uint64_t)frame
-                             recordGPUUse:(BOOL)recordGPUUse
+                        collectedFeedback:(BOOL *)collectedFeedback
                                     error:(NSError **)error
 {
+    BOOL recordGPUUse = !collectedFeedback;
     if (!source || !sampler || !source->length) {
         texture_cache_error(error, @"Missing native texture source/sampler");
         return nil;
@@ -450,27 +1050,34 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     if (!indexed) {
         c.palette_address = c.palette_length = 0;
     }
-    uint64_t version, palette_version;
-    if (![_surfaces sourceVersionAtAddress:c.address
-                                    length:c.length
-                                   version:&version
-                                     error:error] ||
-        ![_surfaces sourceVersionAtAddress:c.palette_address
-                                    length:c.palette_length
-                                   version:&palette_version
-                                     error:error]) {
+    const NV2AMetalVRAMReadSpan sources[] = {
+        { .address = c.address, .length = c.length },
+        { .address = c.palette_address, .length = c.palette_length },
+    };
+    uint64_t versions[2] = { 0 };
+    NV2AMetalCachedSurface *surface = nil;
+    if (![_surfaces sourceVersionsForReadSpans:sources
+                                         count:indexed ? 2 : 1
+                                      versions:versions
+                                  firstSurface:&surface
+                                         error:error]) {
         return nil;
     }
-    NV2AMetalCachedSurface *surface =
-        [_surfaces surfaceContainingAddress:c.address];
-    BOOL rtt = compatible(surface, &c);
+    BOOL downsampleOpaque =
+        [self canCaptureDownsampledOpaqueSurface:surface format:c.shape.format];
+    BOOL swizzledChannels =
+        [self canCaptureSwizzledChannelsSurface:surface format:c.shape.format];
+    BOOL packed1555 = [self canCapturePacked1555Surface:surface
+                                                 format:c.shape.format];
+    BOOL rtt =
+        compatible(surface, &c, downsampleOpaque, swizzledChannels, packed1555);
     const uint64_t words[20] = {
         c.address,
         c.length,
         c.palette_address,
         c.palette_length,
-        version,
-        palette_version,
+        versions[0],
+        versions[1],
         c.shape.format,
         c.shape.dimension,
         c.shape.width,
@@ -486,44 +1093,109 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
         rtt,
         rtt ? surface.transfer.config.scale : 1,
     };
-    NV2AMetalTextureKey *key =
-        [[NV2AMetalTextureKey alloc] initWithKeyWords:words];
-    NV2AMetalTextureContent *content = _entries[key];
+    NV2AMetalTextureKey *key = _lookupKey;
+    [key setLookupWords:words];
+    NV2AMetalCachedTexture *previous = _entries[key];
+    NV2AMetalTextureContent *content = previous.content;
     /* Cancellation invalidates the matched content, not unrelated completed
      * snapshots. Other cancelled entries remain bounded by normal LRU eviction.
      * Source versions and CPU/GPU coherence checks still run on every hit. */
     if (content.token.cancelled) {
         [_entries removeObjectForKey:key];
+        previous = nil;
         content = nil;
     }
+    BOOL compareSource = !content && !rtt && _surfaces.willWatchVRAM &&
+        c.length <= NV2AMetalTextureComparisonBytes &&
+        c.palette_length <= NV2AMetalTextureComparisonBytes - c.length;
+    uint64_t comparisonWords[20];
+    NV2AMetalTextureComparison *comparison = nil;
+    BOOL reusedContent = NO, uploaded = NO;
+    if (compareSource) {
+        memcpy(comparisonWords, words, sizeof(words));
+        comparisonWords[4] = comparisonWords[5] = 0;
+        if (!content && _comparisons) {
+            [key setLookupWords:comparisonWords];
+            comparison = _comparisons[key];
+            NV2AMetalCachedTexture *candidate = comparison.texture;
+            NV2AMetalSurfaceRecording *token = candidate.producerRecording;
+            /* Hazard retirement releases the CPU write guards, even when the
+             * recording remains open. Do not acquire a new guard
+             * here: a prior CPU pre-write callback may already have returned.
+             */
+            if (!token || token.cancelled || token.completed ||
+                token.cpuHazardsRetired) {
+                [_comparisons removeObjectForKey:key];
+                comparison = nil;
+            } else {
+                BOOL readable = NO;
+                if (![_surfaces tryIdleCPUReadSpans:sources
+                                              count:indexed ? 2 : 1
+                                          completed:&readable
+                                              error:error])
+                    return nil;
+                const uint8_t *vram = _surfaces.vram.contents;
+                if (readable &&
+                    !memcmp(comparison.source.bytes, vram + c.address,
+                            c.length) &&
+                    (!indexed ||
+                     !memcmp(comparison.palette.bytes, vram + c.palette_address,
+                             c.palette_length))) {
+                    previous = candidate;
+                    content = candidate.content;
+                    reusedContent = YES;
+                }
+            }
+            [key setLookupWords:words];
+        }
+    }
     if (!content) {
+        const NV2AMetalVRAMReadPattern reads[] = {
+            { .address = c.address, .length = c.length },
+            { .address = c.palette_address, .length = c.palette_length },
+        };
         if (rtt) {
-            content = [self capture:surface
-                              frame:frame
-                             format:c.shape.format
-                              error:error];
-            if (content && ![_surfaces markRTTSampling:surface error:error])
-                return nil;
-            content.rectangle =
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 ||
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
-                c.shape.format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8;
-        } else if ([_surfaces prepareGPUReadAtAddress:c.address
-                                               length:c.length
-                                                error:error] &&
-                   (!indexed ||
-                    [_surfaces prepareGPUReadAtAddress:c.palette_address
-                                                length:c.palette_length
-                                                 error:error])) {
+            if (packed1555 && surface.transfer.config.scale > 1) {
+                /* Pure cold preparation precedes any capture/recording change.
+                 */
+                if (![surface.transfer prepareDownloadWithError:error])
+                    return nil;
+                content = [self captureDownsampledPacked1555:surface
+                                                       frame:frame
+                                                      format:c.shape.format
+                                                       error:error];
+            } else if (downsampleOpaque) {
+                /* Like converted capture, pipeline failure must leave an
+                 * unrelated open recording intact and never select RAM. */
+                if (![self prepareDownsampleCaptureWithError:error])
+                    return nil;
+                content = [self captureDownsampledOpaque:surface
+                                                   frame:frame
+                                                  format:c.shape.format
+                                                   error:error];
+            } else if (swizzledChannels &&
+                       (surface.transfer.config.scale > 1 ||
+                        rtt_swizzled_channel_order(c.shape.format) == 3)) {
+                if (![self prepareDownsampleChannelsCaptureWithError:error])
+                    return nil;
+                content = [self captureDownsampledChannels:surface
+                                                     frame:frame
+                                                    format:c.shape.format
+                                                     error:error];
+            } else {
+                if (rtt_storage(surface, c.shape.format) ==
+                        NV2AMetalTextureStorageFloat32 &&
+                    ![self prepareCaptureWithError:error])
+                    return nil;
+                content = [self capture:surface
+                                  frame:frame
+                                 format:c.shape.format
+                                  error:error];
+            }
+            content.rectangle = rtt_linear_format(c.shape.format);
+        } else if ([_surfaces prepareTextureUploadReadPatterns:reads
+                                                         count:indexed ? 2 : 1
+                                                         error:error]) {
             NV2AMetalTextureUploadResult *upload =
                 [_upload encodeData:_surfaces.vram
                              offset:c.address
@@ -545,6 +1217,7 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
                 content.mixedSignedHalf = upload.mixedSignedHalf;
                 content.depth = upload.depth;
                 content.token = _surfaces.recording;
+                uploaded = YES;
             } else if (upload) {
                 texture_cache_error(
                     error,
@@ -555,11 +1228,13 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
             [_surfaces cancel];
             return nil;
         }
-    } else if (!(recordGPUUse ? [_surfaces prepareGPUReadAtAddress:0
-                                                            length:0
-                                                             error:error] :
-                                [_surfaces collectCompletedWithError:error])) {
-        return nil;
+    } else if (recordGPUUse) {
+        if (![_surfaces prepareGPUReadAtAddress:0 length:0 error:error])
+            return nil;
+    } else if (!*collectedFeedback) {
+        if (![_surfaces collectCompletedWithError:error])
+            return nil;
+        *collectedFeedback = YES;
     }
     NV2AMetalSamplerConfig policy = *sampler;
     policy.signed_channels = c.shape.signed_channels;
@@ -570,31 +1245,62 @@ static BOOL compatible(NV2AMetalCachedSurface *s,
     policy.bordered = c.shape.border;
     policy.min_level = content.minLevel;
     policy.max_level = content.maxLevel;
-    NV2AMetalSamplerConfig previousPolicy = content.bindingPolicy;
-    NV2AMetalTextureBinding *binding = content.binding;
-    if (!binding || !same_policy(&previousPolicy, &policy)) {
-        binding = [_sampler bindingForTexture:content.texture
-                                       config:&policy
-                                        error:error];
-        if (binding) {
-            content.binding = binding;
-            content.bindingPolicy = policy;
-        }
+    NV2AMetalCachedTexture *result = previous;
+    if (![previous matchesPolicy:&policy]) {
+        NV2AMetalTextureBinding *binding =
+            [_sampler bindingForTexture:content.texture
+                                 config:&policy
+                                  error:error];
+        result = binding ?
+            [[NV2AMetalCachedTexture alloc] initWithContent:content
+                                                   binding:binding
+                                                    policy:&policy] : nil;
     }
-    NV2AMetalCachedTexture *result =
-        binding ? [[NV2AMetalCachedTexture alloc] initWithContent:content
-                                                          binding:binding] :
-                  nil;
     if (!result ||
         (content.token.completed &&
          ![result validateCompletedWithError:error]) ||
-        (recordGPUUse && ![_surfaces.commands addResource:binding.texture
+        (recordGPUUse && ![_surfaces.commands addResource:result.binding.texture
                                                     error:error])) {
         [_surfaces cancel];
+        [key setLookupWords:words];
         [_entries removeObjectForKey:key];
         return nil;
     }
-    _entries[key] = content;
+    /* The lookup already promoted a hit. Replace its snapshot only after
+     * a successful policy change so earlier draws keep their own bindings. */
+    if (result != previous || reusedContent) {
+        [key setLookupWords:words];
+        _entries[key] = result;
+    }
+    if (compareSource && (uploaded || reusedContent)) {
+        if (uploaded) {
+            BOOL readable = NO;
+            if (![_surfaces tryIdleCPUReadSpans:sources count:indexed ? 2 : 1
+                                     completed:&readable error:error]) {
+                [_surfaces cancel];
+                [_entries removeObjectForKey:key];
+                return nil;
+            }
+            comparison = nil;
+            if (readable && !content.token.completed && !content.token.cancelled) {
+                const uint8_t *vram = _surfaces.vram.contents;
+                comparison = [NV2AMetalTextureComparison new];
+                comparison.source = [NSData dataWithBytes:vram + c.address
+                                                   length:c.length];
+                if (indexed)
+                    comparison.palette =
+                        [NSData dataWithBytes:vram + c.palette_address
+                                       length:c.palette_length];
+            }
+        }
+        if (comparison) {
+            comparison.texture = result;
+            if (!_comparisons)
+                _comparisons = [[NV2AMetalLRUCache alloc] initWithCapacity:64];
+            [key setLookupWords:comparisonWords];
+            _comparisons[key] = comparison;
+        }
+    }
     return result;
 }
 @end

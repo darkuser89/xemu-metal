@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test-metal-indexed-raster.h"
+#include "test-metal-quad-raster.h"
 
 static void require(BOOL ok, NSError *error)
 {
@@ -53,8 +55,32 @@ static id<MTLTexture> texture(id<MTLDevice> device, MTLPixelFormat format,
     assert(t);
     return t;
 }
-int main(void)
+#include "test-metal-compact-lines.h"
+#include "test-metal-compact-polygon-wire.h"
+
+int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--compact-polygon-wire")) {
+        compact_polygon_wire_tests();
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--compact-lines")) {
+        compact_lines_tests(getenv("XEMU_TEST_COMPACT_LINE_TIMING") != NULL);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--quad-raster")) {
+        quad_raster_tests(YES);
+        return 0;
+    }
+    assert(argc == 1 || (argc >= 2 && argc <= 3 && (!strcmp(argv[1], "--strip") || !strcmp(argv[1], "--loop"))));
+    BOOL sliced = argc == 3 && (!strcmp(argv[2], "--slices") || !strcmp(argv[2], "--odd-slice"));
+    BOOL oddSlice = sliced && !strcmp(argv[2], "--odd-slice");
+    BOOL small = argc == 3 && !strcmp(argv[2], "--two");
+    assert(argc < 3 || sliced || small);
+    enum NV2AMetalPrimitive primitive = argc == 1 ? NV2AMetalPrimitiveLines :
+        !strcmp(argv[1], "--strip") ? NV2AMetalPrimitiveLineStrip : NV2AMetalPrimitiveLineLoop;
+    unsigned topology = primitive == NV2AMetalPrimitiveLineStrip ? NV2AMetalDirectLineStrip :
+                        primitive == NV2AMetalPrimitiveLineLoop ? NV2AMetalDirectLineLoop : 0;
     @autoreleasepool {
         NSError *error = nil;
         NV2AMetalCommands *commands =
@@ -90,11 +116,24 @@ int main(void)
         }
         v[30].clip[0] = 2; /* Endpoint outside the viewport. */
         v[31].clip[3] = -1;
+        /* Repeated logical records exercise physical counts smaller than
+         * the logical source while retaining a materialized reference. */
+        if (getenv("XEMU_TEST_INDEXED_DUPLICATES"))
+            for (unsigned i = 16; i < 32; i++)
+                v[i] = v[i - 16];
         id<MTLBuffer> source =
             [commands.device newBufferWithBytes:v
                                          length:sizeof(v)
                                         options:MTLResourceStorageModeShared];
         assert(source);
+        BOOL indexedTest = getenv("XEMU_TEST_INDEXED_RASTER") != NULL;
+        NV2AMetalIndexedVertices *indexedSource = indexedTest ?
+            indexed_raster_source(commands.device, v, 32, &error) : nil;
+        id<MTLBuffer> shifted = [commands.device newBufferWithLength:37 * sizeof(NV2AMetalVertex)
+                                                            options:MTLResourceStorageModeShared];
+        assert(shifted);
+        memset(shifted.contents, 0x5a, shifted.length);
+        memcpy((uint8_t *)shifted.contents + 5 * sizeof(NV2AMetalVertex), v, sizeof(v));
         require([commands beginWithError:&error] != nil, error);
         Class cls = object_getClass(commands.commandBuffer);
         SEL selector = @selector(computeCommandEncoder);
@@ -127,6 +166,9 @@ int main(void)
                 /* 64 state combinations, then an isolated paired timing case.
                  */
                 unsigned flags = test < 64 ? test : 0;
+                unsigned sourceCount = small ? 2 : flags & 2 ? 31 : 32;
+                unsigned outputCount = primitive == NV2AMetalPrimitiveLines ? sourceCount / 2 * 2 :
+                    2 * (sourceCount - (primitive == NV2AMetalPrimitiveLineStrip));
                 unsigned draws = test < 64 ? 1 : 32;
                 NSData *referenceImage = nil;
                 uint64_t referenceCount = 0;
@@ -162,6 +204,10 @@ int main(void)
                         u.depth_format = flags & 8 ? NV2AMetalPixelDepthF24 :
                                                      NV2AMetalPixelDepthD24;
                         u.surface_scale[0] = u.surface_scale[1] = 1;
+                        if (getenv("XEMU_TEST_INDEXED_SCALE")) {
+                            u.surface_scale[0] = 2;
+                            u.surface_scale[1] = 3;
+                        }
                         u.clip_range[1] = u.clip_range[3] = 16777215;
                         u.clip_regions[0][2] = u.clip_regions[0][3] = 32;
                         for (unsigned k = 0; k < 4; k++) {
@@ -221,14 +267,18 @@ int main(void)
                         for (unsigned draw = 0; draw < draws; draw++) {
                             unsigned before = computeEncoders;
                             NSArray<NV2AMetalGeometryResult *> *gs =
+                                direct && indexedTest ?
+                                    [geometry encodeNativeRasterSlice:indexed_raster_slice(indexedSource, sourceCount, commands, &error)
+                                        primitive:primitive config:&c smooth:flags & 1
+                                        firstProvoking:flags & 2 zPerspective:NO
+                                        commands:commands error:&error] :
                                 direct ?
                                     [geometry
-                                        encodeNativeRasterVertices:source
-                                                             count:(flags & 2 ?
-                                                                        31 :
-                                                                        32)
+                                        encodeNativeRasterVertices:sliced ? shifted : source
+                                                             first:sliced ? 5 : 0
+                                                             count:sourceCount
                                                          primitive:
-                                                             NV2AMetalPrimitiveLines
+                                                             primitive
                                                             config:&c
                                                             smooth:flags & 1
                                                     firstProvoking:flags & 2
@@ -237,10 +287,9 @@ int main(void)
                                                              error:&error] :
                                     [geometry
                                         encodeRasterVertices:source
-                                                       count:(flags & 2 ? 31 :
-                                                                          32)
+                                                       count:sourceCount
                                                    primitive:
-                                                       NV2AMetalPrimitiveLines
+                                                       primitive
                                                       config:&c
                                                       smooth:flags & 1
                                               firstProvoking:flags & 2
@@ -249,7 +298,7 @@ int main(void)
                                                        error:&error];
                             require(gs.count == 1, error);
                             NV2AMetalGeometryResult *g = gs[0];
-                            assert(g.vertexCount == (flags & 2 ? 30 : 32) &&
+                            assert(g.vertexCount == outputCount &&
                                    g.primitiveCount == g.vertexCount / 2 &&
                                    !g.directPoints);
                             NV2AMetalGeometryDirectLineMode mode =
@@ -261,17 +310,26 @@ int main(void)
                             assert(g.directLineMode ==
                                    (direct ? mode :
                                              NV2AMetalGeometryDirectLineNone));
+                            unsigned options = topology | (flags & 1 ? NV2AMetalDirectLineSmooth :
+                                                            flags & 2 ? NV2AMetalDirectLineFirst : 0);
+                            assert(g.directLineOptions == (direct ? options : 0));
                             NV2AMetalPixelRasterClass raster =
                                 !direct ?
                                     NV2AMetalPixelRasterNative :
+                                topology ? (NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectMappedLine |
+                                                                             g.directLineOptions) :
                                 mode == NV2AMetalGeometryDirectLineSmooth ?
                                     NV2AMetalPixelRasterDirectLineSmooth :
                                 mode == NV2AMetalGeometryDirectLineFlatFirst ?
                                     NV2AMetalPixelRasterDirectLineFlatFirst :
                                     NV2AMetalPixelRasterDirectLineFlatLast;
                             assert(!g.expandedLines && !g.expandedPolygons);
-                            assert((g.vertices == source) == direct);
+                            assert(g.sourceVertexCount == (direct ? (topology ? sourceCount : outputCount) : outputCount));
+                            assert(g.firstVertex == (sliced && direct && !indexedTest ? 5u : 0u));
+                            assert((g.vertices == (indexedTest && direct ? indexedSource.vertices : sliced && direct ? shifted : source)) == direct);
                             if (direct) {
+                                assert(g.indexedVertices == (indexedTest ? indexedSource : nil));
+                                assert(g.indexOffset == (indexedTest ? 5u : 0u));
                                 assert(computeEncoders == before);
                                 geometryDirectEncoders +=
                                     computeEncoders - before;
@@ -281,20 +339,66 @@ int main(void)
                                 copiedBytes += g.vertices.length;
                             }
                             NV2AMetalPixelTexture bindings[4] = { 0 };
-                            require(
-                                [pixel encodeVertices:g.vertices
-                                                  offset:0
-                                                   count:g.vertexCount
-                                               primitive:MTLPrimitiveTypeLine
-                                                uniforms:&u
-                                                textures:bindings
-                                                    pass:pass
-                                               drawState:state
-                                             rasterClass:raster
-                                    ignorePolygonCulling:NO
-                                                commands:commands
-                                                   error:&error],
-                                error);
+                            if (direct && topology && test == 0 && samples == 1 && draw == 0) {
+                                NSUInteger available = g.vertices.length / sizeof(NV2AMetalVertex) - g.firstVertex;
+                                assert(![pixel encodeVertices:g.vertices offset:g.firstVertex * sizeof(NV2AMetalVertex)
+                                    count:(available + 2) * 2 primitive:MTLPrimitiveTypeLine
+                                    uniforms:&u textures:bindings pass:pass drawState:state rasterClass:raster
+                                    ignorePolygonCulling:NO commands:commands error:&error] && error);
+                                error = nil;
+                                assert(![pixel encodeVertices:g.vertices offset:0 count:4 primitive:MTLPrimitiveTypeLine
+                                    uniforms:&u textures:bindings pass:pass drawState:state
+                                    rasterClass:(NV2AMetalPixelRasterClass)(NV2AMetalPixelRasterDirectMappedLine |
+                                        NV2AMetalDirectLineTopologyMask)
+                                    ignorePolygonCulling:NO commands:commands error:&error] && error);
+                                error = nil;
+                                assert(![pixel encodeGeometry:g offset:0 count:1 uniforms:&u textures:bindings
+                                    pass:pass drawState:state rasterClass:raster ignorePolygonCulling:NO
+                                    renderEncoder:nil commands:commands error:&error] && error);
+                                error = nil;
+                                assert(![pixel encodeGeometry:g offset:g.vertexCount * sizeof(NV2AMetalVertex)
+                                    count:2 uniforms:&u textures:bindings pass:pass drawState:state rasterClass:raster
+                                    ignorePolygonCulling:NO renderEncoder:nil commands:commands error:&error] && error);
+                                error = nil;
+                                NV2AMetalPixelDraw *empty = [pixel prepareGeometry:g
+                                    offset:g.vertexCount * sizeof(NV2AMetalVertex) count:0 uniforms:&u textures:bindings
+                                    pass:pass drawState:state rasterClass:raster ignorePolygonCulling:NO
+                                    commands:commands error:&error];
+                                require(empty != nil, error);
+                                assert(!empty.vertexCount);
+                            }
+                            if (sliced) {
+                                id<MTL4RenderCommandEncoder> encoder =
+                                    [commands.commandBuffer renderCommandEncoderWithDescriptor:pass];
+                                assert(encoder);
+                                [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
+                                               visibilityOptions:MTL4VisibilityOptionDevice];
+                                [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+                                const NSUInteger firsts[] = { oddSlice ? 1u : 0u, 2, 6 };
+                                const NSUInteger counts[] = { oddSlice ? g.vertexCount - 2 : 2, 4, g.vertexCount - 6 };
+                                for (unsigned part = 0; part < (oddSlice ? 1u : 3u); part++)
+                                    require([pixel encodeGeometry:g offset:firsts[part] * sizeof(NV2AMetalVertex)
+                                        count:counts[part] uniforms:&u textures:bindings pass:pass drawState:state
+                                        rasterClass:raster ignorePolygonCulling:NO renderEncoder:encoder
+                                        commands:commands error:&error], error);
+                                [encoder barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
+                                          visibilityOptions:MTL4VisibilityOptionDevice];
+                                [encoder endEncoding];
+                            } else {
+                                require(
+                                    [pixel encodeGeometry:g
+                                                      offset:0
+                                                       count:g.vertexCount
+                                                    uniforms:&u
+                                                    textures:bindings
+                                                        pass:pass
+                                                   drawState:state
+                                                 rasterClass:raster
+                                        ignorePolygonCulling:NO renderEncoder:nil
+                                                    commands:commands
+                                                       error:&error],
+                                    error);
+                            }
                         }
                         require([commands addResource:readback error:&error],
                                 error);
@@ -329,7 +433,9 @@ int main(void)
                         require([commands waitUntilIdleWithError:&error],
                                 error);
                         uint64_t count = *(uint64_t *)query.contents;
-                        assert(count > 7);
+                        /* Shifted endpoint pairs of a strip/loop coincide:
+                         * [end0,start1], ... are zero-length segments. */
+                        assert(oddSlice ? count == 7 : count > 7);
                         visible += count - 7;
                         if (variant == 0) {
                             referenceImage =
@@ -409,6 +515,7 @@ int main(void)
         assert(((NV2AMetalGeometryResult *)tail[0]).vertexCount == 0);
         [commands cancel];
         for (unsigned special = 0; special < 3; special++) {
+            c.front = c.back = NV2AMetalPolygonLine;
             c.lineWidth = special == 0 ? 2 : 1;
             c.lineSmooth = special == 1;
             c.viewportWidth = c.viewportHeight = 32;
@@ -416,7 +523,7 @@ int main(void)
             NSArray *a =
                 [geometry encodeNativeRasterVertices:source
                                                count:6
-                                           primitive:NV2AMetalPrimitiveLines
+                                           primitive:NV2AMetalPrimitiveTriangles
                                               config:&c
                                               smooth:NO
                                       firstProvoking:YES
@@ -425,7 +532,7 @@ int main(void)
                                                error:&error];
             NSArray *b = [geometry encodeRasterVertices:source
                                                   count:6
-                                              primitive:NV2AMetalPrimitiveLines
+                                              primitive:NV2AMetalPrimitiveTriangles
                                                  config:&c
                                                  smooth:NO
                                          firstProvoking:YES
@@ -436,16 +543,14 @@ int main(void)
             NV2AMetalGeometryResult *x = a[0], *y = b[0];
             assert(!x.directLineMode && x.expandedLines &&
                    x.vertexCount == y.vertexCount);
-            require([commands submitWithError:&error], error);
-            require([commands waitUntilIdleWithError:&error], error);
-            assert(!memcmp(x.vertices.contents, y.vertices.contents,
-                           x.vertexCount * sizeof(NV2AMetalVertex)));
+            cpw_compare_legacy(commands, x, y, source,
+                               NV2AMetalPrimitiveTriangles);
         }
         c.lineSmooth = NO;
         c.lineWidth = 2;
         c.viewportWidth = c.viewportHeight = 32;
         c.polygonSmooth = YES;
-        for (unsigned primitive = NV2AMetalPrimitiveLines;
+        for (unsigned primitive = NV2AMetalPrimitiveTriangles;
              primitive <= NV2AMetalPrimitivePolygon; primitive++) {
             require([commands beginWithError:&error] != nil, error);
             NSArray *a = [geometry encodeNativeRasterVertices:source
@@ -469,20 +574,17 @@ int main(void)
             require(a.count == 1 && b.count == 1, error);
             NV2AMetalGeometryResult *x = a[0], *y = b[0];
             assert(!x.directPoints && !y.directPoints);
-            require([commands submitWithError:&error], error);
-            require([commands waitUntilIdleWithError:&error], error);
             assert(x.vertexCount == y.vertexCount &&
                    x.primitiveType == y.primitiveType);
-            assert(memcmp(x.vertices.contents, y.vertices.contents,
-                          x.vertexCount * sizeof(NV2AMetalVertex)) == 0);
+            cpw_compare_legacy(commands, x, y, source, primitive);
         }
         method_setImplementation(cm, (IMP)original_compute);
         method_setImplementation(fm, (IMP)original_feedback);
-        printf("Direct lines: %u exact color/query pairs (single-sample depth "
+        printf("Direct lines topology%u slices%u odd%u small%u: %u exact color/query pairs (single-sample depth "
                "exact too), %llu visible samples; geometry encoders "
-               "direct/reference=%u/%u, output bytes avoided=%llu;9 fallback "
+               "direct/reference=%u/%u, output bytes avoided=%llu;6 compact polygon "
                "topologies,empty/cancel/input rejects PASS\n",
-               pairs, (unsigned long long)visible, geometryDirectEncoders,
+               primitive, (unsigned)sliced, (unsigned)oddSlice, (unsigned)small, pairs, (unsigned long long)visible, geometryDirectEncoders,
                geometryReferenceEncoders, (unsigned long long)copiedBytes);
     }
     return 0;

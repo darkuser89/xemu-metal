@@ -244,6 +244,23 @@ static void metadata_tests(void)
     pg->surface_shape.clip_x = 2;
     pg->surface_shape.clip_y = 3;
     NV2AMetalPGRAPHPixelState *p = capture(nil);
+    NSError *error = nil;
+    pg->regs_[NV_PGRAPH_FOGCOLOR] = 0;
+    NV2AMetalPGRAPHPixelState *fog = [[NV2AMetalPGRAPHPixelState alloc]
+        initWithState:pg textures:nil device:commands.device
+        reusingRaster:p.raster error:&error];
+    require(fog != nil, error);
+    NV2AMetalPixelUniforms newFog = fog.uniforms;
+    assert(fog.raster == p.raster && newFog.fog_color[0] == 0);
+    pg->regs_[NV_PGRAPH_FOGCOLOR] = 0x778899aa;
+    pg->surface_shape.clip_x++;
+    NV2AMetalPGRAPHPixelState *shifted = [[NV2AMetalPGRAPHPixelState alloc]
+        initWithState:pg textures:nil device:commands.device
+        reusingRaster:p.raster error:&error];
+    require(shifted != nil, error);
+    assert(shifted.raster != p.raster &&
+           shifted.raster.config.scissor.x > p.raster.config.scissor.x);
+    pg->surface_shape.clip_x--;
     NV2AMetalPixelUniforms u = p.uniforms;
     assert(u.combiner.control == 8 &&
            u.combiner.constants[0][0] == 0x22 / 255.f);
@@ -538,10 +555,39 @@ static void texture_snapshot_test(unsigned mask, unsigned index,
                                                     stencil:raster.control[1]
                                                 textureMask:1u << index
                                                    textures:content]);
+    /* Keep the scalar mutation valid for its captured storage. Mixed-half
+     * Signed8 requires a nonempty, non-full signed mask; only the bound
+     * texture owner must reject this otherwise valid alternative mask. */
+    BOOL mixedHalf = p.uniforms.textures[index].snorm ==
+                     NV2AMetalTextureNormalizationMixedHalf;
+    unsigned mismatchMask = mask ^ 1;
+    if (mixedHalf && (!mismatchMask || mismatchMask == 15))
+        mismatchMask = mask ^ 2;
+    if (mixedHalf) {
+        assert(!hilo_format && mask && mask != 15 && mismatchMask &&
+               mismatchMask != 15 && mismatchMask != mask);
+        for (unsigned invalidMask = 0; invalidMask <= 15; invalidMask += 15) {
+            NSMutableData *invalid = [scalar mutableCopy];
+            stl_be_p((uint8_t *)invalid.mutableBytes + 100 +
+                         offsetof(NV2AMetalPixelUniforms, textures) +
+                         index * sizeof(NV2AMetalTextureStage) +
+                         offsetof(NV2AMetalTextureStage, signed_channels),
+                     invalidMask);
+            assert(![NV2AMetalPGRAPHPixelState validateSnapshot:invalid
+                                                          error:NULL]);
+            assert(![NV2AMetalPGRAPHPixelState
+                validateBoundSnapshot:invalid
+                              control:raster.control[0]
+                              stencil:raster.control[1]
+                          textureMask:1u << index
+                             textures:content]);
+            binding_rejections++;
+        }
+    }
     NSMutableData *mismatch = [scalar mutableCopy];
     stl_be_p((uint8_t *)mismatch.mutableBytes + 100 + (108 + 37) * 4 +
                  index * sizeof(NV2AMetalTextureStage),
-             mask ^ 1);
+             mismatchMask);
     assert([NV2AMetalPGRAPHPixelState validateSnapshot:mismatch
                                                  error:NULL] == !hilo_format);
     assert(![NV2AMetalPGRAPHPixelState validateBoundSnapshot:mismatch
@@ -550,13 +596,14 @@ static void texture_snapshot_test(unsigned mask, unsigned index,
                                                  textureMask:1u << index
                                                     textures:content]);
 
-    // Valid scalar states must match their owner; HILO signedness is invalid.
+    /* Valid scalar states must match their owner. Partial HILO signedness is
+     * invalid. */
     for (unsigned test = 0; test < 9; test++) {
         NV2AMetalPixelUniforms changed = p.uniforms;
         NV2AMetalTextureStage *stage = &changed.textures[index];
         switch (test) {
         case 0:
-            stage->signed_channels ^= 1;
+            stage->signed_channels = mismatchMask;
             break;
         case 1:
             stage->scale = 2;
@@ -1048,7 +1095,7 @@ int main(void)
         two_side_capture_tests();
         pixel_case = "rejection_tests";
         rejection_tests();
-        assert(binding_rejections == 848);
+        assert(binding_rejections == 960);
         assert(typed_clear_cases == 1056 && typed_clear_images == 16);
         printf("Typed clear final: %u exact scalar/texture comparisons, %u GPU image pairs PASS\n",
                typed_clear_cases, typed_clear_images);

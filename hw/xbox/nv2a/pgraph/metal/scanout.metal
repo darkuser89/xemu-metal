@@ -17,12 +17,11 @@ vertex ScanoutVertex nv2a_scanout_vertex(uint id [[vertex_id]])
     const float2 p[] = { float2(-1, 1), float2(-1, -3), float2(3, 1) };
     return { float4(p[id], 0, 1) };
 }
-static float4 texel(texture2d<float, access::read> t, int2 p, bool border)
+static float4 texel(texture2d<float, access::read> t, int2 p, int2 size,
+                    bool border)
 {
-    int2 size(t.get_width(), t.get_height());
     if (border && (any(p < 0) || any(p >= size)))
         return 0;
-    p = (p % size + size) % size;
     return t.read(uint2(p));
 }
 static float4 linear(texture2d<float, access::read> t, float2 uv, bool border)
@@ -31,15 +30,22 @@ static float4 linear(texture2d<float, access::read> t, float2 uv, bool border)
     // coordinates never overflow integer texel indices.
     if (!border)
         uv = fract(uv);
-    float2 p = uv * float2(t.get_width(), t.get_height()) - .5f;
-    if (border &&
-        (any(p < -1) || any(p >= float2(t.get_width(), t.get_height()))))
+    int2 size(t.get_width(), t.get_height());
+    float2 p = uv * float2(size) - .5f;
+    if (border && (any(p < -1) || any(p >= float2(size))))
         return 0;
-    int2 i = int2(floor(p));
-    float2 f = p - float2(i);
-    float4 a = mix(texel(t, i, border), texel(t, i + int2(1, 0), border), f.x);
-    float4 b = mix(texel(t, i + int2(0, 1), border),
-                   texel(t, i + int2(1, 1), border), f.x);
+    int2 lo = int2(floor(p)), hi = lo + 1;
+    float2 f = p - float2(lo);
+    if (!border) {
+        // fract confines the taps to [-1, size], so one edge adjustment
+        // replaces modulo for all four reads, including one-texel textures.
+        lo = select(lo, lo + size, lo < 0);
+        hi = select(hi, hi - size, hi >= size);
+    }
+    float4 a = mix(texel(t, lo, size, border),
+                   texel(t, int2(hi.x, lo.y), size, border), f.x);
+    float4 b = mix(texel(t, int2(lo.x, hi.y), size, border),
+                   texel(t, hi, size, border), f.x);
     return mix(a, b, f.y);
 }
 fragment float4 nv2a_scanout_fragment(ScanoutVertex in [[stage_in]],

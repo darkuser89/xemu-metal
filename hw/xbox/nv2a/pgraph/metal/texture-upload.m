@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.0-or-later */
 
 #import "texture-upload.h"
+#import "shader-library.h"
 #include "texture-upload-types.h"
 #include "texture-storage.h"
 #include "texture-upload-source.h"
@@ -131,17 +132,6 @@ static BOOL compact_unorm8(const NV2AMetalTextureShape *shape)
         return NO;
     }
     switch (shape->format) {
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
-    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8:
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
     case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8:
@@ -167,6 +157,23 @@ static BOOL compact_unorm8(const NV2AMetalTextureShape *shape)
 static unsigned texture_storage(const NV2AMetalTextureShape *shape)
 {
     switch (shape->format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+        return NV2AMetalTextureStorageByteY8;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+        return NV2AMetalTextureStorageByteAY8;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+        return NV2AMetalTextureStorageByteA8;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+        return NV2AMetalTextureStorageByteA8Y8;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+        return NV2AMetalTextureStorageByteG8B8;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+        return NV2AMetalTextureStorageByteR8B8;
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5:
         return NV2AMetalTextureStorageSnorm8;
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5:
@@ -226,9 +233,21 @@ typedef struct TextureLayout {
     NSUInteger face_stride, source_length;
 } TextureLayout;
 
+static BOOL same_texture_shape(const NV2AMetalTextureShape *a,
+                               const NV2AMetalTextureShape *b)
+{
+    return a->format == b->format && a->dimension == b->dimension &&
+           a->width == b->width && a->height == b->height &&
+           a->depth == b->depth && a->levels == b->levels &&
+           a->pitch == b->pitch && a->min_level == b->min_level &&
+           a->max_level == b->max_level && a->cubemap == b->cubemap &&
+           a->border == b->border && a->signed_channels == b->signed_channels;
+}
+
 static BOOL texture_layout(const NV2AMetalTextureShape *shape,
                            NSUInteger paletteLength, NSUInteger maxBufferLength,
-                           TextureLayout *output, NSError **error)
+                           unsigned storage, TextureLayout *output,
+                           NSError **error)
 {
     memset(output, 0, sizeof(*output));
     TextureFormat f = texture_format(shape ? shape->format : UINT32_MAX);
@@ -292,7 +311,6 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
         return NO;
     }
     TextureLevel *layout = output->layout;
-    unsigned storage = texture_storage(shape);
     unsigned int output_bytes = nv2a_metal_texture_storage_bytes(storage);
     NSUInteger face_length = 0;
     unsigned int sw = w, sh = h, sd = d;
@@ -402,8 +420,15 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
 
 @implementation NV2AMetalTextureUpload {
     id<MTLDevice> _device;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
+    id<MTLComputePipelineState> _blockPipeline;
+    id<MTL4ArgumentTable> _blockArguments;
+    id<MTLBuffer> _zeroFaults;
+    NV2AMetalTextureShape _layoutShape;
+    NSUInteger _layoutPaletteLength;
+    TextureLayout _layout;
 }
 
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device
@@ -420,39 +445,104 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
         return nil;
     }
     _device = device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
-        return nil;
-    }
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    ld.options.mathMode = MTLMathModeSafe;
-    ld.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!library) {
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-    fn.library = library;
-    fn.name = @"nv2a_texture_decode";
-    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-    pd.computeFunctionDescriptor = fn;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:pd
-                                            compilerTaskOptions:nil
-                                                          error:error];
-    if (!_pipeline) {
-        return nil;
-    }
+    return self;
+}
+
+- (BOOL)prepareDecoderWithError:(NSError **)error
+{
+    if (_arguments)
+        return YES;
+    if (!_module)
+        _module = [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                                   source:metal_shader_source
+                                                    error:error];
+    if (!_module)
+        return NO;
+    if (!_pipeline)
+        _pipeline = [_module computeFunction:@"nv2a_texture_decode" error:error];
+    if (!_pipeline)
+        return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
     ad.maxBufferBindCount = 5;
     ad.initializeBindings = YES;
-    _arguments = [device newArgumentTableWithDescriptor:ad error:error];
-    return _arguments ? self : nil;
+    _arguments = [_device newArgumentTableWithDescriptor:ad error:error];
+    return _arguments != nil;
+}
+
+- (BOOL)canDecodeBCBlocksForShape:(const NV2AMetalTextureShape *)shape
+{
+    if (!shape || shape->signed_channels || !_layout.levels ||
+        (shape->format != NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5 &&
+         shape->format != NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8 &&
+         shape->format != NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8))
+        return NO;
+    for (unsigned level = 0; level < _layout.levels; level++) {
+        const NV2AMetalTextureDecodeUniforms *u =
+            &_layout.layout[level].uniforms;
+        if (u->format != shape->format || u->signed_channels ||
+            u->output_storage != NV2AMetalTextureStorageUnorm8 || u->crop ||
+            u->block_size != _layout.format.block ||
+            u->width != u->source_width || u->height != u->source_height ||
+            u->depth != u->source_depth)
+            return NO;
+    }
+    return YES;
+}
+
+- (BOOL)prepareBlockDecoderWithError:(NSError **)error
+{
+    if (_blockArguments)
+        return YES;
+    if (!_module)
+        _module = [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                                    source:metal_shader_source
+                                                     error:error];
+    if (!_module)
+        return NO;
+    if (!_blockPipeline)
+        _blockPipeline =
+            [_module computeFunction:@"nv2a_texture_decode_bc_blocks"
+                               error:error];
+    if (!_blockPipeline)
+        return NO;
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+    ad.maxBufferBindCount = 5;
+    ad.initializeBindings = YES;
+    _blockArguments = [_device newArgumentTableWithDescriptor:ad error:error];
+    return _blockArguments != nil;
+}
+- (unsigned)storageForShape:(const NV2AMetalTextureShape *)shape
+{
+    if (!shape)
+        return NV2AMetalTextureStorageFloat32;
+    if (!shape->signed_channels) {
+        if (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8)
+            return NV2AMetalTextureStorageBGRA8;
+        if (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8)
+            return NV2AMetalTextureStorageBGRX8;
+    }
+    return texture_storage(shape);
+}
+
+- (BOOL)prepareLayoutForShape:(const NV2AMetalTextureShape *)shape
+                paletteLength:(NSUInteger)paletteLength
+                        error:(NSError **)error
+{
+    /* The DMA length query, cache validation and encoder normally visit
+     * the same shape consecutively. Keep the validated CPU layout local to
+     * this uploader. A failed layout leaves source_length zero. */
+    if (_layout.source_length && shape &&
+        _layoutPaletteLength == paletteLength &&
+        same_texture_shape(&_layoutShape, shape)) {
+        return YES;
+    }
+    if (!texture_layout(shape, paletteLength, _device.maxBufferLength,
+                        [self storageForShape:shape], &_layout, error)) {
+        return NO;
+    }
+    _layoutShape = *shape;
+    _layoutPaletteLength = paletteLength;
+    return YES;
 }
 
 - (BOOL)sourceLengthForShape:(const NV2AMetalTextureShape *)shape
@@ -460,15 +550,14 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
                       length:(NSUInteger *)length
                        error:(NSError **)error
 {
-    TextureLayout layout;
     if (!length) {
         return upload_error(error, @"Missing texture layout length storage");
     }
-    if (!texture_layout(shape, paletteLength, _device.maxBufferLength, &layout,
-                        error)) {
+    if (![self prepareLayoutForShape:shape paletteLength:paletteLength
+                               error:error]) {
         return NO;
     }
-    *length = layout.source_length;
+    *length = _layout.source_length;
     return YES;
 }
 
@@ -482,20 +571,19 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
          commands:(NV2AMetalCommands *)commands
             error:(NSError **)error
 {
-    TextureLayout capture;
     if (commands.device != _device || !commands.commandBuffer ||
         data.device != _device || offset > data.length ||
-        !texture_layout(shape, paletteLength, _device.maxBufferLength, &capture,
-                        error)) {
+        ![self prepareLayoutForShape:shape paletteLength:paletteLength
+                               error:error]) {
         upload_error(error, @"Invalid Metal texture shape or command context");
         return nil;
     }
-    TextureFormat f = capture.format;
-    unsigned int levels = capture.levels, d = capture.depth;
-    BOOL indexed = capture.indexed;
-    TextureLevel *layout = capture.layout;
-    NSUInteger face_stride = capture.face_stride;
-    NSUInteger source_length = capture.source_length;
+    TextureFormat f = _layout.format;
+    unsigned int levels = _layout.levels, d = _layout.depth;
+    BOOL indexed = _layout.indexed;
+    const TextureLevel *layout = _layout.layout;
+    NSUInteger face_stride = _layout.face_stride;
+    NSUInteger source_length = _layout.source_length;
     if (indexed &&
         (palette.device != _device || paletteOffset > palette.length ||
          paletteLength > palette.length - paletteOffset)) {
@@ -507,22 +595,32 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
                      @"Metal texture input does not contain all mip faces");
         return nil;
     }
-    /* Linear A8B8G8R8 and packed16 already match their native byte order. Metal
-     * 4 buffer copies require pixel-aligned offsets/pitches and a row no wider
-     * than the maximum 2D texture. Other layouts retain the decoder. */
+    unsigned storage = layout[0].uniforms.output_storage;
+    /* These linear formats match the backing texture byte order. Metal 4
+     * copies require pixel-aligned offsets/pitches and a supported row width.
+     */
     BOOL direct =
-        (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+        ((f.linear && storage >= NV2AMetalTextureStorageByteY8 &&
+          storage <= NV2AMetalTextureStorageByteR8B8) ||
+         (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 &&
+          storage == NV2AMetalTextureStorageBGRA8) ||
+         (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 &&
+          storage == NV2AMetalTextureStorageBGRX8) ||
+         shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4) &&
         !shape->signed_channels && !(offset % f.bytes) &&
         shape->pitch <= 16384u * f.bytes;
+    BOOL blocks = !direct && [self canDecodeBCBlocksForShape:shape];
+    if (!direct && !(blocks ? [self prepareBlockDecoderWithError:error] :
+                              [self prepareDecoderWithError:error]))
+        return nil;
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
     td.textureType = shape->cubemap        ? MTLTextureTypeCube :
                      shape->dimension == 3 ? MTLTextureType3D :
                                              MTLTextureType2D;
-    unsigned storage = layout[0].uniforms.output_storage;
     unsigned int output_bytes = nv2a_metal_texture_storage_bytes(storage);
     td.pixelFormat = nv2a_metal_texture_storage_format(storage);
     td.swizzle = nv2a_metal_texture_storage_swizzle(storage);
@@ -533,11 +631,18 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     id<MTLTexture> texture = [_device newTextureWithDescriptor:td];
-    uint32_t zero = 0;
-    id<MTLBuffer> faults =
-        [_device newBufferWithBytes:&zero
-                             length:sizeof(zero)
-                            options:MTLResourceStorageModeShared];
+    /* Only short palettes can write the fault word. Every other upload can
+     * share the same zero result, even when its GPU work is still queued. */
+    BOOL canFault = indexed && paletteLength < 256 * sizeof(uint32_t);
+    id<MTLBuffer> faults = canFault ? nil : _zeroFaults;
+    if (!faults && texture) {
+        uint32_t zero = 0;
+        faults = [_device newBufferWithBytes:&zero
+                                     length:sizeof(zero)
+                                    options:MTLResourceStorageModeShared];
+        if (!canFault)
+            _zeroFaults = faults;
+    }
     if (!texture || !faults) {
         upload_error(error, @"Could not allocate Metal decoded texture");
         return nil;
@@ -545,33 +650,30 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
     if (![commands addResource:data error:error] ||
         (indexed && ![commands addResource:palette error:error]) ||
         ![commands addResource:texture error:error] ||
-        ![commands addResource:faults error:error] ||
+        (!direct && ![commands addResource:faults error:error]) ||
         ![commands keepAlive:self error:error]) {
         return nil;
     }
-    /* Allocate before creating the encoder so an allocation failure cannot
-     * leave a half-open encoder on the caller's command buffer. */
-    NSMutableArray<id<MTLBuffer>> *constants = direct ? nil : [NSMutableArray array];
-    NSMutableArray<id<MTLBuffer>> *scratch = direct ? nil : [NSMutableArray array];
-    for (unsigned int level = 0; !direct && level < levels; level++) {
-        id<MTLBuffer> c =
-            [_device newBufferWithBytes:&layout[level].uniforms
-                                 length:sizeof(layout[level].uniforms)
-                                options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b =
-            [_device newBufferWithLength:layout[level].output_length
-                                 options:MTLResourceStorageModePrivate];
-        if (!c || !b) {
-            upload_error(
-                error, @"Could not allocate Metal texture conversion buffers");
+    /* Mip dimensions and aligned output spans are nonincreasing. Each
+     * dispatch's blit finishes reading before the next mip or face writes. */
+    id<MTLBuffer> scratch = nil;
+    MTLGPUAddress uniforms[sizeof(_layout.layout) / sizeof(*layout)];
+    if (!direct) {
+        scratch = [commands orderedTransferScratchWithLength:layout[0].output_length
+                                                       error:error];
+        if (!scratch)
             return nil;
+        for (unsigned level = 0; level < levels; level++) {
+            NSUInteger uniform_offset;
+            id<MTLBuffer> buffer =
+                [commands uploadBytes:&layout[level].uniforms
+                               length:sizeof(layout[level].uniforms)
+                               offset:&uniform_offset
+                                error:error];
+            if (!buffer)
+                return nil;
+            uniforms[level] = buffer.gpuAddress + uniform_offset;
         }
-        if (![commands addResource:c error:error] ||
-            ![commands addResource:b error:error]) {
-            return nil;
-        }
-        [constants addObject:c];
-        [scratch addObject:b];
     }
     id<MTL4ComputeCommandEncoder> e =
         [commands.commandBuffer computeCommandEncoder];
@@ -593,31 +695,34 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
                destinationLevel:0
               destinationOrigin:MTLOriginMake(0, 0, 0)];
     } else {
-        [e setComputePipelineState:_pipeline];
-        [_arguments setAddress:faults.gpuAddress atIndex:4];
-        [_arguments setAddress:indexed ? palette.gpuAddress + paletteOffset :
+        id<MTL4ArgumentTable> arguments = blocks ? _blockArguments : _arguments;
+        [e setComputePipelineState:blocks ? _blockPipeline : _pipeline];
+        [arguments setAddress:faults.gpuAddress atIndex:4];
+        [arguments setAddress:indexed ? palette.gpuAddress + paletteOffset :
                                          data.gpuAddress
                        atIndex:1];
         for (unsigned int face = 0; face < (shape->cubemap ? 6u : 1u); face++) {
             for (unsigned int level = 0; level < levels; level++) {
                 TextureLevel l = layout[level];
                 NV2AMetalTextureDecodeUniforms u = l.uniforms;
-                id<MTLBuffer> b = scratch[level];
-                [_arguments setAddress:data.gpuAddress + offset +
+                [arguments setAddress:data.gpuAddress + offset +
                                        face * face_stride + l.offset
                                atIndex:0];
-                [_arguments setAddress:constants[level].gpuAddress atIndex:2];
-                [_arguments setAddress:b.gpuAddress atIndex:3];
-                [e setArgumentTable:_arguments];
-                [e dispatchThreads:MTLSizeMake(u.width, u.height, u.depth)
+                [arguments setAddress:uniforms[level] atIndex:2];
+                [arguments setAddress:scratch.gpuAddress atIndex:3];
+                [e setArgumentTable:arguments];
+                [e dispatchThreads:MTLSizeMake(blocks ? (u.width + 3) / 4 : u.width,
+                                              blocks ? (u.height + 3) / 4 : u.height,
+                                              u.depth)
                     threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
                 [e barrierAfterEncoderStages:MTLStageDispatch
                          beforeEncoderStages:MTLStageBlit
                            visibilityOptions:MTL4VisibilityOptionDevice];
-                [e copyFromBuffer:b
+                [e copyFromBuffer:scratch
                            sourceOffset:0
                       sourceBytesPerRow:(NSUInteger)u.output_row * output_bytes
-                    sourceBytesPerImage:(NSUInteger)u.output_slice * output_bytes
+                    sourceBytesPerImage:(NSUInteger)u.output_slice *
+                                        output_bytes
                              sourceSize:MTLSizeMake(u.width, u.height, u.depth)
                               toTexture:texture
                        destinationSlice:face

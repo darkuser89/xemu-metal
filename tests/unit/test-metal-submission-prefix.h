@@ -95,10 +95,8 @@ static void submission_prefix_tests(id<MTLDevice> device)
                *(uint32_t *)secondBytes.contents == 0x5a5a5a5au);
         prefix_original_wait =
             (void *)method_setImplementation(wait, (IMP)prefix_wait);
-        BOOL ok = [cache waitForSubmission:second error:&error];
-        method_setImplementation(wait, (IMP)prefix_original_wait);
-        method_setImplementation(finish, (IMP)prefix_original_finish);
-        assert(!prefix_delayed && prefix_waits == (failure ? 1u : 2u));
+        BOOL ok = [cache finishSurfaceQueueWithError:&error];
+        assert(!prefix_delayed && prefix_waits == 1);
         if (failure) {
             assert(!ok && error == prefix_error && !firstToken.completed &&
                    !secondToken.completed);
@@ -109,15 +107,32 @@ static void submission_prefix_tests(id<MTLDevice> device)
         } else {
             require(ok, error);
             assert(firstToken.completed && secondToken.completed);
+            prefix_waits = 0;
+            for (unsigned flip = 0; flip < 32; flip++)
+                require([cache finishSurfaceQueueWithError:&error], error);
+            assert(!prefix_waits && prefix_commands.lastSubmitted == second);
             require([cache flushWithError:&error], error);
+            require([prefix_commands beginWithError:&error] &&
+                        [prefix_commands submitWithError:&error] &&
+                        [prefix_commands waitUntilIdleWithError:&error],
+                    error);
+            require([cache waitForSubmission:prefix_commands.lastSubmitted
+                                        error:&error],
+                    error);
+            assert(!prefix_waits);
         }
+        method_setImplementation(wait, (IMP)prefix_original_wait);
+        method_setImplementation(finish, (IMP)prefix_original_finish);
         prefix_first = nil;
         prefix_commands = nil;
         prefix_error = nil;
     }
     puts(
         "Surface submission prefix:later success cannot hide delayed earlier "
-        "success/error;ordered waits,pixels,sticky failure and CPU guard PASS");
+        "success/error;one wait for earlier feedback,zero for completed native "
+        "work,pixels,sticky failure and CPU guard PASS");
+    puts("Surface FLIP_STALL:32 completed-queue repetitions require zero waits "
+         "and preserve earlier feedback validation PASS");
     checks += 2;
 }
 #endif

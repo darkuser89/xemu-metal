@@ -55,10 +55,16 @@ static void run(NV2AMetalCommands *commands, unsigned kind, unsigned width,
         MTLPixelFormatR32Float,    MTLPixelFormatR32Float,
         MTLPixelFormatR32Float,    MTLPixelFormatB5G6R5Unorm,
         MTLPixelFormatBGR5A1Unorm, MTLPixelFormatBGR5A1Unorm,
-        MTLPixelFormatABGR4Unorm,
-        MTLPixelFormatRGBA8Snorm,
+        MTLPixelFormatABGR4Unorm,  MTLPixelFormatRGBA8Snorm,
+        MTLPixelFormatR8Unorm,     MTLPixelFormatR8Unorm,
+        MTLPixelFormatR8Unorm,     MTLPixelFormatRG8Unorm,
+        MTLPixelFormatRG8Unorm,    MTLPixelFormatRG8Unorm,
+        MTLPixelFormatBGRA8Unorm,  MTLPixelFormatBGRA8Unorm,
+        MTLPixelFormatBGRA8Unorm,  MTLPixelFormatBGRA8Unorm,
     };
-    static const unsigned bytes[] = { 16, 4, 8, 4, 8, 4, 4, 4, 4, 2, 2, 2, 2, 4 };
+    static const unsigned bytes[] = { 16, 4, 8, 4, 8, 4, 4, 4, 4, 2,
+                                      2,  2, 2, 4, 1, 1, 1, 2, 2, 2,
+                                      4, 4, 4, 4 };
     MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsDefault;
     if (compact == 11)
         swizzle = MTLTextureSwizzleChannelsMake(
@@ -84,10 +90,32 @@ static void run(NV2AMetalCommands *commands, unsigned kind, unsigned width,
             compact == 7 || compact == 8 ? MTLTextureSwizzleOne :
                                            MTLTextureSwizzleZero,
             MTLTextureSwizzleZero);
+    else if (compact >= NV2AMetalTextureStorageBGRA8) {
+        const MTLTextureSwizzle r = MTLTextureSwizzleRed;
+        const MTLTextureSwizzle g = MTLTextureSwizzleGreen;
+        const MTLTextureSwizzle b = MTLTextureSwizzleBlue;
+        const MTLTextureSwizzle a = MTLTextureSwizzleAlpha;
+        const MTLTextureSwizzleChannels swizzles[] = {
+            {r, g, b, a}, {r, g, b, MTLTextureSwizzleOne},
+            {b, g, r, a}, {a, r, g, b},
+        };
+        swizzle = swizzles[compact - NV2AMetalTextureStorageBGRA8];
+    } else if (compact >= NV2AMetalTextureStorageByteY8) {
+        const MTLTextureSwizzle r = MTLTextureSwizzleRed;
+        const MTLTextureSwizzle g = MTLTextureSwizzleGreen;
+        const MTLTextureSwizzle one = MTLTextureSwizzleOne;
+        const MTLTextureSwizzleChannels swizzles[] = {
+            { r, r, r, one }, { r, r, r, r }, { one, one, one, r },
+            { r, r, r, g },   { r, g, r, g }, { g, r, r, g },
+        };
+        swizzle = swizzles[compact - NV2AMetalTextureStorageByteY8];
+    }
     unsigned bytesPerPixel = bytes[compact];
-    BOOL rawBytes = compact == 1 || compact == NV2AMetalTextureStorageSnorm8;
+    BOOL rawBytes = compact == 1 || compact == NV2AMetalTextureStorageSnorm8 ||
+                    compact >= NV2AMetalTextureStorageByteY8;
     unsigned lanes = compact >= 9 && compact <= 12 ? 1 :
-                     rawBytes || compact <= 2      ? 4 :
+                     rawBytes                      ? bytesPerPixel :
+                     compact <= 2                  ? 4 :
                                                      bytesPerPixel / 4;
     unsigned headerWords = compact ? 10 : 9;
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor new];
@@ -124,8 +152,8 @@ static void run(NV2AMetalCommands *commands, unsigned kind, unsigned width,
                             continue;
                         }
                         if (rawBytes) {
-                            ((uint8_t *)
-                                 seed.mutableBytes)[(z * h + y) * w * 4 + x] =
+                            ((uint8_t *)seed
+                                 .mutableBytes)[(z * h + y) * w * lanes + x] =
                                 byte_value(face, level, z, y, x);
                             continue;
                         }
@@ -292,8 +320,77 @@ static void run(NV2AMetalCommands *commands, unsigned kind, unsigned width,
     assert(!nv2a_metal_texture_snapshot(bound, commands, NULL));
     assert(commands.commandBuffer); // Existing caller recording survives.
     [commands cancel];
+    if (!images) {
+        uint64_t serial = commands.recordingSerial;
+        NSArray<id<MTLTexture>> *sources = @[ bound, restored, bound, restored ];
+        NSArray<NSData *> *copies = nv2a_metal_texture_snapshot_images(
+            sources, snapshot.length * 4, commands, &error);
+        require(copies != nil, error);
+        assert(copies.count == 4 && commands.recordingSerial == serial + 1 &&
+               !commands.commandBuffer);
+        for (NSData *copy in copies)
+            assert([copy isEqualToData:snapshot]);
+        serial = commands.recordingSerial;
+        NV2AMetalSubmission *captured = commands.lastSubmitted;
+        assert(!nv2a_metal_texture_snapshot_images(
+            sources, snapshot.length * 4 - 1, commands, &error));
+        assert(error && commands.recordingSerial == serial &&
+               commands.lastSubmitted == captured);
+        require([commands beginWithError:&error] != nil &&
+                    [commands sealWithError:&error], error);
+        assert(!nv2a_metal_texture_snapshot_images(
+            sources, snapshot.length * 4, commands, &error));
+        assert(commands.sealedBufferCount == 1 && commands.lastSubmitted == captured);
+        [commands cancel];
+        puts("Texture snapshot batch: four images share one submission; "
+             "exact bytes, host limit and sealed caller work PASS");
+        NV2AMetalSubmission *previous = commands.lastSubmitted;
+        assert(!nv2a_metal_texture_restore_images(
+            @[ snapshot, [NSData data] ], commands, NULL));
+        assert(!commands.commandBuffer && commands.lastSubmitted == previous);
+        require([commands beginWithError:&error] != nil, error);
+        assert(!nv2a_metal_texture_restore_images(@[ snapshot ], commands,
+                                                  NULL));
+        assert(commands.commandBuffer && commands.lastSubmitted == previous);
+        [commands cancel];
+        puts("Texture restore batch: invalid later image cancels the upload; "
+             "an existing caller recording is preserved PASS");
+    }
     images++;
 }
+static void restore_batch_budget(NV2AMetalCommands *commands)
+{
+    NSError *error = nil;
+    /* A one-pixel row occupies 256 staging bytes, so each compact image
+     * needs 36 MiB of staging despite its much smaller wire payload. */
+    const uint32_t width = 1, height = 1024, depth = 144;
+    const uint32_t bytes = width * height * depth * 4;
+    const uint32_t header[] = { 0x4d345458, 2, 2, width, height, depth, 1,
+                                0, bytes, NV2AMetalTextureStorageUnorm8 };
+    NSMutableData *wire = [NSMutableData new];
+    for (unsigned i = 0; i < sizeof(header) / sizeof(header[0]); i++)
+        append(wire, header[i]);
+    [wire increaseLengthBy:bytes];
+    memset((uint8_t *)wire.mutableBytes + sizeof(header), 0x53, bytes);
+    uint64_t serial = commands.recordingSerial;
+    NSArray<id<MTLTexture>> *restored =
+        nv2a_metal_texture_restore_images(@[ wire, wire ], commands, &error);
+    require(restored != nil, error);
+    assert(restored.count == 2 && commands.recordingSerial == serial + 2 &&
+           !commands.commandBuffer);
+    serial = commands.recordingSerial;
+    NSArray<NSData *> *copies = nv2a_metal_texture_snapshot_images(
+        restored, 2 * wire.length, commands, &error);
+    require(copies != nil, error);
+    assert(copies.count == 2 && [copies[0] isEqualToData:wire] &&
+           [copies[1] isEqualToData:wire] &&
+           commands.recordingSerial == serial + 2);
+    puts("Texture restore staging limit: two 36 MiB images use separate "
+         "submissions and preserve exact bytes PASS");
+    puts("Texture snapshot staging limit: two 36 MiB images use separate "
+         "submissions and preserve exact bytes PASS");
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -311,8 +408,9 @@ int main(void)
             run(commands, 3, 8, 8, 1, 4, YES, compact);
         }
         run(commands, 1, 16, 16, 1, 5, NO, YES);
+        restore_batch_budget(commands);
         const MTLPixelFormat unsupported[] = {
-            MTLPixelFormatRGBA8Unorm_sRGB, MTLPixelFormatBGRA8Unorm,
+            MTLPixelFormatRGBA8Unorm_sRGB, MTLPixelFormatBGRA8Unorm_sRGB,
             MTLPixelFormatRGBA8Snorm,      MTLPixelFormatRG16Float,
             MTLPixelFormatR32Float,        MTLPixelFormatRG32Float,
             MTLPixelFormatRGBA32Float

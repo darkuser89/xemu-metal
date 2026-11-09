@@ -30,6 +30,10 @@ static BOOL texture_pgraph_error(NSError **error, NSString *message)
              stage:(NV2AMetalTextureStage)stage
              index:(unsigned)index
             hilo16:(BOOL)hilo16;
+- (BOOL)matchesTexture:(NV2AMetalCachedTexture *)texture
+                 stage:(const NV2AMetalTextureStage *)stage
+                 index:(unsigned)index
+                hilo16:(BOOL)hilo16;
 @end
 
 static float register_float(PGRAPHState *pg, unsigned reg)
@@ -90,6 +94,7 @@ static TextureShape native_16_shape(PGRAPHState *pg, unsigned i,
 }
 @implementation NV2AMetalPGRAPHTextures {
     NV2AState *_d;
+    NV2AMetalPGRAPHTextureSnapshot *_lastSnapshot;
     BOOL _closed;
 }
 - (instancetype)initWithState:(NV2AState *)state
@@ -112,6 +117,7 @@ static TextureShape native_16_shape(PGRAPHState *pg, unsigned i,
 }
 - (void)flush
 {
+    _lastSnapshot = nil;
     [_cache removeAllTextures];
 }
 - (void)close
@@ -175,9 +181,14 @@ static TextureShape native_16_shape(PGRAPHState *pg, unsigned i,
         return nil;
     }
     PGRAPHState *pg = &_d->pgraph;
-    NV2AMetalPGRAPHTextureSnapshot *snapshot =
-        [[NV2AMetalPGRAPHTextureSnapshot alloc] initSnapshot];
-    BOOL pendingPalette = NO;
+    NV2AMetalPGRAPHTextureSnapshot *snapshot = _lastSnapshot;
+    NV2AMetalCachedTexture *textures[4] = { nil };
+    NV2AMetalTextureStage stages[4];
+    unsigned enabledMask = 0, hilo16Mask = 0;
+    BOOL reuse = snapshot != nil;
+    BOOL collectedFeedback = NO;
+    unsigned pendingPalettes = 0;
+    NV2AMetalSurfaceRecording *latestPalette = nil;
     for (unsigned i = 0; i < 4; i++) {
         if (!pgraph_is_texture_enabled(pg, i))
             continue;
@@ -283,10 +294,19 @@ static TextureShape native_16_shape(PGRAPHState *pg, unsigned i,
         NV2AMetalCachedTexture *texture = [_cache captureSource:&source
                                                         sampler:&sampler
                                                           frame:pg->frame_time
+                                              collectedFeedback:&collectedFeedback
                                                           error:error];
         if (!texture)
             goto fail;
-        pendingPalette |= palette && !texture.decodeValidated;
+        /* With all 256 entries, an eight-bit index cannot fault. The raster
+         * consumer can use the ordered decode like any other texture upload. */
+        if (palette && source.palette_length < 256 * sizeof(uint32_t) &&
+            !texture.decodeValidated) {
+            pendingPalettes |= 1u << i;
+            NV2AMetalSurfaceRecording *producer = texture.producerRecording;
+            if (producer.serial > latestPalette.serial)
+                latestPalette = producer;
+        }
         NV2AMetalTextureStage stage = { 0 };
         if (pgraph_is_texture_stage_active(pg, i)) {
             stage.dimension = source.shape.dimension;
@@ -343,18 +363,40 @@ static TextureShape native_16_shape(PGRAPHState *pg, unsigned i,
                     register_float(pg, NV_PGRAPH_BUMPOFFSET1 + (i - 1) * 4);
             }
         }
-        [snapshot setTexture:texture
-                       stage:stage
-                       index:i
-                      hilo16:hilo16 && stage.dimension];
+        textures[i] = texture;
+        stages[i] = stage;
+        unsigned bit = 1u << i;
+        enabledMask |= bit;
+        BOOL stageHILO16 = hilo16 && stage.dimension;
+        if (stageHILO16)
+            hilo16Mask |= bit;
+        reuse = reuse && [snapshot matchesTexture:texture stage:&stage
+                                             index:i hilo16:stageHILO16];
     }
-    if (pendingPalette &&
-        (![_cache.surfaces submitWithError:error] ||
-         ![_cache.surfaces waitUntilIdleWithError:error] ||
-         ![snapshot validateCompletedWithError:error]))
+    /* Short palettes alone require CPU fault validation before raster. Their
+     * latest producer covers earlier decodes; unrelated raster feedback keeps
+     * its own lifetime and must not delay this compute-written fault check. */
+    if (latestPalette &&
+        ![_cache.surfaces waitForProducersOfRecording:latestPalette error:error])
         goto fail;
     for (unsigned i = 0; i < 4; i++) {
-        if (snapshot.enabledMask & (1u << i))
+        if ((pendingPalettes & (1u << i)) &&
+            ![textures[i] validateCompletedWithError:error])
+            goto fail;
+    }
+    /* A draw may still own the prior snapshot. Publish new state only after
+     * source coherence and all short-palette fault checks have succeeded. */
+    if (!reuse || snapshot.enabledMask != enabledMask) {
+        snapshot = [[NV2AMetalPGRAPHTextureSnapshot alloc] initSnapshot];
+        for (unsigned i = 0; i < 4; i++) {
+            if (enabledMask & (1u << i))
+                [snapshot setTexture:textures[i] stage:stages[i]
+                               index:i hilo16:!!(hilo16Mask & (1u << i))];
+        }
+        _lastSnapshot = snapshot;
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        if (enabledMask & (1u << i))
             pg->texture_dirty[i] = false;
     }
     return snapshot;

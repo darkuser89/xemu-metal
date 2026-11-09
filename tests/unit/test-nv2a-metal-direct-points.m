@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test-metal-indexed-raster.h"
+#include "test-metal-quad-raster.h"
 
 static void require(BOOL ok, NSError *error)
 {
@@ -53,9 +55,16 @@ static id<MTLTexture> texture(id<MTLDevice> device, MTLPixelFormat format,
     assert(t);
     return t;
 }
-int main(void)
+#include "test-metal-compact-polygon-fallback.h"
+
+int main(int argc, char **argv)
 {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "--quad-raster")) {
+            quad_raster_tests(NO);
+            return 0;
+        }
+        assert(argc == 1);
         NSError *error = nil;
         NV2AMetalCommands *commands =
             [[NV2AMetalCommands alloc] initWithError:&error];
@@ -90,11 +99,19 @@ int main(void)
         }
         v[30].clip[0] = 2; /* Entirely clipped point. */
         v[31].clip[3] = -1;
+        /* Repeated logical records exercise physical counts smaller than
+         * the logical source while retaining a materialized reference. */
+        if (getenv("XEMU_TEST_INDEXED_DUPLICATES"))
+            for (unsigned i = 16; i < 32; i++)
+                v[i] = v[i - 16];
         id<MTLBuffer> source =
             [commands.device newBufferWithBytes:v
                                          length:sizeof(v)
                                         options:MTLResourceStorageModeShared];
         assert(source);
+        BOOL indexedTest = getenv("XEMU_TEST_INDEXED_RASTER") != NULL;
+        NV2AMetalIndexedVertices *indexedSource = indexedTest ?
+            indexed_raster_source(commands.device, v, 32, &error) : nil;
         require([commands beginWithError:&error] != nil, error);
         Class cls = object_getClass(commands.commandBuffer);
         SEL selector = @selector(computeCommandEncoder);
@@ -161,6 +178,10 @@ int main(void)
                         u.depth_factor = 2;
                         u.depth_format = NV2AMetalPixelDepthD24;
                         u.surface_scale[0] = u.surface_scale[1] = 1;
+                        if (getenv("XEMU_TEST_INDEXED_SCALE")) {
+                            u.surface_scale[0] = 2;
+                            u.surface_scale[1] = 3;
+                        }
                         u.clip_range[1] = u.clip_range[3] = 16777215;
                         u.clip_regions[0][2] = u.clip_regions[0][3] = 32;
                         for (unsigned k = 0; k < 4; k++) {
@@ -220,6 +241,11 @@ int main(void)
                         for (unsigned draw = 0; draw < draws; draw++) {
                             unsigned before = computeEncoders;
                             NSArray<NV2AMetalGeometryResult *> *gs =
+                                direct && indexedTest ?
+                                    [geometry encodeNativeRasterSlice:indexed_raster_slice(indexedSource, 32, commands, &error)
+                                        primitive:NV2AMetalPrimitivePoints config:&c smooth:flags & 1
+                                        firstProvoking:flags & 2 zPerspective:flags & 8
+                                        commands:commands error:&error] :
                                 direct ?
                                     [geometry
                                         encodeNativeRasterVertices:source
@@ -249,8 +275,10 @@ int main(void)
                                    g.primitiveCount == 32 &&
                                    g.directPoints == direct);
                             assert(!g.expandedLines && !g.expandedPolygons);
-                            assert((g.vertices == source) == direct);
+                            assert((g.vertices == (indexedTest && direct ? indexedSource.vertices : source)) == direct);
                             if (direct) {
+                                assert(g.indexedVertices == (indexedTest ? indexedSource : nil));
+                                assert(g.indexOffset == (indexedTest ? 5u : 0u));
                                 assert(computeEncoders == before);
                                 geometryDirectEncoders +=
                                     computeEncoders - before;
@@ -261,10 +289,9 @@ int main(void)
                             }
                             NV2AMetalPixelTexture bindings[4] = { 0 };
                             require(
-                                [pixel encodeVertices:g.vertices
+                                [pixel encodeGeometry:g
                                                   offset:0
                                                    count:g.vertexCount
-                                               primitive:MTLPrimitiveTypePoint
                                                 uniforms:&u
                                                 textures:bindings
                                                     pass:pass
@@ -273,7 +300,7 @@ int main(void)
                                                  direct ?
                                                      NV2AMetalPixelRasterDirectPoint :
                                                      NV2AMetalPixelRasterNative
-                                    ignorePolygonCulling:NO
+                                    ignorePolygonCulling:NO renderEncoder:nil
                                                 commands:commands
                                                    error:&error],
                                 error);
@@ -379,7 +406,7 @@ int main(void)
         c.lineWidth = 2;
         c.viewportWidth = c.viewportHeight = 32;
         c.polygonSmooth = YES;
-        for (unsigned primitive = NV2AMetalPrimitiveLines;
+        for (unsigned primitive = NV2AMetalPrimitiveTriangles;
              primitive <= NV2AMetalPrimitivePolygon; primitive++) {
             require([commands beginWithError:&error] != nil, error);
             NSArray *a = [geometry encodeNativeRasterVertices:source
@@ -403,21 +430,34 @@ int main(void)
             require(a.count == 1 && b.count == 1, error);
             NV2AMetalGeometryResult *x = a[0], *y = b[0];
             assert(!x.directPoints && !y.directPoints);
+            compact_fallback_source(x, primitive, source, nil, commands);
+            assert(x.compactPolygons && !y.compactPolygons);
+            id<MTLBuffer> nativeFrame =
+                compact_fallback_frame(commands, a, primitive, NO);
+            id<MTLBuffer> legacyFrame =
+                compact_fallback_frame(commands, b, primitive, NO);
             require([commands submitWithError:&error], error);
             require([commands waitUntilIdleWithError:&error], error);
             assert(x.vertexCount == y.vertexCount &&
                    x.primitiveType == y.primitiveType);
-            assert(memcmp(x.vertices.contents, y.vertices.contents,
-                          x.vertexCount * sizeof(NV2AMetalVertex)) == 0);
+            assert(nativeFrame.length == legacyFrame.length &&
+                   !memcmp(nativeFrame.contents, legacyFrame.contents,
+                           nativeFrame.length));
+            assert(!x.compactLines && !y.compactLines && x.vertices &&
+                   y.vertices && y.vertices.contents &&
+                   y.vertexCount <=
+                       y.vertices.length / sizeof(NV2AMetalVertex) &&
+                   ![x canUsePolygonCoverageForCommands:commands]);
         }
         method_setImplementation(cm, (IMP)original_compute);
         method_setImplementation(fm, (IMP)original_feedback);
-        printf("Direct points: %u exact color/query pairs (single-sample depth "
-               "exact too), %llu visible samples; geometry encoders "
-               "direct/reference=%u/%u, output bytes avoided=%llu;9 fallback "
-               "topologies,empty/cancel/input rejects PASS\n",
-               pairs, (unsigned long long)visible, geometryDirectEncoders,
-               geometryReferenceEncoders, (unsigned long long)copiedBytes);
+        printf(
+            "Direct points: %u exact color/query pairs (single-sample depth "
+            "exact too), %llu visible samples; geometry encoders "
+            "direct/reference=%u/%u, output bytes avoided=%llu;6 smooth-fill "
+            "topologies,empty/cancel/input rejects PASS\n",
+            pairs, (unsigned long long)visible, geometryDirectEncoders,
+            geometryReferenceEncoders, (unsigned long long)copiedBytes);
     }
     return 0;
 }

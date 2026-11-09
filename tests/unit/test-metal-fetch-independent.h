@@ -3,8 +3,8 @@
 #ifndef TEST_METAL_FETCH_INDEPENDENT_H
 #define TEST_METAL_FETCH_INDEPENDENT_H
 #import <objc/runtime.h>
-static BOOL fi_collect_failure;
-static BOOL (*fi_original_collect)(id, SEL, NSError **);
+static BOOL fi_completion_failure;
+static BOOL (*fi_original_complete)(id, SEL, NV2AMetalIndependentReads *, NSError **);
 static NV2AMetalCommands *fi_observed_commands;
 static unsigned fi_idle_waits;
 static BOOL (*fi_original_idle)(id, SEL, NSError **);
@@ -14,31 +14,32 @@ static BOOL fi_idle(id object, SEL selector, NSError **error)
         fi_idle_waits++;
     return fi_original_idle(object, selector, error);
 }
-static BOOL fi_collect(id object, SEL selector, NSError **error)
+static BOOL fi_complete(id object, SEL selector,
+                         NV2AMetalIndependentReads *reads, NSError **error)
 {
-    if (fi_collect_failure) {
-        fi_collect_failure = NO;
+    if (fi_completion_failure) {
+        fi_completion_failure = NO;
         if (error)
             *error = [NSError errorWithDomain:@"test.independent.completed"
                                          code:1
                                      userInfo:nil];
         return NO;
     }
-    return fi_original_collect(object, selector, error);
+    return fi_original_complete(object, selector, reads, error);
 }
 static void independent_snapshot_tests(void)
 {
     NSError *error = nil;
-    Method collect = class_getInstanceMethod(
-        NV2AMetalSurfaceCache.class, @selector(collectCompletedWithError:));
-    assert(collect);
+    Method complete = class_getInstanceMethod(
+        NV2AMetalSurfaceCache.class, @selector(completeIndependentReads:error:));
+    assert(complete);
     Method idle = class_getInstanceMethod(NV2AMetalCommands.class,
                                           @selector(waitUntilIdleWithError:));
     assert(idle);
     fi_idle_waits = 0;
     fi_original_idle = (void *)method_setImplementation(idle, (IMP)fi_idle);
-    fi_original_collect =
-        (void *)method_setImplementation(collect, (IMP)fi_collect);
+    fi_original_complete =
+        (void *)method_setImplementation(complete, (IMP)fi_complete);
     unsigned cases = 0, retries = 0;
     for (unsigned kind = 0; kind < 2; kind++)
         for (unsigned compact = 0; compact < 2; compact++)
@@ -140,15 +141,11 @@ static void independent_snapshot_tests(void)
                     if (action >= 3) {
                         uint32_t *faults = b[0].fetch.faults.contents;
                         if (action == 5)
-                            fi_collect_failure = YES;
-                        else if (action == 3) {
-                            faults[0] = 1;
-                            *(uint32_t *)((uint8_t *)faults +
-                                          b[0].fetch.faultSummaryOffset) = 1;
-                        } else
-                            faults[b[0].fetch.vertexCount] = 1;
+                            fi_completion_failure = YES;
+                        else
+                            *faults = 1u << (action - 3);
                         assert(![adapter completeWithError:&error] && error);
-                        assert(!fi_collect_failure);
+                        assert(!fi_completion_failure);
                     } else
                         [adapter cancel];
                     if (action == 2) {
@@ -232,7 +229,7 @@ static void independent_snapshot_tests(void)
         fi_observed_commands = nil;
         groups++;
     }
-    method_setImplementation(collect, (IMP)fi_original_collect);
+    method_setImplementation(complete, (IMP)fi_original_complete);
     method_setImplementation(idle, (IMP)fi_original_idle);
     assert(cases == 24 && retries == 20);
     groups += cases;

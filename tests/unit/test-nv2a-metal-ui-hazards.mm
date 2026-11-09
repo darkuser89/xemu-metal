@@ -15,11 +15,105 @@ static const unsigned side = 16, frames = 8, pixels = side * side;
 static BOOL production, broad;
 static MTLStages expectedStages;
 static unsigned consumers, producers, callbacks;
+static id<MTL4RenderCommandEncoder> callbackEncoder;
+static id<MTL4ArgumentTable> callbackArguments;
+static id<MTLRenderPipelineState> callbackPipeline;
 static Class encoderClasses[2];
 static unsigned classCount;
 typedef void (*BarrierIMP)(id, SEL, MTLStages, MTLStages,
                            MTL4VisibilityOptions);
 static BarrierIMP originalConsumers[2], originalProducers[2];
+
+@interface UICommands : NV2AMetalCommands
+@property(nonatomic) BOOL dedicatedUploads;
+@property(nonatomic) BOOL failUpload;
+@property(nonatomic) NSUInteger failUploadAt;
+@property(nonatomic) unsigned uploadDepth;
+@property(nonatomic, strong) NSMutableArray<NSArray *> *uploads;
+@end
+
+@implementation UICommands
+- (id<MTLBuffer>)uploadBytes:(const void *)bytes
+                      length:(NSUInteger)length
+                      offset:(NSUInteger *)offset
+                       error:(NSError **)error
+{
+    if (_failUpload || (!_uploadDepth && _failUploadAt &&
+                        _uploads.count == _failUploadAt - 1)) {
+        if (error)
+            *error = [NSError errorWithDomain:@"test.ui-upload"
+                                         code:1
+                                     userInfo:nil];
+        return nil;
+    }
+    BOOL outer = !_uploadDepth++;
+    id<MTLBuffer> buffer;
+    if (_dedicatedUploads) {
+        buffer = [self.device newBufferWithBytes:bytes
+                                          length:length
+                                         options:MTLResourceStorageModeShared];
+        assert(buffer && [self addResource:buffer error:error]);
+        *offset = 0;
+    } else {
+        buffer = [super uploadBytes:bytes
+                             length:length
+                             offset:offset
+                              error:error];
+    }
+    assert(buffer && *offset <= buffer.length &&
+           length <= buffer.length - *offset && !(*offset & 255));
+    /* The arena re-enters uploadBytes when it rolls to another page. Count
+     * only the caller's immutable slice, not that internal retry. */
+    if (outer) {
+        [_uploads addObject:@[
+            buffer, @(*offset), [NSData dataWithBytes:bytes length:length]
+        ]];
+    }
+    _uploadDepth--;
+    return buffer;
+}
+@end
+
+static unsigned uploadRecords, arenaRecords, arenaPages, nonzeroOffsets;
+static unsigned geometryRecords;
+static void check_uploads(UICommands *commands, id<MTLBuffer> paddedPage)
+{
+    NSMutableSet *buffers = [NSMutableSet new];
+    id<MTLBuffer> page = paddedPage;
+    NSUInteger next = page ? page.length - 256 : 0;
+    for (NSArray *record in commands.uploads) {
+        id<MTLBuffer> buffer = record[0];
+        NSUInteger offset = [record[1] unsignedIntegerValue];
+        NSData *bytes = record[2];
+        assert(!memcmp((char *)buffer.contents + offset, bytes.bytes,
+                       bytes.length));
+        NSValue *identity = [NSValue valueWithNonretainedObject:buffer];
+        uploadRecords++;
+        if (commands.dedicatedUploads) {
+            assert(!offset);
+        } else {
+            assert(page && next <= page.length);
+            if (bytes.length > page.length - next) {
+                assert(buffer != page && buffer != paddedPage &&
+                       buffer.length == paddedPage.length &&
+                       ![buffers containsObject:identity]);
+                page = buffer;
+                next = 0;
+            }
+            assert(buffer == page && offset == next);
+            next += (bytes.length + 255) & ~(NSUInteger)255;
+            nonzeroOffsets += offset != 0;
+        }
+        [buffers addObject:identity];
+    }
+    if (commands.dedicatedUploads) {
+        assert(buffers.count == commands.uploads.count);
+    } else if (commands.uploads.count) {
+        assert(commands.uploads.count >= frames);
+        arenaRecords += commands.uploads.count;
+        arenaPages += buffers.count;
+    }
+}
 
 static void require(BOOL ok, NSError *error)
 {
@@ -43,6 +137,8 @@ static void consumer(id object, SEL selector, MTLStages after, MTLStages before,
         assert(after == MTLStageAll && before == expectedStages &&
                options == MTL4VisibilityOptionDevice);
         consumers++;
+        if (expectedStages & MTLStageVertex)
+            callbackEncoder = (id<MTL4RenderCommandEncoder>)object;
         if (broad)
             before = MTLStageAll;
     }
@@ -61,9 +157,18 @@ static void producer(id object, SEL selector, MTLStages after, MTLStages before,
     }
     originalProducers[class_index(object)](object, selector, after, before,
                                            options);
+    if (production && (expectedStages & MTLStageVertex))
+        callbackEncoder = nil;
 }
 static void callback(const ImDrawList *, const ImDrawCmd *)
 {
+    assert(callbackEncoder && callbackArguments && callbackPipeline);
+    [callbackEncoder setRenderPipelineState:callbackPipeline];
+    [callbackEncoder setArgumentTable:callbackArguments
+                             atStages:MTLRenderStageVertex];
+    [callbackEncoder drawPrimitives:MTLPrimitiveTypePoint
+                        vertexStart:0
+                        vertexCount:1];
     callbacks++;
 }
 static id<MTLTexture> texture(id<MTLDevice> device, MTLPixelFormat format)
@@ -154,14 +259,15 @@ int main(void)
 {
     @autoreleasepool {
         NSError *error = nil;
-        NV2AMetalCommands *commands =
-            [[NV2AMetalCommands alloc] initWithError:&error];
+        UICommands *commands = [[UICommands alloc] initWithError:&error];
         require(commands != nil, error);
+        commands.uploads = [NSMutableArray new];
         id<MTLDevice> device = commands.device;
         NSString *source =
             @"#include <metal_stdlib>\nusing namespace metal;\n"
              "kernel void seed(constant uint4 &p [[buffer(0)]],device uint "
              "*raw [[buffer(1)]],"
+             "device uint *callback_data [[buffer(2)]],"
              "texture2d<float,access::write> src [[texture(0)]],"
              "texture2d<float,access::write> main [[texture(1)]],"
              "texture2d<float,access::write> overlay [[texture(2)]],"
@@ -171,6 +277,7 @@ int main(void)
              "r=((xy.x/4+p.x)&1)*255,g=((xy.y/"
              "4+(p.x>>1))&1)*255,b=((p.x>>2)&1)*255;"
              "raw[id]=b|(g<<8)|(r<<16)|0xff000000u;"
+             "if(id==0)callback_data[p.x]=0xd3c0a500u^p.x;"
              "src.write(float4(r,g,b,255)/255.0f,xy);"
              "float4 "
              "c=float4(p.x&1,0,1,1);main.write(c,xy);overlay.write(c,xy);}\n"
@@ -178,13 +285,25 @@ int main(void)
              "[[texture(0)]],"
              "texture2d<float,access::read> overlay [[texture(1)]],"
              "device uint *out [[buffer(0)]],constant uint4 &p [[buffer(1)]],"
+             "device const uint *callback_data [[buffer(2)]],"
              "uint id [[thread_position_in_grid]]){if(id>=p.y*p.y)return;"
              "uint2 xy=uint2(id%p.y,id/p.y);"
              "uint4 "
              "c=uint4(round(main.read(xy)*255.0f)),d=uint4(round(overlay.read("
              "xy)*255.0f));"
              "out[(p.x*2)*p.y*p.y+id]=c.x|(c.y<<8)|(c.z<<16)|(c.w<<24);"
-             "out[(p.x*2+1)*p.y*p.y+id]=d.x|(d.y<<8)|(d.z<<16)|(d.w<<24);}\n";
+             "out[(p.x*2+1)*p.y*p.y+id]=d.x|(d.y<<8)|(d.z<<16)|(d.w<<24);"
+             "if(id==0)out[p.w*2*p.y*p.y+p.x]=p.z?callback_data[p.x]:("
+             "0xd3c0a500u^p.x);}\n"
+             "struct CallbackVertex{float4 p [[position]];float size "
+             "[[point_size]];};"
+             "vertex CallbackVertex callback_vertex(device const uint *raw "
+             "[[buffer(0)]],"
+             "device uint *out [[buffer(1)]],constant uint4 &p [[buffer(2)]],"
+             "uint id [[vertex_id]]){if(id==0)out[p.x]="
+             "raw[(p.x*37+5)%(p.y*p.y)]^(p.x*0x9e3779b9u);"
+             "return {float4(2,2,.5f,1),1};}\n"
+             "fragment float4 callback_fragment(){return float4(0);}\n";
         id<MTL4Compiler> compiler =
             [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
                                         error:&error];
@@ -212,12 +331,15 @@ int main(void)
             require(pipelines[i] != nil, error);
         }
         MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
-        ad.maxBufferBindCount = 2;
+        ad.maxBufferBindCount = 3;
         ad.maxTextureBindCount = 3;
         ad.initializeBindings = YES;
         id<MTL4ArgumentTable> args =
             [device newArgumentTableWithDescriptor:ad error:&error];
         require(args != nil, error);
+        callbackArguments = [device newArgumentTableWithDescriptor:ad
+                                                             error:&error];
+        require(callbackArguments != nil, error);
         ImGui::CreateContext();
         ImGuiIO &io = ImGui::GetIO();
         io.IniFilename = io.LogFilename = nullptr;
@@ -226,9 +348,28 @@ int main(void)
         NV2AMetalVGA *vga = [[NV2AMetalVGA alloc] initWithDevice:device
                                                            error:&error];
         require(vga != nil, error);
-        unsigned pairs = 0, checked = 0, wantedPasses = 0, wantedCallbacks = 0;
+        unsigned pairs = 0, checked = 0, wantedPasses = 0, wantedCallbacks = 0,
+                 callbackRecords = 0;
         for (MTLPixelFormat format :
              { MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm }) {
+            MTL4LibraryFunctionDescriptor *vf = [MTL4LibraryFunctionDescriptor
+                                              new],
+                                          *ff = [MTL4LibraryFunctionDescriptor
+                                              new];
+            vf.library = ff.library = library;
+            vf.name = @"callback_vertex";
+            ff.name = @"callback_fragment";
+            MTL4RenderPipelineDescriptor *pd =
+                [MTL4RenderPipelineDescriptor new];
+            pd.vertexFunctionDescriptor = vf;
+            pd.fragmentFunctionDescriptor = ff;
+            pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+            pd.colorAttachments[0].pixelFormat = format;
+            callbackPipeline =
+                [compiler newRenderPipelineStateWithDescriptor:pd
+                                           compilerTaskOptions:nil
+                                                         error:&error];
+            require(callbackPipeline != nil, error);
             NV2AMetalDisplay *display =
                 [[NV2AMetalDisplay alloc] initWithDevice:device
                                              pixelFormat:format
@@ -251,29 +392,101 @@ int main(void)
                 [device newBufferWithLength:pixels * 4
                                     options:MTLResourceStorageModePrivate];
             id<MTLBuffer> output =
-                [device newBufferWithLength:frames * 2 * pixels * 4
+                [device newBufferWithLength:(frames * 2 * pixels + frames) * 4
                                     options:MTLResourceStorageModeShared];
-            assert(raw && output);
+            id<MTLBuffer> callbackData =
+                [device newBufferWithLength:frames * 4
+                                    options:MTLResourceStorageModePrivate];
+            assert(raw && output && callbackData);
             if (!classCount)
                 install_spies(commands, main);
+            /* A failed upload must leave no open encoder and must permit a
+             * cancelled recording to be retried with fresh uniforms. */
+            require([commands beginWithError:&error] != nil, error);
+            commands.failUpload = YES;
+            XemuMetal4Decal *failed = [XemuMetal4Decal new];
+            failed.texture = src;
+            failed.destination = failed.source = CGRectMake(0, 0, side, side);
+            error = nil;
+            assert(![decals encodeDecals:@[ failed ]
+                                commands:commands
+                                  target:overlay
+                                   clear:YES
+                                   error:&error]);
+            assert([error.domain isEqualToString:@"test.ui-upload"]);
+            ImGui::NewFrame();
+            ImGui::GetBackgroundDrawList()->AddRectFilled(
+                ImVec2(0, 0), ImVec2(side, side), IM_COL32_WHITE);
+            ImGui::Render();
+            error = nil;
+            assert(![imgui encodeDrawData:ImGui::GetDrawData()
+                                 commands:commands
+                                   target:main
+                                    error:&error]);
+            assert([error.domain isEqualToString:@"test.ui-upload"]);
+            [commands cancel];
+            commands.failUpload = NO;
+            for (NSUInteger upload = 2; upload <= 3; upload++) {
+                [commands.uploads removeAllObjects];
+                commands.failUploadAt = upload;
+                require([commands beginWithError:&error] != nil, error);
+                error = nil;
+                assert(![imgui encodeDrawData:ImGui::GetDrawData()
+                                     commands:commands
+                                       target:main
+                                        error:&error]);
+                assert([error.domain isEqualToString:@"test.ui-upload"] &&
+                       commands.uploads.count == upload - 1);
+                id<MTL4ComputeCommandEncoder> after =
+                    [commands.commandBuffer computeCommandEncoder];
+                assert(after);
+                [after endEncoding];
+                [commands cancel];
+            }
+            commands.failUploadAt = 0;
             for (unsigned route = 0; route < 5; route++)
-                for (unsigned scene = 0; scene < 16; scene++) {
+                for (unsigned scene = 0; scene < (route >= 3 ? 32 : 16);
+                     scene++) {
                     BOOL off = scene & 1, emptyDecals = scene & 2,
-                         clear = !(scene & 4), emptyImGui = scene & 8;
+                         clear = !(scene & 4), emptyImGui = scene & 8,
+                         opaqueCallback = scene & 16;
                     if (route == 3 && emptyImGui)
                         continue;
                     NSData *reference = nil;
-                    for (unsigned variant = 0; variant < 2; variant++) {
-                        broad = (variant ^ (scene & 1)) == 0;
+                    for (unsigned variant = 0; variant < 4; variant++) {
+                        broad = !(variant & 1) ^ !!(scene & 1);
+                        commands.dedicatedUploads = variant & 2;
+                        [commands.uploads removeAllObjects];
                         memset(output.contents, 0x5a, output.length);
                         require([commands beginWithError:&error] != nil, error);
+                        /* Leave space for one small slice to exercise rollover
+                         * before or after the first upload, depending on size. */
+                        id<MTLBuffer> paddedPage = nil;
+                        if (!commands.dedicatedUploads) {
+                            unsigned char padding[65536 - 256];
+                            memset(padding, 0x5a, sizeof(padding));
+                            NSUInteger offset = 1;
+                            paddedPage = [commands uploadBytes:padding
+                                                        length:sizeof(padding)
+                                                        offset:&offset
+                                                         error:&error];
+                            require(paddedPage != nil, error);
+                            assert(offset == 0);
+                            [commands.uploads removeAllObjects];
+                        }
                         for (id<MTLResource> r in
-                             @[ main, overlay, src, raw, output ])
+                             @[ main, overlay, src, raw, output, callbackData ])
                             require([commands addResource:r error:&error],
                                     error);
                         require([commands keepAlive:args error:&error], error);
+                        require([commands keepAlive:callbackArguments
+                                              error:&error],
+                                error);
                         for (unsigned frame = 0; frame < frames; frame++) {
-                            uint32_t values[] = { frame, side, 0, 0 };
+                            BOOL gpuCallback =
+                                route >= 3 && !emptyImGui && opaqueCallback;
+                            uint32_t values[] = { frame, side, gpuCallback,
+                                                  frames };
                             id<MTLBuffer> params = [device
                                 newBufferWithBytes:values
                                             length:sizeof(values)
@@ -293,6 +506,7 @@ int main(void)
                                          MTL4VisibilityOptionDevice];
                             [args setAddress:params.gpuAddress atIndex:0];
                             [args setAddress:raw.gpuAddress atIndex:1];
+                            [args setAddress:callbackData.gpuAddress atIndex:2];
                             [args setTexture:src.gpuResourceID atIndex:0];
                             [args setTexture:main.gpuResourceID atIndex:1];
                             [args setTexture:overlay.gpuResourceID atIndex:2];
@@ -301,6 +515,13 @@ int main(void)
                             [e dispatchThreads:MTLSizeMake(pixels, 1, 1)
                                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                             [e endEncoding];
+                            [callbackArguments setAddress:raw.gpuAddress
+                                                  atIndex:0];
+                            [callbackArguments
+                                setAddress:callbackData.gpuAddress
+                                   atIndex:1];
+                            [callbackArguments setAddress:params.gpuAddress
+                                                  atIndex:2];
                             id<MTLTexture> image = src, result = main;
                             production = YES;
                             if (route == 0 || route == 4) {
@@ -349,8 +570,7 @@ int main(void)
                                 d.secondary = 0x00ff00ff;
                                 d.flipY = frame & 1;
                                 d.blend = (XemuMetal4DecalBlend)(frame % 3);
-                                expectedStages =
-                                    MTLStageVertex | MTLStageFragment;
+                                expectedStages = MTLStageFragment;
                                 require(
                                     [decals
                                         encodeDecals:emptyDecals ? @[] : @[ d ]
@@ -380,25 +600,66 @@ int main(void)
                                                                             overlay),
                                         ImVec2(0, 0), ImVec2(side, side));
                                     list->PopClipRect();
-                                    list->AddCallback(callback, nullptr);
-                                    list->AddCallback(
+                                    /* A later draw list must also widen the
+                                     * pass before its first draw executes. */
+                                    ImDrawList *callbackList =
+                                        opaqueCallback && (scene & 2) ?
+                                            ImGui::GetForegroundDrawList() :
+                                            list;
+                                    if (opaqueCallback) {
+                                        callbackList->AddCallback(callback,
+                                                                  nullptr);
+                                        wantedCallbacks++;
+                                    }
+                                    callbackList->AddCallback(
                                         ImDrawCallback_ResetRenderState,
                                         nullptr);
-                                    list->AddRectFilled(
+                                    callbackList->AddRectFilled(
                                         ImVec2(12, 0), ImVec2(16, 4),
                                         IM_COL32(0, 255, 0, 255));
-                                    wantedCallbacks++;
                                     wantedPasses++;
                                 }
                                 ImGui::Render();
+                                ImDrawData *data = ImGui::GetDrawData();
+                                data->DisplayPos =
+                                    ImVec2(frame * 3 + 1, frame * 7 + 2);
+                                for (ImDrawList *list : data->CmdLists) {
+                                    for (ImDrawVert &v : list->VtxBuffer) {
+                                        v.pos.x += data->DisplayPos.x;
+                                        v.pos.y += data->DisplayPos.y;
+                                    }
+                                    for (ImDrawCmd &draw : list->CmdBuffer) {
+                                        draw.ClipRect.x += data->DisplayPos.x;
+                                        draw.ClipRect.z += data->DisplayPos.x;
+                                        draw.ClipRect.y += data->DisplayPos.y;
+                                        draw.ClipRect.w += data->DisplayPos.y;
+                                    }
+                                }
                                 expectedStages =
-                                    MTLStageVertex | MTLStageFragment;
-                                require([imgui
-                                            encodeDrawData:ImGui::GetDrawData()
-                                                  commands:commands
-                                                    target:main
-                                                     error:&error],
+                                    MTLStageFragment |
+                                    (opaqueCallback ? MTLStageVertex : 0);
+                                NSUInteger upload = commands.uploads.count;
+                                require([imgui encodeDrawData:data
+                                                     commands:commands
+                                                       target:main
+                                                        error:&error],
                                         error);
+                                if (data->CmdListsCount)
+                                    upload++; // Projection.
+                                for (const ImDrawList *list : data->CmdLists) {
+                                    if (!list->VtxBuffer.Size ||
+                                        !list->IdxBuffer.Size)
+                                        continue;
+                                    assert(upload + 2 <= commands.uploads.count);
+                                    NSData *v = commands.uploads[upload++][2];
+                                    NSData *i = commands.uploads[upload++][2];
+                                    assert(v.length == (NSUInteger)list->VtxBuffer.size_in_bytes() &&
+                                           i.length == (NSUInteger)list->IdxBuffer.size_in_bytes() &&
+                                           !memcmp(v.bytes, list->VtxBuffer.Data, v.length) &&
+                                           !memcmp(i.bytes, list->IdxBuffer.Data, i.length));
+                                    geometryRecords += 2;
+                                }
+                                assert(upload == commands.uploads.count);
                             }
                             production = NO;
                             require([commands addResource:result error:&error],
@@ -417,6 +678,7 @@ int main(void)
                             }
                             [args setAddress:output.gpuAddress atIndex:0];
                             [args setAddress:params.gpuAddress atIndex:1];
+                            [args setAddress:callbackData.gpuAddress atIndex:2];
                             [args setTexture:result.gpuResourceID atIndex:0];
                             [args setTexture:overlay.gpuResourceID atIndex:1];
                             [e setComputePipelineState:pipelines[1]];
@@ -425,6 +687,7 @@ int main(void)
                                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                             [e endEncoding];
                         }
+                        check_uploads(commands, paddedPage);
                         require([commands submitWithError:&error], error);
                         require([commands waitUntilIdleWithError:&error],
                                 error);
@@ -483,6 +746,23 @@ int main(void)
                                         assert(p[at + pixels] == overlayWant);
                                     checked++;
                                 }
+                        for (unsigned frame = 0; frame < frames; frame++) {
+                            uint32_t want = 0xd3c0a500u ^ frame;
+                            if (route >= 3 && !emptyImGui && opaqueCallback) {
+                                unsigned at = (frame * 37 + 5) % pixels;
+                                uint32_t color =
+                                    source_color(at % side, at / side, frame);
+                                uint32_t rawColor = (color & 0xff00ff00u) |
+                                                    (color & 255u) << 16 |
+                                                    (color >> 16 & 255u);
+                                uint32_t written =
+                                    rawColor ^ (frame * 0x9e3779b9u);
+                                assert(written != want);
+                                want = written;
+                                callbackRecords++;
+                            }
+                            assert(p[frames * 2 * pixels + frame] == want);
+                        }
                         if (!variant)
                             reference = [NSData dataWithBytes:output.contents
                                                        length:output.length];
@@ -496,23 +776,37 @@ int main(void)
             [imgui shutdown];
         }
         restore_spies();
+        callbackEncoder = nil;
+        callbackArguments = nil;
+        callbackPipeline = nil;
         ImGui::DestroyContext();
-        if (pairs != 144 || consumers != wantedPasses ||
+        if (pairs != 576 || consumers != wantedPasses ||
             producers != consumers || callbacks != wantedCallbacks)
             fprintf(stderr,
-                    "UI totals: pairs %u/144, consumers %u/%u, producers %u, "
+                    "UI totals: pairs %u/576, consumers %u/%u, producers %u, "
                     "callbacks %u/%u\n",
                     pairs, consumers, wantedPasses, producers, callbacks,
                     wantedCallbacks);
-        assert(pairs == 144 && consumers == wantedPasses &&
-               producers == consumers && callbacks == wantedCallbacks);
-        printf("Metal VGA/UI barriers: %u exact broad/production pairs, %u "
-               "pixel records, %u consumer/producer pairs, %u callbacks; "
+        assert(pairs == 576 && consumers == wantedPasses &&
+               producers == consumers && callbacks == wantedCallbacks &&
+               callbackRecords == callbacks && callbackRecords == 1024);
+        assert(uploadRecords && arenaRecords > arenaPages && nonzeroOffsets &&
+               geometryRecords);
+        printf("Metal UI uploads: %u immutable records, %u arena slices/%u "
+               "page uses, %u nonzero offsets; dedicated-buffer equality "
+               "and page rollover PASS\n",
+               uploadRecords, arenaRecords, arenaPages, nonzeroOffsets);
+        printf("Metal ImGui geometry: %u exact vertex/index uploads; both "
+               "geometry upload failures end the encoder and cancel PASS\n",
+               geometryRecords);
+        printf("Metal VGA/UI barriers: %u exact barrier/upload pairs, %u "
+               "pixel records, %u consumer/producer pairs, %u callbacks/%u "
+               "GPU vertex read-write records; "
                "isolated VGA/Display/Decal/ImGui and full chain, GPU "
                "inputs/readback/overwrite, RGBA/BGRA, "
                "clear/load/screen-off/empty/flip/clip/blend/reset-state PASS; "
                "no window\n",
-               pairs, checked, consumers, callbacks);
+               pairs, checked, consumers, callbacks, callbackRecords);
     }
     return 0;
 }

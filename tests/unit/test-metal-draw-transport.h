@@ -9,6 +9,7 @@ static BOOL transport_reference, transport_encoding;
 static NV2AMetalCommands *transport_relocation_commands;
 
 static unsigned transport_encoders, transport_copies, transport_transforms;
+static unsigned transport_geometry_calls;
 static uint64_t transport_bytes;
 static NSArray<NV2AMetalVertexSlice *> *transport_views;
 static id (*transport_original_compute)(id, SEL);
@@ -17,12 +18,12 @@ static void (*transport_original_copy)(id, SEL, id<MTLBuffer>, NSUInteger,
 static NSArray *(*transport_original_native)(id, SEL, NV2AMetalCommands *,
                                              NSError **);
 static NSArray *(*transport_original_geometry)(
-    id, SEL, id<MTLBuffer>, NSUInteger, NSUInteger, enum NV2AMetalPrimitive,
+    id, SEL, NV2AMetalVertexSlice *, enum NV2AMetalPrimitive,
     const NV2AMetalGeometryRasterConfig *, BOOL, BOOL, BOOL,
     NV2AMetalCommands *, NSError **);
 static NV2AMetalEpochEncoding *(*transport_original_transform)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
-    NSUInteger, NV2AMetalCommands *, NSError **);
+    NSUInteger, NV2AMetalFetchResult *, NV2AMetalCommands *, NSError **);
 
 static NV2AMetalEpochResult *(*transport_original_execute)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
@@ -98,42 +99,42 @@ static NSArray *transport_native(id owner, SEL selector,
     transport_views = result;
     return result;
 }
-static NSArray *transport_geometry(
-    id owner, SEL selector, id<MTLBuffer> vertices, NSUInteger first,
-    NSUInteger count, enum NV2AMetalPrimitive primitive,
-    const NV2AMetalGeometryRasterConfig *config, BOOL smooth, BOOL provoking,
-    BOOL perspective, NV2AMetalCommands *commands, NSError **error)
+static NSArray *transport_geometry(id owner, SEL selector,
+                                   NV2AMetalVertexSlice *view,
+                                   enum NV2AMetalPrimitive primitive,
+                                   const NV2AMetalGeometryRasterConfig *config,
+                                   BOOL smooth, BOOL provoking,
+                                   BOOL perspective,
+                                   NV2AMetalCommands *commands, NSError **error)
 {
-    assert(transport_views.count == 1);
-    NV2AMetalVertexSlice *view = transport_views[0];
-    assert(vertices == view.buffer && first == view.firstVertex &&
-           count == view.vertexCount);
-    return transport_original_geometry(owner, selector, vertices, first, count,
-                                       primitive, config, smooth, provoking,
-                                       perspective, commands, error);
+    transport_geometry_calls++;
+    assert(transport_views.count == 1 && view == transport_views[0]);
+    return transport_original_geometry(owner, selector, view, primitive, config,
+                                       smooth, provoking, perspective, commands,
+                                       error);
 }
-static NV2AMetalEpochEncoding *
-transport_transform(id owner, SEL selector,
-                    NV2AMetalPGRAPHVertexState *captured, id<MTLBuffer> input,
-                    NSUInteger first, NSUInteger count,
-                    NV2AMetalCommands *commands, NSError **error)
+static NV2AMetalEpochEncoding *transport_transform(
+    id owner, SEL selector, NV2AMetalPGRAPHVertexState *captured,
+    id<MTLBuffer> input, NSUInteger first, NSUInteger count,
+    NV2AMetalFetchResult *fetch, NV2AMetalCommands *commands, NSError **error)
 {
     transport_transforms++;
     return transport_original_transform(owner, selector, captured, input, first,
-                                        count, commands, error);
+                                        count, fetch, commands, error);
 }
 static NV2AMetalEpochEncoding *(*transport_original_serial)(
     id, SEL, NV2AMetalPGRAPHVertexState *, id<MTLBuffer>, NSUInteger,
-    NSUInteger, NV2AMetalEpochEncoding *, NV2AMetalCommands *, NSError **);
+    NSUInteger, NV2AMetalEpochEncoding *, NV2AMetalFetchResult *,
+    NV2AMetalCommands *, NSError **);
 static NV2AMetalEpochEncoding *
 transport_serial(id owner, SEL selector, NV2AMetalPGRAPHVertexState *captured,
                  id<MTLBuffer> input, NSUInteger first, NSUInteger count,
-                 NV2AMetalEpochEncoding *previous, NV2AMetalCommands *commands,
-                 NSError **error)
+                 NV2AMetalEpochEncoding *previous, NV2AMetalFetchResult *fetch,
+                 NV2AMetalCommands *commands, NSError **error)
 {
     transport_transforms++;
     return transport_original_serial(owner, selector, captured, input, first,
-                                     count, previous, commands, error);
+                                     count, previous, fetch, commands, error);
 }
 static NV2AMetalPendingInput *transport_prefix(NV2AMetalPendingInput *input,
                                                NSUInteger count)
@@ -328,19 +329,19 @@ static void draw_transport_tests(void)
                                 @selector(encodeSlicesWithCommands:error:));
     Method geometryMethod = class_getInstanceMethod(
         NV2AMetalGeometry.class,
-        @selector(encodeNativeRasterVertices:first:count:primitive:config:
-                  smooth:firstProvoking:zPerspective:commands:error:));
+        @selector(encodeNativeRasterSlice:primitive:config:smooth:
+                  firstProvoking:zPerspective:commands:error:));
     Method transform = class_getInstanceMethod(
         NV2AMetalEpochExecutor.class,
-        @selector(
-            encodeRasterState:attributeBuffer:first:count:commands:error:));
+        @selector(encodeRasterState:attributeBuffer:first:count:attributeFetch:
+                  commands:error:));
     Method execute = class_getInstanceMethod(
         NV2AMetalEpochExecutor.class,
         @selector(executeRasterState:attributeBuffer:first:count:error:));
     Method serial = class_getInstanceMethod(
         NV2AMetalEpochExecutor.class,
         @selector(encodeSerialRasterState:attributeBuffer:first:count:previous:
-                  commands:error:));
+                  attributeFetch:commands:error:));
     assert(native && geometryMethod && transform && execute && serial);
     transport_original_serial =
         (void *)method_setImplementation(serial, (IMP)transport_serial);
@@ -510,6 +511,7 @@ static void draw_transport_tests(void)
                                 pg->inline_array_length = 48;
                             transport_reference = reference == 0;
                             transport_encoders = transport_copies = 0;
+                            transport_geometry_calls = 0;
                             transport_bytes = 0;
                             transport_views = nil;
                             transport_original_native =
@@ -528,7 +530,8 @@ static void draw_transport_tests(void)
                             assert(transport_transforms ==
                                    completedTransforms +
                                        (layout == 6 ? 1u : 0u));
-                            assert(transport_views.count == 1 &&
+                            assert(transport_geometry_calls == 1 &&
+                                   transport_views.count == 1 &&
                                    transport_views[0].vertexCount == 6);
                             BOOL borrowed = reference && layout <= 2;
                             BOOL joined = !borrowed && layout != 0;

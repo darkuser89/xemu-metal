@@ -129,9 +129,7 @@ static void packed_current_tests(void)
                         family, i);
                 abort();
             }
-            const uint32_t *faults = result.faults.contents;
-            for (unsigned v = 0; v <= result.vertexCount; v++)
-                assert(!faults[v]);
+            assert(!*(const uint32_t *)result.faults.contents);
         }
     }
     for (unsigned invalid = 0; invalid < 9; invalid++) {

@@ -23,6 +23,17 @@ enum NV2AMetalSurfaceStorage {
     NV2AMetalSurfaceStorageO7,
 };
 
+/* X1/X8 expose opaque DstAlpha to these factors; A7 remains variable.
+ * Shared by blend evaluation and the encoder's destination-read proof. */
+static inline unsigned int nv2a_metal_surface_blend_factor(
+    unsigned int factor, unsigned int surface_channels)
+{
+    if (surface_channels >= NV2AMetalSurfaceStorageZ1 &&
+        surface_channels <= NV2AMetalSurfaceStorageO8)
+        return factor == 6 ? 1 : factor == 7 ? 0 : factor;
+    return factor;
+}
+
 enum NV2AMetalPixelDepthFormat {
     NV2AMetalPixelDepthD24,
     NV2AMetalPixelDepthD16,
@@ -33,6 +44,7 @@ enum NV2AMetalPixelDepthFormat {
 /* Encoder-owned GPU arguments, outside portable pixel captures. */
 typedef struct NV2AMetalPixelStorageInfo {
     unsigned int surface_channels, polygon_projection_count;
+    unsigned int source_vertex_count;
 } NV2AMetalPixelStorageInfo;
 
 enum NV2AMetalTextureNormalization {

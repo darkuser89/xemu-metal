@@ -19,6 +19,17 @@ enum {
     NV2AMetalTextureStoragePackedX1555 = 11,
     NV2AMetalTextureStoragePackedA4444 = 12,
     NV2AMetalTextureStorageSnorm8 = 13,
+    NV2AMetalTextureStorageByteY8 = 14,
+    NV2AMetalTextureStorageByteAY8 = 15,
+    NV2AMetalTextureStorageByteA8 = 16,
+    NV2AMetalTextureStorageByteA8Y8 = 17,
+    NV2AMetalTextureStorageByteG8B8 = 18,
+    NV2AMetalTextureStorageByteR8B8 = 19,
+    /* Raw BGRA render-target bytes with their logical read swizzle. */
+    NV2AMetalTextureStorageBGRA8 = 20,
+    NV2AMetalTextureStorageBGRX8 = 21,
+    NV2AMetalTextureStorageBGRA8SwapRB = 22,
+    NV2AMetalTextureStorageBGRA8ARGB = 23,
     NV2AMetalTextureStorageCount,
 };
 

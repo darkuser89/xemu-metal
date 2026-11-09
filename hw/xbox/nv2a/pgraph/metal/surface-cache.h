@@ -34,6 +34,14 @@ API_AVAILABLE(macos(26.0))
 API_AVAILABLE(macos(26.0))
 @interface NV2AMetalSurfaceRecording : NSObject
 @property(nonatomic, readonly) BOOL submitted, completed, cancelled;
+/* Published by the PGRAPH owner after producer feedback, source dependencies
+ * and execution witnesses have passed. Does not retire raster ownership. */
+@property(nonatomic, readonly) BOOL producersCompleted;
+/* All CPU VRAM read/write guards of this entirely producer-only recording
+ * have retired after ordered feedback. Does not complete raster ownership. */
+@property(nonatomic, readonly) BOOL cpuHazardsRetired;
+/* Monotonic within the owning surface cache. */
+@property(nonatomic, readonly) uint64_t serial;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
@@ -70,20 +78,22 @@ API_AVAILABLE(macos(26.0))
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
-/* Conservative, lock-free check for RAM with no GPU ownership. Reads must
- * avoid all prior GPU write destinations. Writes must also avoid all prior
- * GPU sources/cache keys. Before first GPU use there is no cached content to
- * invalidate; the normal dirty-page journal still records the RAM write.
- * A false result requires the synchronized access path. */
+/* Conservative, lock-free check for RAM with no relevant GPU ownership.
+ * Reads avoid active destination leases and valid surface bindings. Writes
+ * also avoid all historically watched GPU sources/cache keys. Those source
+ * watches persist after target retirement; deferred dirty tracking below
+ * still records their CPU writes. Before first GPU use the normal dirty-page
+ * journal records RAM writes. A false result requires synchronized access. */
 BOOL nv2a_metal_untracked_cpu_access(const NV2AMetalCPUAccessGuard *guard,
                                      NSUInteger address, NSUInteger length,
                                      BOOL write);
 
 /* CPU-hook fast path. Pure source/key pages with no active GPU reader record
  * deferred dirty bits instead of entering cache metadata. The next source-key
- * query publishes a fresh version. GPU destinations and active readers still
- * require the synchronized path. A false result may conservatively invalidate
- * a source key but never permits the CPU access. */
+ * query publishes a fresh version. Active GPU destinations, valid surface
+ * bindings and active readers still require the synchronized path. A false
+ * result may conservatively invalidate a source key but never permits the CPU
+ * access. */
 BOOL nv2a_metal_try_cpu_access(NV2AMetalCPUAccessGuard *_Nullable guard,
                                NSUInteger address, NSUInteger length,
                                BOOL write);
@@ -93,15 +103,27 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) NV2AMetalCommands *commands;
 @property(nonatomic, readonly) id<MTLBuffer> vram;
 @property(nonatomic, readonly) NSUInteger count;
+/* Raw GPU-write registrations invalidate retained CPU source evidence even
+ * after their hazards retire. UINT64_MAX permanently disables such reuse. */
+@property(nonatomic, readonly) uint64_t gpuWriteEpoch;
 @property(nonatomic, readonly) NV2AMetalCPUAccessGuard *cpuAccessGuard;
 /* PGRAPH thread only; called before first GPU ownership of each RAM page.
- * Install the frontend's CPU hook here. Do not reenter the cache. */
+ * Install the frontend's CPU hook here. While set, surface retirement may
+ * submit writebacks without waiting. The hook must guard CPU access to every
+ * registered page until its GPU work completes. Do not reenter the cache. */
 @property(nonatomic, copy, nullable) NV2AMetalVRAMWriteHandler willWatchVRAM;
 @property(nonatomic, readonly, nullable) NV2AMetalSurfaceRecording *recording;
+/* Acquire a cache-owned recording before borrowing GPU resources. Existing
+ * raster-scope and pending-chain ordering remain in force. */
+- (BOOL)beginRecordingWithError:(NSError *_Nullable *_Nullable)error;
 /* PGRAPH draw owner only. Producer work inside this scope may precede earlier
  * compatible raster sections. Texture/VRAM dependencies and external work
  * still close that chain before consuming its targets. No encoder is opened. */
 - (BOOL)beginRasterProducersWithError:(NSError *_Nullable *_Nullable)error;
+/* Nonwaiting validation of the open raster batch's actual dependencies.
+ * Preserves their error priority/sticky state without submitting the batch. */
+- (BOOL)validateRasterContinuationWithError:
+    (NSError *_Nullable *_Nullable)error;
 - (void)endRasterProducers;
 /* Call after all geometry producers and before preparing pixel packets.
  * A changed descriptor submits the old chain, then reacquires attachments in
@@ -113,6 +135,18 @@ API_AVAILABLE(macos(26.0))
  * read-only attachments in a pending raster chain. */
 - (BOOL)prepareTextureRead:(NV2AMetalCachedSurface *)surface
                      error:(NSError *_Nullable *_Nullable)error;
+/* Prepare only an immutable private RTT snapshot. Earlier raster use is
+ * submitted before the binding is revalidated and any upload is encoded.
+ * Encode the copy from the returned surface in this recording, then call
+ * markRTTSnapshotCaptured:error:. Rendering retains its own capture intent. */
+- (nullable NV2AMetalCachedSurface *)
+    prepareSurfaceForRTTSnapshot:(NV2AMetalCachedSurface *)surface
+                           frame:(uint64_t)frame
+                           error:(NSError *_Nullable *_Nullable)error;
+/* Call only after the private snapshot copy has been encoded successfully.
+ * Cancel the section on errors; this never authorizes attachment writes. */
+- (BOOL)markRTTSnapshotCaptured:(NV2AMetalCachedSurface *)surface
+                          error:(NSError *_Nullable *_Nullable)error;
 - (nullable instancetype)initWithCommands:(NV2AMetalCommands *)commands
                                      vram:(id<MTLBuffer>)vram
                              didWriteVRAM:
@@ -123,7 +157,8 @@ API_AVAILABLE(macos(26.0))
 
 /* Reuses compatible larger bindings as GL does; use the returned transfer's
  * dimensions for viewport/uniform capture. Overlaps/incompatible bindings are
- * written back before replacement. A new recording/upload starts if needed. */
+ * written back in queue order before a replacement upload. A new recording
+ * starts if needed. */
 - (nullable NV2AMetalCachedSurface *)
     prepareSurfaceAtAddress:(NSUInteger)address
                      config:(const NV2AMetalSurfaceConfig *_Nullable)config
@@ -140,6 +175,18 @@ API_AVAILABLE(macos(26.0))
                       error:(NSError *_Nullable *_Nullable)error;
 - (nullable NV2AMetalCachedSurface *)surfaceContainingAddress:
     (NSUInteger)address;
+/* Select and validate a binding before deciding whether its entire texture
+ * will be overwritten. Selection may retire conflicting older bindings. */
+- (nullable NV2AMetalCachedSurface *)
+    selectSurfaceAtAddress:(NSUInteger)address
+                    config:(const NV2AMetalSurfaceConfig *)config
+                     frame:(uint64_t)frame
+                     error:(NSError *_Nullable *_Nullable)error;
+/* Keep a deferred upload pending until the complete overwrite is encoded
+ * and marked written. Cancel or an intervening submit cannot publish it. */
+- (BOOL)prepareSelectedSurface:(NV2AMetalCachedSurface *)surface
+            discardingContents:(BOOL)discard
+                         error:(NSError *_Nullable *_Nullable)error;
 
 /* Call only after successfully encoding a draw/clear that can write this
  * attachment, prepared in this recording. Cancel the section on encoding
@@ -147,24 +194,46 @@ API_AVAILABLE(macos(26.0))
  * suffix. GPU ownership remains protected until submission completion. */
 - (BOOL)markWritten:(NV2AMetalCachedSurface *)surface
               error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)markWritten:(NV2AMetalCachedSurface *)surface
+    replacingContents:(BOOL)replaced
+                error:(NSError *_Nullable *_Nullable)error;
 /* Mirror GL's persistent RTT sampler change in the same host transaction. */
 - (BOOL)markRTTSampling:(NV2AMetalCachedSurface *)surface
                   error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)submitWithError:(NSError *_Nullable *_Nullable)error;
+/* Finish this render queue and its dependencies for FLIP_STALL. Independent
+ * readers without render-queue dependencies retain their own completion. */
+- (BOOL)finishSurfaceQueueWithError:(NSError *_Nullable *_Nullable)error;
 /* Accept successful work without submitting it. Later cancel drops only its
  * unaccepted suffix; accepted sections remain ordered and protected. The
  * bounded command batch submits automatically when full or under resource
  * pressure. This is a host transaction boundary, not GPU completion. */
 - (BOOL)checkpointWithError:(NSError *_Nullable *_Nullable)error;
 /* Wait for a submission and its earlier feedback prefix on this cache's
- * queue, then retire completed ownership on the PGRAPH thread. A later
- * recording stays open and protected; later submissions need not finish.
+ * queue, then retire that prefix on the PGRAPH thread. Later recordings
+ * and submissions keep their ownership until a subsequent collection.
  * Validate the required source queues' feedback prefixes before publishing
  * dependent RAM writes, even if this queue's GPU work is already complete.
  * Pending readers also supply GPU-written completion witnesses; an event
  * timeout or an unsatisfied dependency keeps CPU ownership closed. */
 - (BOOL)waitForSubmission:(NV2AMetalSubmission *)submission
                     error:(NSError *_Nullable *_Nullable)error;
+/* Submit pending work if it contains this recording, then wait for its
+ * submission prefix. The caller owns the recording on this cache. */
+- (BOOL)waitForRecording:(NV2AMetalSurfaceRecording *)recording
+                  error:(NSError *_Nullable *_Nullable)error;
+/* Compute-only consumers may wait for the recording's producer commit.
+ * Earlier submissions and source dependencies still require full feedback;
+ * execution witnesses are checked before publishing the produced data.
+ * Raster tokens, downloads and resources retain their full lifetime. A sealed
+ * unsubmitted recording commits only its required producer prefix; later
+ * producer sections and the complete raster chain remain pending. */
+- (BOOL)waitForProducersOfRecording:(NV2AMetalSurfaceRecording *)recording
+                             error:(NSError *_Nullable *_Nullable)error;
+/* Poll through this submitted recording without waiting or touching later
+ * feedback. Its completed property becomes true when the prefix retires. */
+- (BOOL)collectCompletedThroughRecording:(NV2AMetalSurfaceRecording *)recording
+                                   error:(NSError *_Nullable *_Nullable)error;
 /* Cancel only the current unaccepted section, preserving earlier checkpoints.
  * discardForRestore also discards those accepted, unsubmitted sections. */
 - (void)cancel;
@@ -177,6 +246,10 @@ API_AVAILABLE(macos(26.0))
  * its guard. Only the PGRAPH owner may call this method or change submissions.
  */
 - (BOOL)waitUntilIdleWithError:(NSError *_Nullable *_Nullable)error;
+/* Write selected live attachments back to VRAM without retiring them. Wait
+ * for their download receipt, leaving unrelated submitted work alone. */
+- (BOOL)downloadSurfacesForCPU:(NSArray<NV2AMetalCachedSurface *> *)surfaces
+                         error:(NSError *_Nullable *_Nullable)error;
 
 /* Preserve overlapping GPU pixels into shared VRAM in this recording, then
  * allow a native decoder to consume those bytes with queue barriers. Ordered
@@ -192,6 +265,18 @@ API_AVAILABLE(macos(26.0))
                           error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)prepareGPUReadPattern:(NV2AMetalVRAMReadPattern)pattern
                         error:(NSError *_Nullable *_Nullable)error;
+/* Register disjoint patterns as one GPU read transaction. Count zero still
+ * opens a recording for work that does not read VRAM. */
+- (BOOL)prepareGPUReadPatterns:(const NV2AMetalVRAMReadPattern *_Nullable)patterns
+                         count:(NSUInteger)count
+                         error:(NSError *_Nullable *_Nullable)error;
+/* Only for uploads into a fresh private texture. Proven independent RAM
+ * reads may precede an accepted raster chain; every other case keeps the
+ * ordinary GPU-read path. Does not seal or accept the current section. */
+- (BOOL)prepareTextureUploadReadPatterns:
+            (const NV2AMetalVRAMReadPattern *_Nullable)patterns
+                                  count:(NSUInteger)count
+                                  error:(NSError *_Nullable *_Nullable)error;
 /* Begin a producer only when every span is independent of dirty surfaces,
  * pending/submitted downloads and GPU writes. Clean surface aliases may share
  * readonly VRAM. YES with nil reads requests the original queue
@@ -215,12 +300,20 @@ API_AVAILABLE(macos(26.0))
                                   reads:(NV2AMetalIndependentReads *_Nullable
                                              *_Nonnull)reads
                                   error:(NSError *_Nullable *_Nullable)error;
+/* Prefer the independent queue. On a write conflict, prepare the same reads
+ * on this cache's queue before returning YES with nil reads. */
+- (BOOL)prepareGPUReadPatterns:(const NV2AMetalVRAMReadPattern *_Nullable)patterns
+                         count:(NSUInteger)count
+           independentCommands:(NV2AMetalCommands *)commands
+                         reads:(NV2AMetalIndependentReads *_Nullable *_Nonnull)reads
+                         error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)submitIndependentReads:(NV2AMetalIndependentReads *)reads
                          error:(NSError *_Nullable *_Nullable)error;
 /* Wait through this producer's feedback prefix, including older submitted
  * cancellations, and submitted writer prefixes that retain its GPU read
- * witnesses. Other producers' feedback and later unrelated surface work need
- * not finish; open recordings stay intact. Failure is sticky and keeps CPU
+ * witnesses, then retire the selected reader prefix. Other producers'
+ * feedback and later unrelated surface work are left for collection;
+ * open recordings stay intact. Failure is sticky and keeps CPU
  * access and dependent Fetch/Current publication closed. */
 - (BOOL)completeIndependentReads:(NV2AMetalIndependentReads *)reads
                            error:(NSError *_Nullable *_Nullable)error;
@@ -232,15 +325,47 @@ API_AVAILABLE(macos(26.0))
 - (BOOL)prepareGPUWriteAtAddress:(NSUInteger)address
                           length:(NSUInteger)length
                            error:(NSError *_Nullable *_Nullable)error;
+/* Register both VRAM ranges for a blit and preserve its dirty aliases in the
+ * same recording. The caller proves which targets are fully replaced. Encode
+ * the write before submitting. Cancelled work leaves the surfaces intact.
+ */
+- (BOOL)prepareGPUBlitFrom:(NSRange)source
+                        to:(NSRange)destination
+          replacingSurface:
+              (NS_NOESCAPE BOOL (^)(NV2AMetalCachedSurface *))replaces
+                     error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)sourceVersionAtAddress:(NSUInteger)address
                         length:(NSUInteger)length
                        version:(uint64_t *_Nullable)version
                          error:(NSError *_Nullable *_Nullable)error;
+/* Return the greatest source version across the requested spans without
+ * watching or querying VRAM between them. An empty batch has version zero. */
+- (BOOL)sourceVersionForReadSpans:(const NV2AMetalVRAMReadSpan *_Nullable)spans
+                            count:(NSUInteger)count
+                          version:(uint64_t *_Nullable)version
+                            error:(NSError *_Nullable *_Nullable)error;
+/* Return one version per span in order under the same cache lock. If span
+ * zero is nonempty, firstSurface can receive the surface containing its
+ * start. Callers supply count version slots and use results on success. */
+- (BOOL)sourceVersionsForReadSpans:(const NV2AMetalVRAMReadSpan *)spans
+                             count:(NSUInteger)count
+                          versions:(uint64_t *)versions
+                      firstSurface:
+                          (NV2AMetalCachedSurface *_Nullable *_Nullable)firstSurface
+                             error:(NSError *_Nullable *_Nullable)error;
 
-/* Drains prior uploads/draws/downloads before CPU access. Partial CPU writes
- * first preserve all dirty GPU pixels, then make overlapping bindings require
- * reupload. Zero length is a no-op. Range checks never wrap address+length. */
+/* Commits open sections before CPU access. If work is already submitted,
+ * wait through the last submission that owns the requested bytes. Partial
+ * CPU writes preserve dirty GPU pixels before marking bindings for reupload,
+ * and wait for independent readers of those bytes. Zero length is a no-op. */
 - (BOOL)prepareCPUAccessAtAddress:(NSUInteger)address
+                           length:(NSUInteger)length
+                            write:(BOOL)write
+                            error:(NSError *_Nullable *_Nullable)error;
+/* Service a CPU request on the PGRAPH thread. Disjoint open GPU sections
+ * remain cancellable while a previously submitted conflict completes.
+ * A CPU read only checks feedback through the last writer of its bytes. */
+- (BOOL)resolveCPUAccessAtAddress:(NSUInteger)address
                            length:(NSUInteger)length
                             write:(BOOL)write
                             error:(NSError *_Nullable *_Nullable)error;
@@ -256,6 +381,24 @@ API_AVAILABLE(macos(26.0))
                             write:(BOOL)write
                         completed:(BOOL *)completed
                             error:(NSError *_Nullable *_Nullable)error;
+/* Check a group of CPU reads together. No VRAM or recording state changes. */
+- (BOOL)tryIdleCPUReadSpans:(const NV2AMetalVRAMReadSpan *)spans
+                     count:(NSUInteger)count
+                 completed:(BOOL *)completed
+                     error:(NSError *_Nullable *_Nullable)error;
+/* Check the bytes actually read by GPU patterns without collecting feedback,
+ * changing recordings or registering new readers. */
+- (BOOL)tryIdleGPUReadPatterns:(const NV2AMetalVRAMReadPattern *_Nullable)patterns
+                         count:(NSUInteger)count
+                     completed:(BOOL *)completed
+                         error:(NSError *_Nullable *_Nullable)error;
+/* Optionally collect available feedback when a submitted writer blocks a
+ * read. Open recordings and dirty surfaces cannot be resolved by collection. */
+- (BOOL)tryIdleCPUReadSpans:(const NV2AMetalVRAMReadSpan *)spans
+                     count:(NSUInteger)count
+          collectCompleted:(BOOL)collect
+                 completed:(BOOL *)completed
+                     error:(NSError *_Nullable *_Nullable)error;
 /* Dirty-page fallback is after an unhooked CPU write. GPU-owned overlapping
  * pixels cannot safely be preserved at that point; reject a coherence conflict.
  * Frontends without TCG hooks must drain GPU writes before allowing CPU access.

@@ -18,8 +18,36 @@ static id<MTLLibrary> bs_library(id<MTL4Compiler> compiler, BOOL reference)
 {
     NSError *error = nil;
     NSString *source = @(bs_source);
-    if (reference)
+    if (reference) {
         source = sampling_force_gradients(source);
+        NSRange start =
+            [source rangeOfString:@"    bool interpolate = s.mip_filter == 2;"];
+        assert(start.location != NSNotFound);
+        NSRange end = [source rangeOfString:@"\n}"
+                                    options:0
+                                      range:NSMakeRange(
+                                          NSMaxRange(start),
+                                          source.length - NSMaxRange(start))];
+        assert(end.location != NSNotFound);
+        /* The reference performs both interpolated reads, even if the
+         * hardware mip range clamps both to the same level. */
+        NSString *mips =
+            @"    if (s.mip_filter != 2) {\n"
+             "        uint level = uint(max(0.0f, ceil(lod + .5f) - 1));\n"
+             "        return sample_level(t, c, level, face, linear, volume, s,\n"
+             "                            unsigned_half_mask);\n"
+             "    }\n"
+             "    uint a = uint(floor(lod));\n"
+             "    uint b = min(a + 1, t.get_num_mip_levels() - 1);\n"
+             "    return mix(\n"
+             "        sample_level(t, c, a, face, linear, volume, s, unsigned_half_mask),\n"
+             "        sample_level(t, c, b, face, linear, volume, s, unsigned_half_mask),\n"
+             "        lod - floor(lod));";
+        source = [source
+            stringByReplacingCharactersInRange:NSMakeRange(
+                start.location, end.location - start.location)
+                                    withString:mips];
+    }
     source = [source
         stringByAppendingString:
             @"\nstruct BSPacket{NV2AMetalSamplingUniforms sampling;uint "
@@ -268,7 +296,7 @@ static void sampler_base_only_tests(NV2AMetalCommands *commands)
     assert(sampler);
     id<MTLTexture> target =
         attachment(commands.device, MTLPixelFormatRGBA32Float, 1);
-    unsigned cases = 0;
+    unsigned cases = 0, mipCases = 0;
     for (unsigned type = 0; type < 3; type++) {
         id<MTLTexture> textures[2] = { bs_texture(commands.device, type, NO),
                                        bs_texture(commands.device, type, YES) };
@@ -336,12 +364,33 @@ static void sampler_base_only_tests(NV2AMetalCommands *commands)
                                     textures[0], sampler, target, p, type,
                                     pattern, cases++);
                         }
+        for (unsigned linear = 0; linear < 2; linear++)
+            for (unsigned bias = 0; bias < 3; bias++)
+                for (unsigned special = 0; special < 2; special++)
+                    for (unsigned pattern = 0; pattern < 2; pattern++)
+                        @autoreleasepool {
+                            BSPacket p = { .sampling = {
+                                               .enabled = 1,
+                                               .address = { 3, 3, 3 },
+                                               .min_linear = linear,
+                                               .mag_linear = linear,
+                                               .mip_filter = 2,
+                                               .anisotropy = 1,
+                                               .lod_bias =
+                                                   (float[]){ -16, .625f,
+                                                              4095.f / 256 }[bias] } };
+                            bs_pair(commands, arguments, pipelines[type],
+                                    textures[special], sampler, target, p, type,
+                                    pattern, 2064 + mipCases++);
+                        }
     }
-    assert(cases == 2064);
+    assert(cases == 2064 && mipCases == 72);
     printf("Base-only sampling:2064 exact optimized/original Float4 image "
            "pairs/132096 pixels;2D/3D/cube,nearest/linear,all5 addresses,bias "
            "limits,half masks,signed "
            "zero/NaN/Inf/subnormals,overflow,seams/physical borders;144 "
            "mip/AF/min-mag/native controls PASS\n");
+    puts("Mip endpoint reuse:72 exact two-read reference pairs; 2D/3D/cube, "
+         "interpolated and clamped LOD, nearest/linear and nonfinite texels PASS");
 }
 #endif

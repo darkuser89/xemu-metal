@@ -212,7 +212,7 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
     MTLColorWriteMask _writeMask;
     unsigned int _sourceFactor, _destinationFactor, _equation;
     MTLCullMode _cullMode;
-    BOOL _blendEnabled, _cullBoth;
+    BOOL _blendEnabled;
     MTLWinding _frontFace;
 }
 
@@ -284,9 +284,8 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
             effective |= _sourceFactor << 4 | _destinationFactor << 8;
         }
     }
-    _pipelineKey = effective | (NSUInteger)_writeMask << 17 |
-                   (NSUInteger)_logicEnabled << 21 |
-                   (NSUInteger)_ditherEnabled << 22;
+    _pipelineKey =
+        effective | (NSUInteger)_writeMask << NV2AMetalDrawPipelineWriteMaskShift;
     _requiresDepth = !!(control0 & NV_PGRAPH_CONTROL_0_ZENABLE);
     _requiresStencil = !!(control1 & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE);
     /* Validation precedes every lookup, including warm hits. Disabling depth
@@ -309,7 +308,8 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
             draw_error(error, @"Invalid NV2A cull mode");
             return nil;
         }
-        _cullBoth = face == NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK;
+        _cullsBothFaces =
+            face == NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK;
         _cullMode = face == NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT ?
                         MTLCullModeFront :
                         MTLCullModeBack;
@@ -350,10 +350,12 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
                primitive:(MTLPrimitiveType)primitive
     ignorePolygonCulling:(BOOL)ignore
 {
-    if (_config.viewport_width) {
-        [encoder setViewport:(MTLViewport){ 0, 0, _config.viewport_width,
-                                            _config.viewport_height, 0, 1 }];
-    }
+    NSUInteger viewportWidth = _config.viewport_width ?
+                                   _config.viewport_width : width;
+    NSUInteger viewportHeight = _config.viewport_width ?
+                                    _config.viewport_height : height;
+    [encoder setViewport:(MTLViewport){ 0, 0, viewportWidth, viewportHeight,
+                                        0, 1 }];
     [encoder setDepthStencilState:_depthStencil];
     [encoder setStencilReferenceValue:(_config.control[1] &
                                        NV_PGRAPH_CONTROL_1_STENCIL_REF) >>
@@ -365,7 +367,7 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
                         green:((argb >> 8) & 255) / 255.0f
                          blue:(argb & 255) / 255.0f
                         alpha:(argb >> 24) / 255.0f];
-    if (!ignore && _cullBoth && primitive >= MTLPrimitiveTypeTriangle) {
+    if (!ignore && _cullsBothFaces && primitive >= MTLPrimitiveTypeTriangle) {
         return NO;
     }
     MTLScissorRect rect = { 0, 0, width, height };

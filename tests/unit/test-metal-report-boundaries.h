@@ -8,9 +8,8 @@ static void rb_fixture(void)
 {
     fixture();
     [draw.reports discard];
-    memset(report_seen, 0, sizeof(report_seen));
-    memset(report_values, 0xa5, sizeof(report_values));
     state->pgraph.dma_report = 64;
+    memset(report_bytes(0), 0xa5, 64 * 16);
     const float positions[6][4] = {
         { 0, 0, 32768, 1 }, { 8, 0, 32768, 1 }, { 0, 8, 32768, 1 },
         { 4, 4, 32768, 1 }, { 8, 4, 32768, 1 }, { 4, 8, 32768, 1 },
@@ -37,9 +36,10 @@ static void rb_process(void)
 }
 static void rb_expect(unsigned slot, uint32_t value)
 {
-    if (!report_seen[slot] || report_values[slot] != value) {
+    if (!report_was_written(slot) || report_value(slot) != value) {
         fprintf(stderr, "Report boundary slot%u:seen%u got%u expected%u\n",
-                slot, report_seen[slot], report_values[slot], value);
+                slot, report_was_written(slot), ldl_le_p(report_bytes(slot) + 8),
+                value);
         abort();
     }
 }
@@ -375,6 +375,36 @@ static void rb_legacy_active_tests(void)
         }
 }
 
+static void rb_dma_remap_test(void)
+{
+    rb_fixture();
+    qemu_mutex_lock(&state->pgraph.lock);
+    uint8_t *destination = report_bytes(63);
+    const hwaddr remappedBase = 45056;
+    uint8_t *remapped = state->vram_ptr + remappedBase + 63 * 16;
+    uint8_t sentinel[16];
+    memset(sentinel, 0xa5, sizeof(sentinel));
+    memcpy(remapped, sentinel, sizeof(sentinel));
+    NV2AMetalPGRAPHQuery *query = [draw.reports beginQuery];
+    rb_counter(query, 17);
+    [draw.reports endQuery:query];
+    rb_get(63);
+    unsigned beforeLoads = report_dma_loads, beforeNotices = notifications;
+    report_remap_after_load = remappedBase;
+    rb_process();
+    assert(report_dma_loads == beforeLoads + 1 && !report_remap_after_load &&
+           report_bytes(63) == remapped &&
+           !memcmp(remapped, sentinel, sizeof(sentinel)) &&
+           ldq_le_p(destination) == UINT64_C(0x0011223344556677) &&
+           ldl_le_p(destination + 8) == 17 && !ldl_le_p(destination + 12) &&
+           notifications == beforeNotices + 1 && texture_dirty[8] &&
+           !texture_dirty[11]);
+    qemu_mutex_unlock(&state->pgraph.lock);
+    puts("Metal report DMA: one mapping, exact final 16 bytes, remapped "
+         "destination untouched and dirty notice at the validated address PASS");
+    rb_cases++;
+}
+
 static void report_boundary_tests(void)
 {
     rb_fixture();
@@ -406,6 +436,7 @@ static void report_boundary_tests(void)
     rb_snapshot_tests();
     rb_wire_tests();
     rb_legacy_active_tests();
+    rb_dma_remap_test();
     [draw.reports discard];
     printf("Metal report boundaries:%u cases/%u rejects;immutable live-Begin "
            "prefixes,FIFO/Clear,late "

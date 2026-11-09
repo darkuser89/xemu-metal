@@ -19,11 +19,22 @@ API_AVAILABLE(macos(26.0))
 NSData *_Nullable nv2a_metal_texture_snapshot(
     id<MTLTexture> texture, NV2AMetalCommands *commands,
     NSError *_Nullable *_Nullable error);
+/* Capture up to four images in order. The byte limit includes image headers.
+ * Staging is bounded per submission, with large images captured separately. */
+API_AVAILABLE(macos(26.0))
+NSArray<NSData *> *_Nullable nv2a_metal_texture_snapshot_images(
+    NSArray<id<MTLTexture>> *textures, NSUInteger byteLimit,
+    NV2AMetalCommands *commands, NSError *_Nullable *_Nullable error);
 BOOL nv2a_metal_texture_snapshot_validate(NSData *data,
                                           NSError *_Nullable *_Nullable error);
 API_AVAILABLE(macos(26.0))
 id<MTLTexture> _Nullable nv2a_metal_texture_restore(
     NSData *data, NV2AMetalCommands *commands,
+    NSError *_Nullable *_Nullable error);
+/* Complete private uploads in bounded batches and return textures in order. */
+API_AVAILABLE(macos(26.0))
+NSArray<id<MTLTexture>> *_Nullable nv2a_metal_texture_restore_images(
+    NSArray<NSData *> *images, NV2AMetalCommands *commands,
     NSError *_Nullable *_Nullable error);
 NS_ASSUME_NONNULL_END
 #endif

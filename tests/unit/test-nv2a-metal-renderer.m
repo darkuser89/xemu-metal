@@ -26,6 +26,7 @@
 #include "qapi/error.h"
 #include "hw/xbox/nv2a/pgraph/metal/pixel-shader-types.h"
 #include "hw/xbox/nv2a/pgraph/metal/texture-upload-types.h"
+#include "hw/xbox/nv2a/pgraph/metal/vga-types.h"
 #include "qemu/module.h"
 #include "test-metal-legacy-cube.h"
 
@@ -37,7 +38,9 @@ static NV2AMetalPGRAPHDraw *draw;
 static MemAccessCallback *hook;
 static CPUState cpu;
 static DMAObject dma[5];
-static bool texture_dirty[16];
+enum { TEST_VRAM_CAPACITY = 512 * 1024 };
+static size_t test_vram_length = 65536;
+static bool texture_dirty[TEST_VRAM_CAPACITY / 4096];
 static unsigned groups, methods, notifications;
 static QemuEvent worker_kick;
 static QemuThread worker;
@@ -51,7 +54,7 @@ bool tcg_allowed = true;
 uint64_t memory_region_size(MemoryRegion *mr)
 {
     assert(mr == state->vram);
-    return 65536;
+    return test_vram_length;
 }
 void *memory_region_get_ram_ptr(MemoryRegion *mr)
 {
@@ -66,7 +69,7 @@ DMAObject nv_dma_load(NV2AState *d, hwaddr object)
 static hwaddr tile_clipped_length = UINT64_MAX;
 hwaddr nv_clip_gpu_tile_blit(NV2AState *d, hwaddr address, hwaddr length)
 {
-    assert(d == state && address < 65536);
+    assert(d == state && address < test_vram_length);
     return MIN(length,
                tile_clipped_length); // Simulated original tile-helper result.
 }
@@ -80,8 +83,8 @@ void *nv_dma_map(NV2AState *d, hwaddr object, hwaddr *length)
 bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr address,
                                         hwaddr length, unsigned client)
 {
-    assert(mr == state->vram && length && address < 65536 &&
-           length <= 65536 - address);
+    assert(mr == state->vram && length && address < test_vram_length &&
+           length <= test_vram_length - address);
     assert(client == DIRTY_MEMORY_NV2A || client == DIRTY_MEMORY_NV2A_TEX);
     if (client == DIRTY_MEMORY_NV2A)
         return false;
@@ -95,8 +98,8 @@ bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr address,
 void memory_region_set_client_dirty(MemoryRegion *mr, hwaddr address,
                                     hwaddr length, unsigned client)
 {
-    assert(mr == state->vram && length && address < 65536 &&
-           length <= 65536 - address);
+    assert(mr == state->vram && length && address < test_vram_length &&
+           length <= test_vram_length - address);
     if (client == DIRTY_MEMORY_VGA) {
         notifications++;
         return;
@@ -118,8 +121,8 @@ MemAccessCallback *mem_access_callback_insert(CPUState *c, MemoryRegion *mr,
                                               MemAccessCallbackFunc func,
                                               void *opaque)
 {
-    assert(c == &cpu && mr == state->vram && length && address < 65536 &&
-           length <= 65536 - address);
+    assert(c == &cpu && mr == state->vram && length &&
+           address < test_vram_length && length <= test_vram_length - address);
     if (!registered_hooks)
         registered_hooks = g_ptr_array_new();
     MemAccessCallback *entry = g_new0(MemAccessCallback, 1);
@@ -1176,6 +1179,19 @@ static void report_queue(void)
     send_method(NV097_SET_CONTEXT_DMA_REPORT, 64);
     assert(state->pgraph.dma_report == 64);
     send_method(NV097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    const unsigned incomplete[] = { PRIM_TYPE_TRIANGLES, PRIM_TYPE_TRIANGLE_STRIP };
+    for (unsigned i = 0; i < G_N_ELEMENTS(incomplete); i++) {
+        begin(incomplete[i]);
+        arrays(0, 2);
+        end();
+        assert(!draw.reports.visibilityBuffer &&
+               !surfaces.cache.commands.hasPendingRasterPass);
+    }
+    get_report(80);
+    process_reports();
+    assert(report_result(80) == 0 && !draw.reports.visibilityBuffer);
+    puts("Visibility without raster work: incomplete direct triangles and "
+         "strips report zero without a counter buffer or pass PASS");
     query_triangle(0);
     get_report(0);
     query_triangle(3);
@@ -1199,6 +1215,100 @@ static void report_queue(void)
     get_report(64);
     process_reports();
     assert(report_result(64) == 0);
+    groups++;
+}
+static void report_submission_scope(void)
+{
+    fixture();
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NV2AMetalCommands *commands = cache.commands;
+    NV2AMetalCommands *producer =
+        [[NV2AMetalCommands alloc] initWithDevice:commands.device error:&error];
+    require(producer != nil, error);
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(producer, queueIvar);
+    id<MTLSharedEvent> laterGate = [commands.device newSharedEvent];
+    assert(queue && laterGate);
+    send_method(NV097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    query_triangle(0);
+    get_report(0);
+    require([cache submitWithError:&error], error);
+    NV2AMetalSubmission *query = commands.lastSubmitted;
+
+    [queue waitForEvent:laterGate value:1];
+    require([producer beginWithError:&error] != nil, error);
+    id<MTLBuffer> witness =
+        [producer.device newBufferWithLength:4
+                                     options:MTLResourceStorageModeShared];
+    require(witness && [producer addResource:witness error:&error], error);
+    id<MTL4ComputeCommandEncoder> fill =
+        [producer.commandBuffer computeCommandEncoder];
+    assert(fill);
+    [fill fillBuffer:witness range:NSMakeRange(0, 4) value:0x5a];
+    [fill endEncoding];
+    require([producer submitWithError:&error], error);
+    NV2AMetalSubmission *dependency = producer.lastSubmitted;
+    const NSUInteger address = 49152;
+    require([cache prepareGPUReadAtAddress:address length:4 error:&error],
+            error);
+    require([commands orderAfterSubmission:dependency
+                              fromCommands:producer
+                                      error:&error],
+            error);
+    id<MTLBuffer> output =
+        [commands.device newBufferWithLength:4
+                                     options:MTLResourceStorageModeShared];
+    require(output && [commands addResource:output error:&error], error);
+    id<MTL4ComputeCommandEncoder> encoder =
+        [commands.commandBuffer computeCommandEncoder];
+    assert(encoder);
+    [encoder barrierAfterQueueStages:MTLStageAll
+                        beforeStages:MTLStageBlit
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder copyFromBuffer:cache.vram
+               sourceOffset:address
+                   toBuffer:output
+          destinationOffset:0
+                       size:4];
+    [encoder barrierAfterStages:MTLStageBlit
+              beforeQueueStages:MTLStageAll
+              visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder endEncoding];
+    require([cache submitWithError:&error], error);
+    NV2AMetalSubmission *later = commands.lastSubmitted;
+    assert(query && later != query && dependency &&
+           ![later completedWithError:&error] && !error);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!laterGate.signaledValue)
+                         laterGate.signaledValue = 2;
+                   });
+    process_reports();
+    assert(report_result(0) == 28 &&
+           [query completedWithError:&error] && !error &&
+           !laterGate.signaledValue &&
+           ![later completedWithError:&error] && !error);
+
+    /* A second report has no new counter. Preserve disjoint pending work. */
+    require([cache prepareGPUReadAtAddress:address + 4 length:4 error:&error],
+            error);
+    NV2AMetalSurfaceRecording *pending = cache.recording;
+    get_report(16);
+    process_reports();
+    assert(report_result(16) == 28 && !laterGate.signaledValue &&
+           cache.recording == pending && !pending.submitted &&
+           commands.lastSubmitted == later);
+    [cache cancel];
+    laterGate.signaledValue = 1;
+    require([cache waitForSubmission:later error:&error], error);
+    require([producer waitForSubmission:dependency error:&error], error);
+    assert(*(const uint32_t *)witness.contents == 0x5a5a5a5a &&
+           !memcmp(output.contents, state->vram_ptr + address, 4));
+    puts("Report submission scope: waits for its query prefix; later "
+         "submitted and pending surface work stay independent PASS");
     groups++;
 }
 static void report_rejections(void)
@@ -3570,14 +3680,19 @@ static void blit_validation(void)
 }
 #include "test-metal-blit-submission.h"
 
-static NV2AMetalFramebuffer *copy_frame(void)
+static NV2AMetalFramebuffer *copy_frame_from(
+    void *(*copy)(NV2AState *))
 {
     qemu_mutex_lock(&state->pgraph.renderer_lock);
-    void *handle = pgraph_metal4_copy_framebuffer(state);
+    void *handle = copy(state);
     NV2AMetalFramebuffer *frame = (__bridge NV2AMetalFramebuffer *)handle;
     pgraph_metal4_release_framebuffer(handle);
     qemu_mutex_unlock(&state->pgraph.renderer_lock);
     return frame;
+}
+static NV2AMetalFramebuffer *copy_frame(void)
+{
+    return copy_frame_from(pgraph_metal4_capture_framebuffer);
 }
 static NSData *texture_pixels(id<MTLTexture> texture)
 {
@@ -3982,6 +4097,31 @@ static void explicit_attachment_masks(void)
     }
     groups++;
 }
+static void clear_inside_begin_upload(void)
+{
+    fixture();
+    PGRAPHState *pg = &state->pgraph;
+    begin(PRIM_TYPE_TRIANGLES);
+    NV2AMetalCachedSurface *target = surfaces.color;
+    assert(target && target.transfer.texture.width == 8 &&
+           target.transfer.texture.height == 8);
+    cpu_write(target.address, target.reservationLength);
+    memset(state->vram_ptr + target.address, 0x31, target.reservationLength);
+    NSData *reads = [surfaces.cache valueForKey:@"pendingReads"];
+    assert(target.needsUpload && !reads.length);
+    pg->regs_[NV_PGRAPH_COLORCLEARVALUE] = 0xffff0000;
+    pg->regs_[NV_PGRAPH_CLEARRECTX] = pg->regs_[NV_PGRAPH_CLEARRECTY] = 7 << 16;
+    send_method(NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+    assert(surfaces.color == target && target.dirty && !target.needsUpload &&
+           !reads.length);
+    arrays(0, 3);
+    end();
+    assert(color(1, 1) == 0xff00ff00 && color(7, 7) == 0xffff0000);
+    puts("Active Begin clear: stale captured binding needs no VRAM upload; "
+         "native clear and following draw match PASS");
+    groups++;
+}
+
 static void clear_inside_begin(void)
 {
     for (unsigned variant = 0; variant < 6; variant++) {
@@ -4133,7 +4273,9 @@ static void clear_inside_begin(void)
             uint32_t inside = variant == 1 ? 0xff00ff00 : 0xff0000ff;
             if (variant == 4) {
                 NSError *error = nil;
-                require([surfaces.cache waitUntilIdleWithError:&error], error);
+                require([surfaces.cache submitWithError:&error] &&
+                            [surfaces.cache waitUntilIdleWithError:&error],
+                        error);
                 assert(surfaces.color.address == 1536 &&
                        surfaces.color.transfer.texture.width == 16 &&
                        texture_pixel(surfaces.color.transfer.texture, 1, 1) ==
@@ -4178,7 +4320,9 @@ static void clear_inside_begin(void)
             end();
             if (variant == 4) {
                 NSError *error = nil;
-                require([surfaces.cache waitUntilIdleWithError:&error], error);
+                require([surfaces.cache submitWithError:&error] &&
+                            [surfaces.cache waitUntilIdleWithError:&error],
+                        error);
                 assert(texture_pixel(surfaces.color.transfer.texture, 1, 1) ==
                            0xffffff00 &&
                        texture_pixel(surfaces.color.transfer.texture, 5, 1) ==
@@ -4331,7 +4475,9 @@ static void clear_zero_binding_changes(void)
             arrays(0, 3);
             end();
             NSError *error = nil;
-            require([surfaces.cache waitUntilIdleWithError:&error], error);
+            require([surfaces.cache submitWithError:&error] &&
+                        [surfaces.cache waitUntilIdleWithError:&error],
+                    error);
             assert(surfaces.color.address == (change == 0 ? 1536 : 1024) &&
                    texture_pixel(surfaces.color.transfer.texture, 1, 1) ==
                        0xffffff00);
@@ -4400,7 +4546,8 @@ static void clear_aa_swizzle_begin(void)
                     arrays(0, 3);
                     end();
                     NSError *error = nil;
-                    require([surfaces.cache waitUntilIdleWithError:&error],
+                    require([surfaces.cache submitWithError:&error] &&
+                                [surfaces.cache waitUntilIdleWithError:&error],
                             error);
                     id<MTLTexture> target = surfaces.color.transfer.texture;
                     assert(target.width == width * scale &&
@@ -4465,7 +4612,8 @@ static void clear_aa_swizzle_begin(void)
                     begin(PRIM_TYPE_TRIANGLES);
                     arrays(0, 3);
                     end();
-                    require([surfaces.cache waitUntilIdleWithError:&error],
+                    require([surfaces.cache submitWithError:&error] &&
+                                [surfaces.cache waitUntilIdleWithError:&error],
                             error);
                     assert(texture_pixel(surfaces.color.transfer.texture, sx,
                                          sy) == 0xffffff00);
@@ -13191,9 +13339,34 @@ static void scale_preserves_begin(void)
     }
     groups++;
 }
+static void scanout_with_prefix(NV2AMetalPGRAPHScanout *capture, BOOL sealed)
+{
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    assert(!cache.recording && !cache.commands.hasPendingRasterPass);
+    require([cache prepareGPUReadAtAddress:65528 length:4 error:&error], error);
+    NV2AMetalSurfaceRecording *prefix = cache.recording;
+    if (sealed)
+        require([cache checkpointWithError:&error], error);
+    assert(prefix && !prefix.submitted && cache.commands.sealedBufferCount ==
+                                             (NSUInteger)sealed);
+    uint64_t before =
+        [[cache.commands valueForKey:@"lastSubmission"] unsignedLongLongValue];
+    require([capture renderWithError:&error], error);
+    uint64_t after =
+        [[cache.commands valueForKey:@"lastSubmission"] unsignedLongLongValue];
+    assert(after - before == 1 && prefix.completed);
+}
 static void scanout_reuse(void)
 {
     fixture();
+    PGRAPHState *pg = &state->pgraph;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    assert(!cache.commands.lastSubmitted);
+    qemu_mutex_lock(&pg->lock);
+    renderer.ops.flip_stall(state);
+    qemu_mutex_unlock(&pg->lock);
+    assert(!cache.commands.lastSubmitted);
     query_triangle(0);
     NSError *error = nil;
     NV2AMetalPGRAPHScanout *capture =
@@ -13201,13 +13374,107 @@ static void scanout_reuse(void)
                                                 cache:surfaces.cache
                                                 error:&error];
     require(capture != nil, error);
+    /* Capture only the surface queue's work. Another queue may still own
+     * a read of disjoint VRAM when this immutable frame is published. */
+    id<MTLDevice> device = cache.commands.device;
+    NV2AMetalCommands *readerCommands =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    require(readerCommands != nil, error);
+    const NV2AMetalVRAMReadSpan span = { 49152, sizeof(uint32_t) };
+    uint32_t expected;
+    memcpy(&expected, state->vram_ptr + span.address, sizeof(expected));
+    NV2AMetalIndependentReads *reader = nil;
+    require([cache tryBeginIndependentReads:&span
+                                      count:1
+                                   commands:readerCommands
+                                      reads:&reader
+                                      error:&error],
+            error);
+    assert(reader);
+    id<MTLBuffer> readback =
+        [device newBufferWithLength:span.length
+                            options:MTLResourceStorageModeShared];
+    require(readback && [readerCommands addResource:readback error:&error],
+            error);
+    id<MTL4ComputeCommandEncoder> e =
+        [readerCommands.commandBuffer computeCommandEncoder];
+    assert(e);
+    [e copyFromBuffer:cache.vram
+             sourceOffset:span.address
+                 toBuffer:readback
+        destinationOffset:0
+                     size:span.length];
+    [e endEncoding];
+
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(readerCommands, queueIvar);
+    assert(gate && queue);
+    [queue waitForEvent:gate value:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!gate.signaledValue)
+                         gate.signaledValue = 2;
+                   });
+    require([cache submitIndependentReads:reader error:&error], error);
+    assert(![readerCommands.lastSubmitted completedWithError:&error]);
+    qemu_mutex_lock(&pg->lock);
+    renderer.ops.surface_update(state, false, true, true);
+    renderer.ops.flip_stall(state);
+    qemu_mutex_unlock(&pg->lock);
+    assert(!gate.signaledValue &&
+           [cache.commands.lastSubmitted completedWithError:&error] && !error &&
+           ![readerCommands.lastSubmitted completedWithError:&error]);
+    Method waitMethod = class_getInstanceMethod(NV2AMetalCommands.class,
+                                                @selector(waitForSubmission:error:));
+    IMP originalWait = method_getImplementation(waitMethod);
+    __block unsigned repeatedWaits = 0;
+    IMP countWait = imp_implementationWithBlock(
+        ^BOOL(NV2AMetalCommands *commands, NV2AMetalSubmission *submission,
+              NSError **failure) {
+            repeatedWaits++;
+            BOOL (*wait)(id, SEL, NV2AMetalSubmission *, NSError **) =
+                (void *)originalWait;
+            return wait(commands, @selector(waitForSubmission:error:),
+                        submission, failure);
+        });
+    method_setImplementation(waitMethod, countWait);
+    qemu_mutex_lock(&pg->lock);
+    for (unsigned flip = 0; flip < 16; flip++)
+        renderer.ops.flip_stall(state);
+    qemu_mutex_unlock(&pg->lock);
+    method_setImplementation(waitMethod, originalWait);
+    assert(imp_removeBlock(countWait));
+    assert(!repeatedWaits && !gate.signaledValue &&
+           ![readerCommands.lastSubmitted completedWithError:&error]);
+    puts("Flip stall scope: empty flip and completed raster submission with "
+         "unrelated VRAM reader behind a closed GPU gate; 16 repeated flips "
+         "with zero waits PASS");
+    send_method(NV097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    query_triangle(0);
+    get_report(0);
+    process_reports();
+    assert(report_result(0) == 28 && !gate.signaledValue &&
+           ![readerCommands.lastSubmitted completedWithError:&error] && !error);
+    puts("Report scope: native Z-pass result written with unrelated VRAM "
+         "reader behind a closed GPU gate PASS");
     require([capture renderWithError:&error], error);
+    assert(!gate.signaledValue &&
+           [cache.commands.lastSubmitted completedWithError:&error] && !error &&
+           ![readerCommands.lastSubmitted completedWithError:&error]);
+    gate.signaledValue = 1;
+    require([cache completeIndependentReads:reader error:&error], error);
+    assert(!memcmp(readback.contents, &expected, sizeof(expected)));
     NV2AMetalFramebuffer *first = capture.frame;
     assert(first && frame_pixel(first, 1, 1) == 0xff00ff00);
+    id vga = [capture valueForKey:@"vga"];
+    assert(vga && ![vga valueForKey:@"pipeline"] && ![vga valueForKey:@"arguments"]);
+    puts("Scanout submission scope: completed frame with unrelated VRAM reader "
+         "behind a closed GPU gate PASS");
     for (unsigned i = 0; i < 128; i++) {
         require([capture renderWithError:&error], error);
-        assert(capture.frame != first &&
-               capture.frame.texture == first.texture &&
+        assert(capture.frame == first &&
                !surfaces.cache.recording &&
                !surfaces.cache.commands.commandBuffer);
     }
@@ -13232,7 +13499,8 @@ static void scanout_reuse(void)
     state->puserdac.palette[37 * 3] = 99;
     state->vga.sr[VGA_SEQ_CLOCK_MODE] = VGA_SR01_SCREEN_OFF;
     require([capture renderWithError:&error], error);
-    assert(capture.frame.texture == first.texture && capture.frame.screenOff &&
+    assert(capture.frame != first && capture.frame.texture == first.texture &&
+           capture.frame.screenOff &&
            (capture.frame.displayUniforms.palette[37] & 255) == 99 &&
            !first.screenOff && (first.displayUniforms.palette[37] & 255) == 37);
     state->vga.sr[VGA_SEQ_CLOCK_MODE] = 0;
@@ -13253,9 +13521,10 @@ static void scanout_reuse(void)
            frame_pixel(green, 1, 1) == 0xff00ff00 &&
            frame_pixel(blue, 1, 1) == 0xff0000ff);
     scan_pitch = 16;
-    require([capture renderWithError:&error], error);
+    scanout_with_prefix(capture, YES);
     assert(capture.frame.texture != green.texture);
     scan_pitch = 32;
+    scanout_with_prefix(capture, NO);
     state->vga.cr[NV_PRMCIO_INTERLACE_MODE] = 0;
     require([capture renderWithError:&error], error);
     NV2AMetalFramebuffer *interlace = capture.frame;
@@ -13269,21 +13538,181 @@ static void scanout_reuse(void)
     require([surfaces.cache submitWithError:&error], error);
     require([capture renderWithError:&error], error);
     assert(capture.frame.texture != normal.texture);
-    id<MTLTexture> before = capture.frame.texture;
+    NV2AMetalFramebuffer *before = capture.frame;
     [capture invalidate];
     assert(!capture.frame);
     require([capture renderWithError:&error], error);
-    assert(capture.frame.texture != before);
-    before = capture.frame.texture;
+    assert(capture.frame.texture != before.texture);
+    before = capture.frame;
     state->pcrtc.start = 64000;
     require([capture renderWithError:&error], error);
     assert(!capture.frame);
     state->pcrtc.start = 1024;
     require([capture renderWithError:&error], error);
-    assert(capture.frame.texture != before);
+    assert(capture.frame.texture != before.texture);
     assert(![surfaces.cache touchSurface:other frame:7 error:&error]);
     assert(![surfaces.cache touchSurface:nil frame:7 error:&error]);
     assert(frame_pixel(first, 1, 1) == 0xff00ff00);
+    groups++;
+}
+static NV2AMetalFramebuffer *copy_frame_while_fifo_locked(void)
+{
+    __block NV2AMetalFramebuffer *frame = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    qemu_mutex_lock(&state->pfifo.lock);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+      @autoreleasepool {
+          frame = copy_frame_from(pgraph_metal4_copy_framebuffer);
+      }
+      dispatch_semaphore_signal(done);
+    });
+    long result = dispatch_semaphore_wait(
+        done, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+    qemu_mutex_unlock(&state->pfifo.lock);
+    assert(!result);
+    return frame;
+}
+static void scanout_presentation(void)
+{
+    fixture();
+    query_triangle(0);
+    start_worker();
+    NV2AMetalFramebuffer *first = copy_frame();
+    assert(first && frame_pixel(first, 1, 1) == 0xff00ff00);
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NV2AMetalCommands *commands = cache.commands;
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(commands, queueIvar);
+    id<MTLSharedEvent> gate = [commands.device newSharedEvent];
+    assert(gate && queue);
+
+    cpu_write(1024, 256);
+    for (unsigned i = 0; i < 64; i++) {
+        uint32_t blue = 0xff0000ff;
+        memcpy(state->vram_ptr + 1024 + i * 4, &blue, 4);
+    }
+    NV2AMetalSubmission *previous = commands.lastSubmitted;
+    [queue waitForEvent:gate value:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!gate.signaledValue)
+                         gate.signaledValue = 2;
+                   });
+    qemu_event_init(&worker_paused, false);
+    qemu_event_init(&worker_resume, false);
+    qatomic_set(&worker_pause, true);
+    assert(copy_frame_while_fifo_locked() == first);
+    assert(copy_frame_from(pgraph_metal4_copy_framebuffer) == first);
+    qemu_event_wait(&worker_paused);
+    assert(commands.lastSubmitted == previous);
+    /* Multiple UI polls can return before the PGRAPH thread services any. */
+    for (unsigned i = 0; i < 4; i++)
+        assert(copy_frame_from(pgraph_metal4_copy_framebuffer) == first);
+    process_pending();
+    NV2AMetalSubmission *capture = commands.lastSubmitted;
+    assert(capture && capture != previous &&
+           ![capture completedWithError:NULL] && !gate.signaledValue);
+
+    /* A later producer can still record while the capture is in flight. */
+    NSError *error = nil;
+    qemu_mutex_lock(&state->pgraph.lock);
+    require([cache prepareGPUReadAtAddress:65528 length:4 error:&error], error);
+    NV2AMetalSurfaceRecording *later = cache.recording;
+    qemu_mutex_unlock(&state->pgraph.lock);
+    for (unsigned i = 0; i < 4; i++) {
+        assert(copy_frame_from(pgraph_metal4_copy_framebuffer) == first);
+        process_pending();
+        assert(commands.lastSubmitted == capture && cache.recording == later &&
+               !later.submitted && !gate.signaledValue);
+    }
+    gate.signaledValue = 1;
+    require([commands waitForSubmission:capture error:&error], error);
+    /* Service the contended request without a second host poll to wake it. */
+    assert(copy_frame_while_fifo_locked() == first);
+    process_pending();
+    NV2AMetalFramebuffer *blue = copy_frame_from(pgraph_metal4_copy_framebuffer);
+    assert(blue && blue.texture != first.texture &&
+           frame_pixel(blue, 1, 1) == 0xff0000ff &&
+           frame_pixel(first, 1, 1) == 0xff00ff00 &&
+           commands.lastSubmitted == capture && cache.recording == later &&
+           !later.submitted);
+    qatomic_set(&worker_pause, false);
+    qemu_event_set(&worker_resume);
+    stop_worker();
+    qemu_event_destroy(&worker_paused);
+    qemu_event_destroy(&worker_resume);
+    [cache cancel];
+
+    NV2AMetalPGRAPHScanout *discarded =
+        [[NV2AMetalPGRAPHScanout alloc] initWithState:state
+                                                cache:cache
+                                                error:&error];
+    require(discarded != nil, error);
+    require([discarded updatePresentationWithError:&error], error);
+    NV2AMetalSubmission *old = commands.lastSubmitted;
+    assert(old != capture && !discarded.frame);
+    [discarded invalidate];
+    require([commands waitForSubmission:old error:&error], error);
+    require([discarded updatePresentationWithError:&error], error);
+    assert(commands.lastSubmitted != old && !discarded.frame);
+    require([commands waitForSubmission:commands.lastSubmitted error:&error],
+            error);
+    require([discarded updatePresentationWithError:&error], error);
+    assert(frame_pixel(discarded.frame, 1, 1) == 0xff0000ff);
+    puts("Scanout presentation scope: UI returns with the FIFO lock held or "
+         "the PGRAPH worker paused, retained request publishes, "
+         "pending GPU capture keeps old frame, "
+         "bounds submissions, leaves a later recording open and discards "
+         "invalidated images PASS");
+    groups++;
+}
+static void scanout_target_pool(void)
+{
+    fixture();
+    query_triangle(0);
+    NSError *error = nil;
+    NV2AMetalPGRAPHScanout *capture =
+        [[NV2AMetalPGRAPHScanout alloc] initWithState:state
+                                                cache:surfaces.cache
+                                                error:&error];
+    require(capture != nil, error);
+    id<MTLTexture> firstTexture;
+    __weak NV2AMetalFramebuffer *snapshot;
+    @autoreleasepool {
+        require([capture renderWithError:&error], error);
+        NV2AMetalFramebuffer *original = capture.frame;
+        firstTexture = original.texture;
+        state->puserdac.palette[37 * 3] = 99;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame != original &&
+               capture.frame.texture == firstTexture);
+        snapshot = capture.frame;
+        xemu_metal4_set_capture_frame((__bridge void *)capture.frame);
+    }
+    @autoreleasepool {
+        cpu_write(1024, 256);
+        for (unsigned i = 0; i < 64; i++)
+            stl_le_p(state->vram_ptr + 1024 + i * 4, 0xff0000ff);
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture != firstTexture &&
+               frame_pixel(capture.frame, 1, 1) == 0xff0000ff && snapshot &&
+               frame_pixel(snapshot, 1, 1) == 0xff00ff00);
+    }
+    xemu_metal4_set_capture_frame(NULL);
+    assert(!snapshot);
+    @autoreleasepool {
+        query_triangle(0);
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture == firstTexture &&
+               frame_pixel(capture.frame, 1, 1) == 0xff00ff00);
+        scan_height = 16;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture.height == 16 &&
+               capture.frame.texture != firstTexture);
+    }
+    puts("PGRAPH scanout target pool: capture lease survives metadata-only "
+         "publication, reuses the released target and separates sizes PASS");
     groups++;
 }
 static void scanout_frames(void)
@@ -13340,9 +13769,9 @@ static void scanout_overlay(void)
 {
     fixture();
     query_triangle(0);
-    cpu_write(32768, 32);
+    cpu_write(32768, 48);
     // Neutral YUY2 producing white, repeated over a 4x4 input.
-    for (unsigned i = 0; i < 32; i += 4) {
+    for (unsigned i = 0; i < 48; i += 4) {
         state->vram_ptr[32768 + i] = 235;
         state->vram_ptr[32768 + i + 1] = 128;
         state->vram_ptr[32768 + i + 2] = 235;
@@ -13351,20 +13780,81 @@ static void scanout_overlay(void)
     uint32_t *r = state->pvideo.regs;
     r[NV_PVIDEO_BUFFER] = NV_PVIDEO_BUFFER_0_USE;
     r[NV_PVIDEO_BASE] = 32768;
-    r[NV_PVIDEO_LIMIT] = 32;
+    r[NV_PVIDEO_LIMIT] = 48;
     r[NV_PVIDEO_SIZE_IN] = 4 | 4 << 16;
     r[NV_PVIDEO_SIZE_OUT] = 4 | 4 << 16;
     r[NV_PVIDEO_POINT_OUT] = 1 | 1 << 16;
     r[NV_PVIDEO_FORMAT] = 8 | NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8 << 16;
     r[NV_PVIDEO_DS_DX] = r[NV_PVIDEO_DT_DY] = NV_PVIDEO_DIN_DOUT_UNITY;
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    require([cache submitWithError:&error] &&
+                [cache waitUntilIdleWithError:&error], error);
+    NV2AMetalPGRAPHScanout *capture =
+        [[NV2AMetalPGRAPHScanout alloc] initWithState:state cache:cache error:&error];
+    require(capture != nil, error);
+    scanout_with_prefix(capture, NO);
+    assert(frame_pixel(capture.frame, 1, 1) == 0xffffffff);
     start_worker();
     NV2AMetalFramebuffer *overlay = copy_frame();
     assert(frame_pixel(overlay, 1, 1) == 0xffffffff &&
            frame_pixel(overlay, 6, 6) == 0xffff0000);
+    NV2AMetalSubmission *initialOverlay = cache.commands.lastSubmitted;
     // Larger input dimensions are capped to the scaled output, as in GL.
     r[NV_PVIDEO_SIZE_IN] = 8 | 8 << 16;
+    cpu_write(49152, 4);
+    memset(state->vram_ptr + 49152, 0xff, 4);
     NV2AMetalFramebuffer *capped = copy_frame();
-    assert(frame_pixel(capped, 1, 1) == 0xffffffff);
+    assert(capped.texture == overlay.texture &&
+           cache.commands.lastSubmitted == initialOverlay &&
+           frame_pixel(capped, 1, 1) == 0xffffffff);
+    r[NV_PVIDEO_FORMAT] = 12 | NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8 << 16;
+    NV2AMetalFramebuffer *pitched = copy_frame();
+    assert(pitched.texture != overlay.texture &&
+           cache.commands.lastSubmitted != initialOverlay &&
+           frame_pixel(pitched, 1, 1) == 0xffffffff);
+    cpu_write(32768, 48);
+    for (unsigned i = 0; i < 48; i += 2)
+        state->vram_ptr[32768 + i] = 16;
+    NV2AMetalFramebuffer *dark = copy_frame();
+    assert(dark.texture != pitched.texture &&
+           frame_pixel(dark, 1, 1) == 0xff000000 &&
+           frame_pixel(pitched, 1, 1) == 0xffffffff);
+    /* An open writer must block reuse even without a generation change. */
+    uint8_t white[48];
+    for (unsigned i = 0; i < sizeof(white); i += 2) {
+        white[i] = 235;
+        white[i + 1] = 128;
+    }
+    NV2AMetalCommands *commands = cache.commands;
+    id<MTLBuffer> upload = [commands.device
+        newBufferWithBytes:white length:sizeof(white)
+                   options:MTLResourceStorageModeShared];
+    qemu_mutex_lock(&state->pgraph.lock);
+    uint64_t beforeWrite = 0, queuedWrite = UINT64_MAX;
+    require(upload &&
+                [cache sourceVersionAtAddress:32768 length:sizeof(white)
+                                        version:&beforeWrite error:&error] &&
+                [cache prepareGPUWriteAtAddress:32768 length:sizeof(white)
+                                          error:&error] &&
+                [cache sourceVersionAtAddress:32768 length:sizeof(white)
+                                        version:&queuedWrite error:&error] &&
+                [commands addResource:upload error:&error], error);
+    assert(beforeWrite == queuedWrite);
+    id<MTL4ComputeCommandEncoder> writer =
+        [commands.commandBuffer computeCommandEncoder];
+    assert(writer);
+    [writer copyFromBuffer:upload sourceOffset:0 toBuffer:cache.vram
+         destinationOffset:32768 size:sizeof(white)];
+    [writer barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll
+             visibilityOptions:MTL4VisibilityOptionDevice];
+    [writer endEncoding];
+    qemu_mutex_unlock(&state->pgraph.lock);
+    NV2AMetalFramebuffer *written = copy_frame();
+    assert(written.texture != dark.texture &&
+           frame_pixel(written, 1, 1) == 0xffffffff &&
+           frame_pixel(dark, 1, 1) == 0xff000000);
+    r[NV_PVIDEO_FORMAT] = 8 | NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8 << 16;
     // A non-unity DIN/DOUT produces a one-pixel input after GL's rounding.
     r[NV_PVIDEO_SIZE_IN] = 4 | 4 << 16;
     r[NV_PVIDEO_SIZE_OUT] = 1 | 1 << 16;
@@ -13391,6 +13881,9 @@ static void scanout_overlay(void)
     assert(alias && !surfaces.color.dirty && raw_color(1, 1) == 0xff00ff00);
     assert(frame_pixel(alias, 1, 1) != frame_pixel(hidden, 1, 1));
     stop_worker();
+    puts("Scanout PVIDEO reuse: unchanged effective layout and disjoint VRAM "
+         "write skip GPU submission, changed pitch and source bytes refresh, "
+         "pending GPU writer and GPU-owned alias pixels PASS");
     groups++;
 }
 static void scanout_capture_guards(void)
@@ -13496,16 +13989,155 @@ static void vga_split_and_repeat(void)
     assert(frame_pixel(split, 1, 0) == 0xff0000ff &&
            frame_pixel(split, 1, 1) == 0xff0000ff &&
            frame_pixel(split, 1, 2) == 0xff00ff00);
+    NV2AMetalSubmission *splitSubmission = surfaces.cache.commands.lastSubmitted;
+    cpu_write(60000, 4);
+    memset(state->vram_ptr + 60000, 0xff, 4);
+    assert(copy_frame() == split &&
+           surfaces.cache.commands.lastSubmitted == splitSubmission);
+    cpu_write(16384, 4);
+    memset(state->vram_ptr + 16384, 0xff, 4);
+    assert(copy_frame() == split &&
+           surfaces.cache.commands.lastSubmitted == splitSubmission);
+    NSError *error = nil;
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    const NV2AMetalVRAMReadSpan gaps[] = { { 16384, 4 }, { 49152 + 3, 1 } };
+    for (unsigned i = 0; i < G_N_ELEMENTS(gaps); i++) {
+        qemu_mutex_lock(&state->pgraph.lock);
+        require([cache prepareGPUWriteAtAddress:gaps[i].address
+                                          length:gaps[i].length error:&error],
+                error);
+        NV2AMetalSurfaceRecording *gap = cache.recording;
+        qemu_mutex_unlock(&state->pgraph.lock);
+        assert(copy_frame() == split && cache.recording == gap && !gap.submitted);
+        qemu_mutex_lock(&state->pgraph.lock);
+        [cache cancel];
+        qemu_mutex_unlock(&state->pgraph.lock);
+    }
+    cpu_write(4, 4);
+    stl_le_p(state->vram_ptr + 4, 0xffff0000);
+    NV2AMetalFramebuffer *updatedSplit = copy_frame();
+    assert(updatedSplit.texture != split.texture &&
+           frame_pixel(updatedSplit, 1, 2) == 0xffff0000 &&
+           frame_pixel(split, 1, 2) == 0xff00ff00);
+    NV2AMetalCommands *commands = cache.commands;
+    uint32_t red = 0xffff0000;
+    id<MTLBuffer> upload = [commands.device
+        newBufferWithBytes:&red length:sizeof(red)
+                   options:MTLResourceStorageModeShared];
+    qemu_mutex_lock(&state->pgraph.lock);
+    require(upload && [cache prepareGPUWriteAtAddress:49152 + 8
+                                                length:sizeof(red) error:&error] &&
+                [commands addResource:upload error:&error], error);
+    id<MTL4ComputeCommandEncoder> writer =
+        [commands.commandBuffer computeCommandEncoder];
+    assert(writer);
+    [writer copyFromBuffer:upload sourceOffset:0 toBuffer:cache.vram
+         destinationOffset:49152 + 8 size:sizeof(red)];
+    [writer barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll
+             visibilityOptions:MTL4VisibilityOptionDevice];
+    [writer endEncoding];
+    qemu_mutex_unlock(&state->pgraph.lock);
+    NV2AMetalFramebuffer *written = copy_frame();
+    assert(written.texture != updatedSplit.texture &&
+           frame_pixel(written, 2, 0) == red &&
+           frame_pixel(updatedSplit, 2, 0) == 0xff0000ff);
     scan_compare = UINT32_MAX;
     state->vga.cr[VGA_CRTC_MAX_SCAN] = 1;
-    uint32_t red = 0xffff0000;
     for (unsigned i = 0; i < 32; i += 4)
         memcpy(state->vram_ptr + 49152 + 32 + i, &red, 4);
     NV2AMetalFramebuffer *repeat = copy_frame();
     assert(frame_pixel(repeat, 1, 0) == 0xff0000ff &&
            frame_pixel(repeat, 1, 1) == 0xff0000ff &&
            frame_pixel(repeat, 1, 2) == 0xffff0000);
+    cpu_write(49152 + 4, 4);
+    stl_le_p(state->vram_ptr + 49152 + 4, red);
+    NV2AMetalFramebuffer *changed = copy_frame();
+    assert(changed.texture != repeat.texture &&
+           frame_pixel(changed, 1, 0) == red &&
+           frame_pixel(repeat, 1, 0) == 0xff0000ff);
     stop_worker();
+    puts("VGA graphics reuse: unused pages and a pending write to a skipped "
+         "alpha byte retain the split frame; row layout and visible CPU/GPU "
+         "writes refresh exact pixels PASS");
+    groups++;
+}
+static void vga_unused_graphics_lanes(void)
+{
+    const unsigned modes[] = { 2, 4, 32, 32 };
+    for (unsigned i = 0; i < G_N_ELEMENTS(modes); i++) {
+        fixture();
+        unsigned mode = modes[i];
+        bool big_endian = i == 3;
+        unsigned offset = mode == 32 ? (big_endian ? 4 : 7) : 5;
+        unsigned base = 1024;
+        cpu_write(base, 64);
+        memset(state->vram_ptr + base, 0, 64);
+        NV2AMetalSurfaceConfig config = {
+            .format = NV097_SET_SURFACE_FORMAT_COLOR_LE_B8,
+            .width = 1, .height = 1, .pitch = 1, .scale = 1, .color = YES
+        };
+        NSError *error = nil;
+        NV2AMetalSurfaceCache *cache = surfaces.cache;
+        NV2AMetalCachedSurface *surface =
+            [cache prepareSurfaceAtAddress:base + offset
+                                    config:&config
+                                     frame:0
+                                     error:&error];
+        require(surface != nil, error);
+        assert(surface.reservationLength == 1);
+        MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
+        pass.colorAttachments[0].texture = surface.transfer.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor =
+            MTLClearColorMake(128.0 / 255, 0, 0, 1);
+        require([cache.commands addResource:surface.transfer.texture
+                                    error:&error], error);
+        id<MTL4RenderCommandEncoder> encoder =
+            [cache.commands.commandBuffer renderCommandEncoderWithDescriptor:pass];
+        assert(encoder);
+        [encoder barrierAfterQueueStages:MTLStageAll
+                             beforeStages:MTLStageAll
+                        visibilityOptions:MTL4VisibilityOptionDevice];
+        [encoder barrierAfterStages:MTLStageAll
+                 beforeQueueStages:MTLStageAll
+                 visibilityOptions:MTL4VisibilityOptionDevice];
+        [encoder endEncoding];
+        require([cache markWritten:surface error:&error], error);
+        assert(surface.dirty);
+
+        state->vga.get_bpp = get_scan_bpp;
+        state->vga.big_endian_fb = big_endian;
+        state->vga.gr[VGA_GFX_MODE] = (mode == 32 ? 2 : mode == 2) << 5;
+        state->vga.ar[VGA_ATC_PLANE_ENABLE] = 1;
+        state->vga.ar[VGA_ATC_MODE] = state->vga.ar[VGA_ATC_COLOR_PAGE] = 0;
+        state->vga.ar[0] = 0;
+        state->vga.ar[2] = 2;
+        memset(state->vga.palette, 0, sizeof(state->vga.palette));
+        state->vga.palette[2 * 3] = 63;
+        state->pcrtc.start = base;
+        scan_start = base / 4;
+        scan_pitch = 64;
+        scan_width = 16;
+        scan_height = 1;
+        scan_bpp = mode;
+        scan_hpel = 0;
+        unsigned x = mode == 32 ? 1 : mode == 2 ? 12 : 8;
+        start_worker();
+        NV2AMetalFramebuffer *frame = copy_frame();
+        assert(frame && frame_pixel(frame, x, 0) == 0xff000000 &&
+               surface.dirty && state->vram_ptr[base + offset] == 0);
+
+        state->vga.big_endian_fb = !big_endian;
+        state->vga.ar[VGA_ATC_PLANE_ENABLE] |= 2;
+        frame = copy_frame();
+        stop_worker();
+        assert(frame && frame_pixel(frame, x, 0) ==
+                            (mode == 32 ? 0xff000080 : 0xffff0000) &&
+               !surface.dirty && state->vram_ptr[base + offset] == 0x80);
+    }
+    puts("VGA graphics lanes: unused planar and packed alpha bytes stay on "
+         "the GPU; enabling the lane resolves its byte and pixel PASS");
     groups++;
 }
 static void vga_gpu_owned_ram(void)
@@ -13525,6 +14157,71 @@ static void vga_gpu_owned_ram(void)
     assert(frame && frame.texture.height == 1 &&
            frame_pixel(frame, 1, 0) == 0xff00ff00 &&
            raw_color(1, 0) == 0xff00ff00);
+
+    fixture();
+    query_triangle(0);
+    assert(surfaces.color.dirty && raw_color(1, 0) == 0xffff0000);
+    state->vga.get_bpp = get_scan_bpp;
+    scan_bpp = 32;
+    scan_start = 65532 / 4;
+    scan_pitch = 32;
+    scan_height = 1;
+    state->pcrtc.start = 65532;
+    uint32_t red = 0xffff0000, green = 0xff00ff00;
+    cpu_write(65532, 4);
+    memcpy(state->vram_ptr + 65532, &red, 4);
+    cpu_write(0, 28);
+    for (unsigned i = 0; i < 28; i += 4)
+        memcpy(state->vram_ptr + i, &green, 4);
+    start_worker();
+    frame = copy_frame();
+    assert(frame && frame_pixel(frame, 0, 0) == red &&
+           frame_pixel(frame, 1, 0) == green && surfaces.color.dirty &&
+           raw_color(1, 0) == red);
+    state->vga.ar_index = 0;
+    NV2AMetalFramebuffer *blank = copy_frame();
+    stop_worker();
+    assert(blank && frame_pixel(blank, 1, 0) == 0xff000000 &&
+           surfaces.color.dirty && raw_color(1, 0) == red);
+
+    test_vram_length = TEST_VRAM_CAPACITY;
+    fixture();
+    query_triangle(0);
+    assert(surfaces.color.dirty && raw_color(1, 0) == red);
+    state->vga.get_bpp = get_scan_bpp;
+    state->vga.vbe_size_mask = test_vram_length - 1;
+    state->vga.dac_8bit = 1;
+    scan_bpp = 0;
+    scan_start = 0x3fff8 / 4;
+    scan_pitch = 5;
+    scan_height = 2;
+    scan_hpel = 6;
+    state->pcrtc.start = 0x3fff8;
+    cpu_write(0x40000, 1);
+    cpu_write(1, 3);
+    state->vram_ptr[0x40000] = 1;
+    for (unsigned i = 1; i <= 3; i++)
+        state->vram_ptr[i] = i + 1;
+    for (unsigned i = 1; i <= 4; i++) {
+        state->vga.palette[i * 3] = i;
+        state->vga.palette[i * 3 + 1] = 0;
+        state->vga.palette[i * 3 + 2] = 0;
+    }
+    start_worker();
+    frame = copy_frame();
+    stop_worker();
+    test_vram_length = 65536;
+    // The misaligned row reads the last lane at 0x40000, then wraps to 1.
+    assert(frame && frame.texture.height == 2 &&
+           frame_pixel(frame, 0, 1) == 0xff010000 &&
+           frame_pixel(frame, 2, 1) == 0xff020000 &&
+           frame_pixel(frame, 4, 1) == 0xff030000 &&
+           frame_pixel(frame, 6, 1) == 0xff040000 &&
+           surfaces.color.dirty && raw_color(1, 0) == red);
+    puts("VGA graphics read spans: wrapped pixels and blank output leave "
+         "a disjoint dirty surface in GPU memory PASS");
+    puts("VGA misaligned mode-0 wrap: upper-edge and wrapped pixels match "
+         "while a disjoint dirty surface stays on the GPU PASS");
     groups++;
 }
 static void vga_graphics_startup(void)
@@ -13560,6 +14257,244 @@ static void vga_graphics_startup(void)
     stop_worker();
     groups++;
 }
+static void check_scanout_pool_failure(NV2AMetalPGRAPHScanout *capture,
+                                       BOOL feedback, BOOL sealed)
+{
+    NSError *error = nil;
+    id<MTLTexture> released;
+    @autoreleasepool {
+        scan_width = 32;
+        require([capture renderWithError:&error], error);
+        released = capture.frame.texture;
+        scan_width = 72;
+        require([capture renderWithError:&error], error);
+    }
+    NV2AMetalFramebuffer *published = capture.frame;
+    scan_width = 32;
+    Method method;
+    IMP original, injected;
+    NV2AMetalSurfaceRecording *prefix = nil;
+    if (feedback) {
+        SEL selector = @selector(waitForRecording:error:);
+        method = class_getInstanceMethod([NV2AMetalSurfaceCache class],
+                                         selector);
+        assert(method);
+        original = method_getImplementation(method);
+        injected = imp_implementationWithBlock(
+            ^BOOL(NV2AMetalSurfaceCache *cache, NV2AMetalSurfaceRecording *recording,
+                  NSError **failure) {
+                BOOL (*wait)(id, SEL, NV2AMetalSurfaceRecording *, NSError **) =
+                    (void *)original;
+                assert(wait(cache, selector, recording, failure));
+                if (failure)
+                    *failure = [NSError errorWithDomain:@"test.scanout-pool"
+                                                   code:1 userInfo:nil];
+                return NO;
+            });
+    } else {
+        NV2AMetalSurfaceCache *cache = surfaces.cache;
+        require([cache prepareGPUReadAtAddress:65528 length:4 error:&error],
+                error);
+        prefix = cache.recording;
+        if (sealed)
+            require([cache checkpointWithError:&error], error);
+        method = class_getInstanceMethod([NV2AMetalCommands class],
+                                         @selector(uploadBytes:length:offset:error:));
+        assert(method);
+        original = method_getImplementation(method);
+        injected = imp_implementationWithBlock(
+            ^id<MTLBuffer>(NV2AMetalCommands *commands, const void *bytes,
+                           NSUInteger length, NSUInteger *offset,
+                           NSError **failure) {
+                assert(commands == surfaces.cache.commands && bytes && offset &&
+                       length == scan_height * sizeof(NV2AMetalVGARow));
+                if (failure)
+                    *failure = [NSError errorWithDomain:@"test.scanout-pool"
+                                                   code:2 userInfo:nil];
+                return nil;
+            });
+    }
+    method_setImplementation(method, injected);
+    assert(![capture renderWithError:&error] && capture.frame == published &&
+           [error.domain isEqualToString:@"test.scanout-pool"]);
+    if (prefix)
+        assert(!prefix.submitted && !prefix.cancelled && !surfaces.cache.recording &&
+               surfaces.cache.commands.sealedBufferCount == 1);
+    method_setImplementation(method, original);
+    assert(imp_removeBlock(injected));
+    error = nil;
+    require([capture renderWithError:&error], error);
+    assert(!prefix || prefix.completed);
+    assert(capture.frame.texture != released &&
+           capture.frame.texture.width == 32 &&
+           frame_pixel(capture.frame, 0, 0) == 0xff000000);
+}
+
+static void check_scanout_pool_byte_limit(NV2AMetalPGRAPHScanout *capture)
+{
+    const NSUInteger limit = 64 * 1024 * 1024;
+    NSError *error = nil;
+    [capture invalidate];
+    scan_width = 4096;
+    scan_height = 2304;
+    NSArray<id<MTLTexture>> *freeTargets =
+        [[capture valueForKey:@"targetPool"] valueForKey:@"free"];
+    id<MTLTexture> older;
+    NSUInteger olderBytes;
+    @autoreleasepool {
+        require([capture renderWithError:&error], error);
+        older = capture.frame.texture;
+        olderBytes = capture.frame.texture.allocatedSize;
+        [capture invalidate];
+    }
+    assert([freeTargets containsObject:older] && olderBytes <= limit);
+
+    scan_height = 2560;
+    id<MTLTexture> newer;
+    @autoreleasepool {
+        require([capture renderWithError:&error], error);
+        newer = capture.frame.texture;
+        NSUInteger newerBytes = capture.frame.texture.allocatedSize;
+        assert(newerBytes <= limit && olderBytes + newerBytes > limit);
+        [capture invalidate];
+    }
+    assert(freeTargets.count == 1 && freeTargets.firstObject == newer);
+    older = nil;
+
+    scan_height = 4608;
+    id<MTLTexture> oversized;
+    @autoreleasepool {
+        require([capture renderWithError:&error], error);
+        oversized = capture.frame.texture;
+        assert(capture.frame.texture.allocatedSize > limit);
+        [capture invalidate];
+    }
+    assert(oversized != newer && freeTargets.count == 1 &&
+           freeTargets.firstObject == newer);
+    puts("Scanout pool byte limit: two individually eligible targets exceed "
+         "64 MiB together, one oversized target is never cached PASS");
+}
+
+static void vga_target_pool(void)
+{
+    fixture();
+    state->vga.get_bpp = get_scan_bpp;
+    state->vga.gr[VGA_GFX_MISC] = 0;
+    state->vga.cr[VGA_CRTC_H_DISP] = 1;
+    state->vga.cr[VGA_CRTC_MAX_SCAN] = 0;
+    state->vga.cr[VGA_CRTC_V_DISP_END] = 1;
+    state->vga.cr[VGA_CRTC_OVERFLOW] = 0;
+    state->vga.cr[VGA_CRTC_V_TOTAL] = 0;
+    state->vga.cr[VGA_CRTC_CURSOR_START] = 0x20;
+    state->vga.sr[VGA_SEQ_CLOCK_MODE] = VGA_SR01_CHAR_CLK_8DOTS;
+    state->vga.sr[VGA_SEQ_CHARACTER_MAP] = 0;
+    state->vga.ar[0] = 0;
+    state->vga.ar[1] = 1;
+    state->vga.ar[VGA_ATC_MODE] = state->vga.ar[VGA_ATC_COLOR_PAGE] = 0;
+    memset(state->vga.palette, 0, sizeof(state->vga.palette));
+    state->vga.palette[3] = 63;
+    const unsigned start = 49152;
+    state->pcrtc.start = start;
+    scan_start = start / 4;
+    scan_width = 16;
+    scan_height = 2;
+    scan_pitch = 8;
+    scan_bpp = 32;
+    cpu_write(start, 16);
+    memset(state->vram_ptr + start, 0, 16);
+    state->vram_ptr[start] = 'A';
+    state->vram_ptr[start + 1] = 1;
+    cpu_write(2 + 'A' * 128, 1);
+    state->vram_ptr[2 + 'A' * 128] = 0x80;
+
+    NSError *error = nil;
+    NV2AMetalPGRAPHScanout *capture =
+        [[NV2AMetalPGRAPHScanout alloc] initWithState:state
+                                                cache:surfaces.cache
+                                                error:&error];
+    require(capture != nil, error);
+    id<MTLTexture> textTexture, graphicsTexture;
+    @autoreleasepool {
+        scanout_with_prefix(capture, YES);
+        NV2AMetalFramebuffer *textFrame = capture.frame;
+        textTexture = textFrame.texture;
+        assert(textTexture.width == 16 && textTexture.height == 2);
+        state->vga.gr[VGA_GFX_MISC] = VGA_GR06_GRAPHICS_MODE;
+        scan_start = 32768 / 4;
+        scan_pitch = 64;
+        cpu_write(32768, 128);
+        for (unsigned i = 0; i < 128; i += 4)
+            stl_le_p(state->vram_ptr + 32768 + i, 0xff0000ff);
+        scanout_with_prefix(capture, YES);
+        graphicsTexture = capture.frame.texture;
+        assert(graphicsTexture != textTexture &&
+               frame_pixel(capture.frame, 0, 0) == 0xff0000ff &&
+               frame_pixel(textFrame, 0, 0) == 0xffff0000);
+    }
+    @autoreleasepool {
+        cpu_write(32768, 4);
+        require([capture renderWithError:&error], error);
+        NV2AMetalFramebuffer *graphics = capture.frame;
+        assert(graphics.texture == textTexture);
+        state->vga.ar_index = 0;
+        scanout_with_prefix(capture, NO);
+        assert(capture.frame.texture == graphicsTexture &&
+               frame_pixel(capture.frame, 0, 0) == 0xff000000 &&
+               frame_pixel(graphics, 0, 0) == 0xff0000ff);
+        NV2AMetalFramebuffer *blank = capture.frame;
+        NV2AMetalSurfaceCache *cache = surfaces.cache;
+        NV2AMetalSubmission *blankSubmission = cache.commands.lastSubmitted;
+        require([cache prepareGPUReadAtAddress:65528 length:4 error:&error],
+                error);
+        NV2AMetalSurfaceRecording *unrelated = cache.recording;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame == blank && cache.recording == unrelated &&
+               cache.commands.lastSubmitted == blankSubmission);
+        state->puserdac.palette[37 * 3] = 99;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame != blank && capture.frame.texture == blank.texture &&
+               (capture.frame.displayUniforms.palette[37] & 255) == 99 &&
+               (blank.displayUniforms.palette[37] & 255) != 99 &&
+               cache.recording == unrelated && !unrelated.submitted &&
+               cache.commands.lastSubmitted == blankSubmission);
+        [cache cancel];
+        scan_width = 24;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture.width == 24 &&
+               capture.frame.texture != textTexture &&
+               capture.frame.texture != graphicsTexture);
+    }
+    id<MTLTexture> bySize[4];
+    for (unsigned i = 0; i < G_N_ELEMENTS(bySize); i++) {
+        @autoreleasepool {
+            scan_width = 40 + 8 * i;
+            require([capture renderWithError:&error], error);
+            bySize[i] = capture.frame.texture;
+            [capture invalidate];
+        }
+    }
+    @autoreleasepool {
+        scan_width = 48;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture == bySize[1]);
+        scan_width = 40;
+        require([capture renderWithError:&error], error);
+        assert(capture.frame.texture != bySize[0]);
+    }
+    check_scanout_pool_failure(capture, NO, YES);
+    check_scanout_pool_failure(capture, NO, NO);
+    check_scanout_pool_failure(capture, YES, NO);
+    puts("VGA blank reuse: unchanged pixels and metadata keep the frame; "
+         "palette refresh shares the target and leaves unrelated work open PASS");
+    check_scanout_pool_byte_limit(capture);
+    puts("VGA scanout target pool: text, graphics and blank share released "
+         "targets, held pixels and incompatible dimensions preserved PASS");
+    puts("Scanout pool limits and failure: oldest of four targets evicted; "
+         "cancelled upload and failed feedback discard the target PASS");
+    puts("Scanout batching: one commit with sealed or open work, "
+         "preserved prefix and exact retry after capture failure PASS");
+    groups++;
+}
 static void vga_text_frames(void)
 {
     fixture();
@@ -13573,7 +14508,7 @@ static void vga_text_frames(void)
     state->vga.cr[VGA_CRTC_MAX_SCAN] = 7;
     state->vga.cr[VGA_CRTC_V_DISP_END] = 15;
     state->vga.cr[VGA_CRTC_OVERFLOW] = 0;
-    state->vga.sr[VGA_SEQ_CHARACTER_MAP] = 0;
+    state->vga.sr[VGA_SEQ_CHARACTER_MAP] = 0x30; /* Both selectors use bank 1. */
     state->vga.sr[VGA_SEQ_CLOCK_MODE] = VGA_SR01_CHAR_CLK_8DOTS;
     state->vga.cr[VGA_CRTC_CURSOR_START] = 0x20;
     for (unsigned i = 0; i < 16; i++) {
@@ -13584,22 +14519,47 @@ static void vga_text_frames(void)
     }
     state->vga.ar[VGA_ATC_MODE] = 0;
     state->vga.ar[VGA_ATC_COLOR_PAGE] = 0;
-    cpu_write(0, 32768);
+    const unsigned font = 32768 + 2;
+    cpu_write(32768, 32768);
     cpu_write(49152, 16);
-    memset(state->vram_ptr, 0, 32768);
-    memset(state->vram_ptr + 49152, 0, 16);
+    memset(state->vram_ptr + 32768, 0, 32768);
     for (unsigned row = 0; row < 8; row++)
-        state->vram_ptr[2 + 'A' * 128 + row * 4] = 0x81;
+        state->vram_ptr[font + 'A' * 128 + row * 4] = 0x81;
     for (unsigned i = 0; i < 4; i++) {
         state->vram_ptr[49152 + i * 4] = 'A';
         state->vram_ptr[49153 + i * 4] = 1;
     }
+    query_triangle(0);
+    assert(surfaces.color.dirty && raw_color(1, 0) == 0xffff0000);
     start_worker();
     NV2AMetalFramebuffer *frame = copy_frame();
     assert(frame.texture.width == 16 && frame.texture.height == 16 &&
            frame_pixel(frame, 0, 0) == 0xffff0000 &&
            frame_pixel(frame, 1, 0) == 0xff000000 &&
-           frame_pixel(frame, 7, 0) == 0xffff0000);
+           frame_pixel(frame, 7, 0) == 0xffff0000 && surfaces.color.dirty &&
+           raw_color(1, 0) == 0xffff0000);
+    NV2AMetalSurfaceCache *cache = surfaces.cache;
+    NV2AMetalSubmission *textSubmission = cache.commands.lastSubmitted;
+    assert(copy_frame() == frame && cache.commands.lastSubmitted == textSubmission);
+    NSError *error = nil;
+    qemu_mutex_lock(&state->pgraph.lock);
+    require([cache prepareGPUWriteAtAddress:font + 'A' * 128 + 1
+                                     length:1 error:&error], error);
+    NV2AMetalSurfaceRecording *unusedLane = cache.recording;
+    qemu_mutex_unlock(&state->pgraph.lock);
+    assert(copy_frame() == frame && cache.recording == unusedLane &&
+           !unusedLane.submitted);
+    qemu_mutex_lock(&state->pgraph.lock);
+    [cache cancel];
+    qemu_mutex_unlock(&state->pgraph.lock);
+    cpu_write(font + 'A' * 128, 1);
+    state->vram_ptr[font + 'A' * 128] = 0xc1;
+    NV2AMetalFramebuffer *fontChanged = copy_frame();
+    assert(fontChanged.texture != frame.texture &&
+           frame_pixel(fontChanged, 1, 0) == 0xffff0000 &&
+           frame_pixel(frame, 1, 0) == 0xff000000);
+    cpu_write(font + 'A' * 128, 1);
+    state->vram_ptr[font + 'A' * 128] = 0x81;
     state->vga.sr[VGA_SEQ_CLOCK_MODE] = 8;
     NV2AMetalFramebuffer *wide = copy_frame();
     assert(wide.texture.width == 32 && frame_pixel(wide, 1, 0) == 0xffff0000 &&
@@ -13608,7 +14568,7 @@ static void vga_text_frames(void)
     state->vga.ar[VGA_ATC_MODE] = 4;
     state->vram_ptr[49152] = 0xb0;
     for (unsigned row = 0; row < 8; row++)
-        state->vram_ptr[2 + 0xb0 * 128 + row * 4] = 1;
+        state->vram_ptr[font + 0xb0 * 128 + row * 4] = 1;
     NV2AMetalFramebuffer *nine = copy_frame();
     assert(nine.texture.width == 18 && frame_pixel(nine, 8, 0) == 0xffff0000);
     state->vga.cr[VGA_CRTC_CURSOR_START] = 2;
@@ -13622,7 +14582,8 @@ static void vga_text_frames(void)
            frame_pixel(cursor, 2, 1) == 0xff000000);
     state->vga.cursor_visible_phase = false;
     NV2AMetalFramebuffer *off = copy_frame();
-    assert(frame_pixel(off, 2, 2) == 0xff000000);
+    assert(off.texture != cursor.texture &&
+           frame_pixel(off, 2, 2) == 0xff000000 && copy_frame() == off);
     state->vga.graphic_mode = 1;
     state->vga.cursor_visible_phase = false;
     NV2AMetalFramebuffer *blink = copy_frame();
@@ -13644,7 +14605,23 @@ static void vga_text_frames(void)
     assert(ldl_be_p(bytes + 16) == 18 && ldl_be_p(bytes + 20) == 16);
     free(png);
     xemu_metal4_set_capture_frame(NULL);
+
+    // Attribute bit 3 selects bank 0 for the second character. That bank
+    // also overlaps the pending render target and must make it visible.
+    state->vga.sr[VGA_SEQ_CHARACTER_MAP] = 0x10;
+    state->vga.palette[9 * 3 + 1] = 63;
+    cpu_write(49157, 1);
+    state->vram_ptr[49157] = 9;
+    cpu_write(2 + 'A' * 128, 1);
+    state->vram_ptr[2 + 'A' * 128] = 0x80;
+    NV2AMetalFramebuffer *two_fonts = copy_frame();
+    assert(frame_pixel(two_fonts, 9, 0) == 0xff00ff00 &&
+           !surfaces.color.dirty && raw_color(1, 0) == 0xff00ff00);
     stop_worker();
+    puts("VGA text reuse: stable cursor and unused font lane retain the frame; "
+         "glyph edits and blink changes refresh exact pixels PASS");
+    puts("VGA text read spans: a disjoint dirty surface stays on the GPU; "
+         "a selected font bank resolves an overlapping surface PASS");
     groups++;
 }
 static void registered_backend_startup(void)
@@ -13672,14 +14649,28 @@ static void registered_backend_startup(void)
     surfaces = draw.surfaces;
     state->vga.get_bpp = get_scan_bpp;
     scan_bpp = 32;
+    qemu_event_init(&worker_paused, false);
+    qemu_event_init(&worker_resume, false);
+    qatomic_set(&worker_pause, true);
     start_worker();
-    qemu_mutex_lock(&state->pgraph.renderer_lock);
-    void *handle = actual->ops.copy_framebuffer(state);
-    qemu_mutex_unlock(&state->pgraph.renderer_lock);
-    NV2AMetalFramebuffer *frame = (__bridge NV2AMetalFramebuffer *)handle;
+    assert(!copy_frame_from(actual->ops.copy_framebuffer));
+    qemu_event_wait(&worker_paused);
+    process_pending();
+    NSError *error = nil;
+    NV2AMetalCommands *commands = surfaces.cache.commands;
+    require([commands waitForSubmission:commands.lastSubmitted error:&error],
+            error);
+    assert(!copy_frame_from(actual->ops.copy_framebuffer));
+    process_pending();
+    NV2AMetalFramebuffer *frame = copy_frame_from(actual->ops.copy_framebuffer);
     assert(frame && frame.texture.width == 8 && frame.texture.height == 8);
-    nv2a_release_metal4_framebuffer(handle);
+    qatomic_set(&worker_pause, false);
+    qemu_event_set(&worker_resume);
     stop_worker();
+    qemu_event_destroy(&worker_paused);
+    qemu_event_destroy(&worker_resume);
+    puts("Scanout presentation startup: registered backend returns its "
+         "first completed frame PASS");
     groups++;
 }
 static void *request_global_frame(void *opaque)
@@ -13726,6 +14717,7 @@ static void global_frame_lifetime(void)
     start_worker();
     nv2a_set_surface_scale_factor(3);
     assert(nv2a_get_surface_scale_factor() == 3);
+    require(copy_frame() != nil, nil);
     void *owned = nv2a_copy_metal4_framebuffer();
     NV2AMetalFramebuffer *frame = (__bridge NV2AMetalFramebuffer *)owned;
     assert(frame);
@@ -13736,6 +14728,7 @@ static void global_frame_lifetime(void)
         stl_le_p(state->vram_ptr + i * 4, 0xff123456);
     after_ram_load();
     start_worker();
+    require(copy_frame() != nil, nil);
     void *restored = nv2a_copy_metal4_framebuffer();
     NV2AMetalFramebuffer *restored_frame =
         (__bridge NV2AMetalFramebuffer *)restored;
@@ -13753,12 +14746,11 @@ static void global_frame_lifetime(void)
     qemu_thread_create(&stopper, "metal-global-stop", stop_global_requests,
                        state, QEMU_THREAD_JOINABLE);
     qemu_event_wait(&host_stop_started);
-    assert(!qatomic_read(&host_stopped));
-    qatomic_set(&worker_pause, false);
-    qemu_event_set(&worker_resume);
     qemu_thread_join(&getter);
     qemu_thread_join(&stopper);
     assert(requested_frame && host_stopped && !g_nv2a);
+    qatomic_set(&worker_pause, false);
+    qemu_event_set(&worker_resume);
     assert(!nv2a_copy_metal4_framebuffer());
     assert(nv2a_get_surface_scale_factor() == 1);
     nv2a_set_surface_scale_factor(2);
@@ -13784,6 +14776,8 @@ static void global_frame_lifetime(void)
     nv2a_release_metal4_framebuffer(requested_frame);
     nv2a_release_metal4_framebuffer(restored);
     requested_frame = NULL;
+    puts("Scanout host lifetime: retained frames survive restore and shutdown; "
+         "the host getter and unpublish finish while PGRAPH is paused PASS");
     groups++;
 }
 static unsigned legacy_context_calls;
@@ -14608,13 +15602,33 @@ static void pending_save_capacity_tests(void)
                 for (NSData *bytes in archive.vertices)
                     for (NSUInteger i = 0; i < bytes.length; i++)
                         assert(((const uint8_t *)bytes.bytes)[i] == 0);
+                NV2AMetalSurfaceCache *roundtripCache = surfaces.cache;
+                NV2AMetalCommands *roundtripCommands = roundtripCache.commands;
+                BOOL recordingBefore = roundtripCache.recording != nil;
+                NSUInteger tokensBefore =
+                    [[roundtripCache valueForKey:@"sealedTokens"] count];
+                NSUInteger sealedBefore = roundtripCommands.sealedBufferCount;
+                uint64_t batchBefore = roundtripCommands.batchSerial;
+                NV2AMetalCommands *snapshotCommands = [[NV2AMetalCommands alloc]
+                    initWithDevice:roundtripCommands.device
+                             error:&error];
+                require(snapshotCommands != nil, error);
                 NV2AMetalPendingJournal *restored = nv2a_metal_pending_restore(
-                    archive, surfaces.cache.commands, NSUIntegerMax, &error);
+                    archive, snapshotCommands, NSUIntegerMax, &error);
                 require(restored != nil, error);
                 NV2AMetalPendingArchive *again = nv2a_metal_pending_capture(
-                    restored, surfaces.cache.commands, &error);
+                    restored, snapshotCommands, &error);
                 require(again != nil, error);
                 assert([again.data isEqualToData:archive.data]);
+                BOOL recordingAfter = roundtripCache.recording != nil;
+                NSUInteger tokensAfter =
+                    [[roundtripCache valueForKey:@"sealedTokens"] count];
+                assert(recordingAfter == recordingBefore &&
+                       recordingAfter ==
+                           (roundtripCommands.commandBuffer != nil) &&
+                       tokensAfter == tokensBefore &&
+                       roundtripCommands.sealedBufferCount == sealedBefore &&
+                       roundtripCommands.batchSerial == batchBefore);
                 printf(
                     "Capacity exact boundary: %lu transformed vertices, "
                     "%lu canonical snapshot bytes, private GPU restore/capture "
@@ -14788,7 +15802,7 @@ static BOOL blit_write_probe(id object, SEL selector, NSUInteger address,
 static void blit_coherence_tests(void)
 {
     Method registration = class_getInstanceMethod(NV2AMetalSurfaceCache.class,
-        @selector(prepareGPUWriteAtAddress:length:error:));
+        sel_registerName("registerGPUWriteAtAddress:length:error:"));
     assert(registration);
     blit_write_captures = 0;
     blit_write_original = (void *)method_setImplementation(registration,
@@ -14798,10 +15812,12 @@ static void blit_coherence_tests(void)
     blit_surface_alias();
     blit_validation();
     blit_submission_tests();
+    blit_destination_reader_test();
     method_setImplementation(registration, (IMP)blit_write_original);
-    assert(blit_write_captures == 64);
-    puts("PGRAPH blit coherence:64 real destination registrations protect "
+    assert(blit_write_captures == 65);
+    puts("PGRAPH blit coherence:65 real destination registrations protect "
          "CPU reads/writes; full RAM format/operation/tail/alias and validation PASS");
+    blit_overwrite_tests();
 }
 
 #include "test-metal-pending-locks.h"
@@ -14813,6 +15829,8 @@ int main(int argc, char **argv)
 {
     bool pendingLocks = argc == 2 && !strcmp(argv[1], "--pending-locks");
     bool reportsOnly = argc == 2 && !strcmp(argv[1], "--reports");
+    bool scanoutOnly = argc == 2 && !strcmp(argv[1], "--scanout-submission");
+    bool clearBindings = argc == 2 && !strcmp(argv[1], "--clear-bindings");
 #ifdef NV2A_METAL_REPORT_FILE_TEST
     bool reportFileOnly = argc == 2 && !strcmp(argv[1], "--report-file");
 #else
@@ -14838,7 +15856,8 @@ int main(int argc, char **argv)
     bool cubeBRDF = argc == 2 && !strcmp(argv[1], "--hilo16-cube-brdf-begin");
     bool volumeBRDF =
         argc == 2 && !strcmp(argv[1], "--hilo16-volume-brdf-begin");
-    assert(argc == 1 || pendingLocks || reportsOnly || reportFileOnly || surfaceRelease ||
+    assert(argc == 1 || scanoutOnly || clearBindings || pendingLocks ||
+           reportsOnly || reportFileOnly || surfaceRelease ||
            packedFloatCurrent || blitCoherence || facingParity || xfRestore ||
            prefixRotations || arrayCurrent || xfBoundaries || stateBoundaries ||
            idx || cubeAF || cubeDot || cubeLookup || cubeBRDF || volumeBRDF);
@@ -14849,9 +15868,9 @@ int main(int argc, char **argv)
     @autoreleasepool {
         state = g_new0(NV2AState, 1);
         state->vram = g_new0(MemoryRegion, 1);
-        assert(
-            !posix_memalign((void **)&state->vram_ptr, getpagesize(), 65536));
-        memset(state->vram_ptr, 0, 65536);
+        assert(!posix_memalign((void **)&state->vram_ptr, getpagesize(),
+                               TEST_VRAM_CAPACITY));
+        memset(state->vram_ptr, 0, TEST_VRAM_CAPACITY);
         qemu_mutex_init(&state->pgraph.lock);
         qemu_mutex_init(&state->pgraph.renderer_lock);
         qemu_mutex_init(&state->pfifo.lock);
@@ -14878,6 +15897,39 @@ int main(int argc, char **argv)
             qemu_mutex_unlock(&state->pgraph.lock);
             goto cleanup;
         }
+        if (scanoutOnly || clearBindings) {
+            if (clearBindings) {
+                clear_inside_begin_upload();
+                clear_inside_begin();
+                restored_binding_metadata();
+                clear_zero_binding_changes();
+                clear_aa_swizzle_begin();
+                depth_replace_snapshot();
+            } else {
+                scanout_reuse();
+                scanout_presentation();
+                scanout_target_pool();
+                scanout_frames();
+                scanout_overlay();
+                scanout_capture_guards();
+                vga_ram_frames();
+                vga_split_and_repeat();
+                vga_unused_graphics_lanes();
+                vga_gpu_owned_ram();
+                vga_graphics_startup();
+                vga_target_pool();
+                vga_text_frames();
+                registered_backend_startup();
+                global_frame_lifetime();
+                goto cleanup;
+            }
+            qemu_mutex_lock(&state->pgraph.lock);
+            draw = nil;
+            surfaces = nil;
+            renderer.ops.finalize(state);
+            qemu_mutex_unlock(&state->pgraph.lock);
+            goto cleanup;
+        }
         if (pendingLocks) {
             pending_lock_tests();
             lifecycle();
@@ -14893,6 +15945,7 @@ int main(int argc, char **argv)
         }
         if (reportsOnly) {
             report_queue();
+            report_submission_scope();
             report_rejections();
             report_flush_and_retry();
             report_scale_and_lifecycle();
@@ -15032,6 +16085,7 @@ int main(int argc, char **argv)
         surface_registers_preserve_begin();
         explicit_surface_rebind();
         explicit_attachment_masks();
+        clear_inside_begin_upload();
         clear_inside_begin();
         restored_binding_metadata();
         clear_zero_binding_changes();
@@ -15096,6 +16150,7 @@ int main(int argc, char **argv)
         submitted_download_restore();
         restored_active_block();
         report_queue();
+        report_submission_scope();
         report_rejections();
         report_flush_and_retry();
         report_scale_and_lifecycle();
@@ -15122,15 +16177,21 @@ int main(int argc, char **argv)
         blit_surface_alias();
         blit_validation();
         blit_submission_tests();
+        blit_destination_reader_test();
+        blit_overwrite_tests();
         scanout_reuse();
+        scanout_presentation();
+        scanout_target_pool();
         scanout_frames();
         scanout_overlay();
         scanout_capture_guards();
         pending_lock_tests();
         vga_ram_frames();
         vga_split_and_repeat();
+        vga_unused_graphics_lanes();
         vga_gpu_owned_ram();
         vga_graphics_startup();
+        vga_target_pool();
         vga_text_frames();
         additive_backend_selection();
         registered_backend_startup();

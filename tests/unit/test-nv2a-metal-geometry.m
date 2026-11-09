@@ -423,6 +423,58 @@ static void w_slope_range(NV2AMetalCommands *commands,
         cases, count);
 }
 
+static void lazy_geometry_pipeline_test(NV2AMetalCommands *commands,
+                                        NV2AMetalGeometry *geometry,
+                                        id<MTLBuffer> input,
+                                        const NV2AMetalVertex *source)
+{
+    NSError *error = nil;
+    require([commands beginWithError:&error] != nil, error);
+    const NV2AMetalGeometryRasterConfig config = {
+        .front = NV2AMetalPolygonFill, .back = NV2AMetalPolygonFill,
+        .lineWidth = 1,
+    };
+    NSArray<NV2AMetalGeometryResult *> *direct =
+        [geometry encodeNativeRasterVertices:input count:3
+                                    primitive:NV2AMetalPrimitiveTriangles
+                                       config:&config smooth:YES
+                               firstProvoking:NO zPerspective:NO
+                                     commands:commands error:&error];
+    require(direct.count == 1, error);
+    assert(direct[0].directTriangles && direct[0].vertices == input);
+    NV2AMetalGeometryResult *empty =
+        expand(commands, geometry, input, 1, NV2AMetalPrimitiveLineStrip,
+               NV2AMetalPolygonFill, YES, NO, NO);
+    assert(!empty.vertexCount && ![geometry valueForKey:@"module"]);
+    NV2AMetalGeometryResult *lines =
+        expand(commands, geometry, input, 3, NV2AMetalPrimitiveLineStrip,
+               NV2AMetalPolygonFill, YES, NO, NO);
+    id module = [geometry valueForKey:@"module"];
+    assert(module && ![geometry valueForKey:@"polygonFacing"] &&
+           [[module valueForKey:@"computeBuildCount"] unsignedIntegerValue] == 1);
+    finish(commands);
+    const unsigned lineOrder[] = { 0, 1, 1, 2 };
+    check_vertices(lines, source, lineOrder, 4, MTLPrimitiveTypeLine);
+
+    NV2AMetalGeometry *other =
+        [[NV2AMetalGeometry alloc] initWithDevice:commands.device error:&error];
+    require(other != nil, error);
+    require([commands beginWithError:&error] != nil, error);
+    NV2AMetalGeometryResult *polygon =
+        expand(commands, other, input, 4, NV2AMetalPrimitivePolygon,
+               NV2AMetalPolygonFill, YES, NO, NO);
+    assert([other valueForKey:@"module"] == module &&
+           [other valueForKey:@"pipeline"] == [geometry valueForKey:@"pipeline"] &&
+           [other valueForKey:@"arguments"] != [geometry valueForKey:@"arguments"] &&
+           [other valueForKey:@"polygonFacing"] &&
+           [[module valueForKey:@"computeBuildCount"] unsignedIntegerValue] == 2);
+    finish(commands);
+    const unsigned polygonOrder[] = { 0, 1, 2, 0, 2, 3 };
+    check_vertices(polygon, source, polygonOrder, 6, MTLPrimitiveTypeTriangle);
+    puts("Geometry shader startup: direct and empty draws compile nothing; "
+         "expansion and polygon facing build once on demand PASS");
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -459,6 +511,7 @@ int main(void)
                                          length:sizeof(source)
                                         options:MTLResourceStorageModeShared];
         assert(input);
+        lazy_geometry_pipeline_test(commands, geometry, input, source);
         const struct {
             enum NV2AMetalPrimitive primitive;
             unsigned count;

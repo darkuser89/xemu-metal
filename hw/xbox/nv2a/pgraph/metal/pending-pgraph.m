@@ -8,6 +8,7 @@
 #pragma clang diagnostic pop
 #import "pending-pgraph.h"
 #import "vertex-fetch.h"
+#import <objc/runtime.h>
 static NSArray *input_error(NSError **error, NSString *message)
 {
     if (error)
@@ -16,6 +17,17 @@ static NSArray *input_error(NSError **error, NSString *message)
                                 code:1
                             userInfo:@{ NSLocalizedDescriptionKey : message }];
     return nil;
+}
+static NSArray *reuse_inline_input(NSArray *previous, NV2AMetalInputKind kind,
+                                   NSUInteger count)
+{
+    if (previous.count != 1)
+        return nil;
+    NV2AMetalPendingInput *old = previous[0];
+    if (object_getClass(old) != NV2AMetalPendingInput.class ||
+        old.kind != kind || old.count != count)
+        return nil;
+    return [previous copy];
 }
 @implementation NV2AMetalPGRAPHPendingInputs
 + (NSArray<NV2AMetalPendingInput *> *)inputsWithState:(PGRAPHState *)pg
@@ -39,6 +51,18 @@ static NSArray *input_error(NSError **error, NSString *message)
     if (kinds != 1)
         return input_error(error, @"Conflicting pending PGRAPH input kinds");
     if (pg->draw_arrays_length) {
+        BOOL unchanged = previous.count == pg->draw_arrays_length;
+        for (unsigned i = 0; unchanged && i < pg->draw_arrays_length; i++) {
+            NV2AMetalPendingInput *old = previous[i];
+            unchanged = [old isKindOfClass:NV2AMetalPendingInput.class] &&
+                        old.kind == NV2AMetalInputArrays &&
+                        pg->draw_arrays_start[i] >= 0 &&
+                        pg->draw_arrays_count[i] > 0 &&
+                        old.first == (NSUInteger)pg->draw_arrays_start[i] &&
+                        old.count == (NSUInteger)pg->draw_arrays_count[i];
+        }
+        if (unchanged)
+            return [previous copy];
         NSMutableArray *inputs = [NSMutableArray new];
         for (unsigned i = 0; i < pg->draw_arrays_length; i++) {
             int32_t first = pg->draw_arrays_start[i],
@@ -59,11 +83,18 @@ static NSArray *input_error(NSError **error, NSString *message)
             indexedBytes:pg->inline_elements
                    count:pg->inline_elements_length
         matchingPrevious:previous.count == 1 ? previous[0] : nil];
+        if (previous.count == 1 && input == previous[0])
+            return [previous copy];
         return @[ input ];
     }
-    if (pg->inline_buffer_length)
+    if (pg->inline_buffer_length) {
+        NSArray *same = reuse_inline_input(previous, NV2AMetalInputInlineBuffer,
+                                           pg->inline_buffer_length);
+        if (same)
+            return same;
         return @[ [NV2AMetalPendingInput inlineKind:NV2AMetalInputInlineBuffer
                                               count:pg->inline_buffer_length] ];
+    }
     NSUInteger stride = 0;
     for (unsigned i = 0; i < 16; i++) {
         const VertexAttribute *a = &pg->vertex_attributes[i];
@@ -83,6 +114,10 @@ static NSArray *input_error(NSError **error, NSString *message)
     NSUInteger count = (NSUInteger)pg->inline_array_length * 4 / stride;
     if (!count)
         return input_error(error, @"Incomplete pending packed inline vertex");
+    NSArray *same =
+        reuse_inline_input(previous, NV2AMetalInputInlineArray, count);
+    if (same)
+        return same;
     return @[ [NV2AMetalPendingInput inlineKind:NV2AMetalInputInlineArray
                                           count:count] ];
 }

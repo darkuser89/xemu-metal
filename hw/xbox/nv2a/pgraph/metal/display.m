@@ -59,12 +59,19 @@ static BOOL display_error(NSError **error, NSString *message)
         return nil;
     }
 
+    return self;
+}
+
+- (BOOL)prepareDisplayWithError:(NSError **)error
+{
+    if (_pipeline)
+        return YES;
     MTL4CompilerDescriptor *compilerDescriptor = [MTL4CompilerDescriptor new];
     compilerDescriptor.label = @"NV2A display compiler";
     id<MTL4Compiler> compiler =
         [_device newCompilerWithDescriptor:compilerDescriptor error:error];
     if (!compiler) {
-        return nil;
+        return NO;
     }
     MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
     libraryDescriptor.source = @(metal_shader_source);
@@ -74,7 +81,7 @@ static BOOL display_error(NSError **error, NSString *message)
     id<MTLLibrary> library =
         [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
     if (!library) {
-        return nil;
+        return NO;
     }
     MTL4LibraryFunctionDescriptor *vertex = [MTL4LibraryFunctionDescriptor new];
     vertex.library = library;
@@ -88,15 +95,15 @@ static BOOL display_error(NSError **error, NSString *message)
     pipelineDescriptor.label = @"NV2A framebuffer gamma and scaling";
     pipelineDescriptor.vertexFunctionDescriptor = vertex;
     pipelineDescriptor.fragmentFunctionDescriptor = fragment;
-    pipelineDescriptor.colorAttachments[0].pixelFormat = pixelFormat;
+    pipelineDescriptor.colorAttachments[0].pixelFormat = _pixelFormat;
     pipelineDescriptor.inputPrimitiveTopology =
         MTLPrimitiveTopologyClassTriangle;
-    _pipeline =
+    id<MTLRenderPipelineState> pipeline =
         [compiler newRenderPipelineStateWithDescriptor:pipelineDescriptor
                                    compilerTaskOptions:nil
                                                  error:error];
-    if (!_pipeline) {
-        return nil;
+    if (!pipeline) {
+        return NO;
     }
 
     MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
@@ -105,21 +112,24 @@ static BOOL display_error(NSError **error, NSString *message)
     sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
     sampler.minFilter = MTLSamplerMinMagFilterNearest;
     sampler.magFilter = MTLSamplerMinMagFilterNearest;
-    _nearest = [_device newSamplerStateWithDescriptor:sampler];
+    id<MTLSamplerState> nearest = [_device newSamplerStateWithDescriptor:sampler];
     sampler.minFilter = MTLSamplerMinMagFilterLinear;
     sampler.magFilter = MTLSamplerMinMagFilterLinear;
-    _linear = [_device newSamplerStateWithDescriptor:sampler];
+    id<MTLSamplerState> linear = [_device newSamplerStateWithDescriptor:sampler];
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 1;
     arguments.maxTextureBindCount = 1;
     arguments.maxSamplerStateBindCount = 1;
     arguments.initializeBindings = YES;
-    _arguments = [_device newArgumentTableWithDescriptor:arguments error:error];
-    if (!_nearest || !_linear || !_arguments) {
-        display_error(error, @"Could not allocate Metal display bindings");
-        return nil;
-    }
-    return self;
+    id<MTL4ArgumentTable> table =
+        [_device newArgumentTableWithDescriptor:arguments error:error];
+    if (!nearest || !linear || !table)
+        return display_error(error, @"Could not allocate Metal display bindings");
+    _nearest = nearest;
+    _linear = linear;
+    _arguments = table;
+    _pipeline = pipeline;
+    return YES;
 }
 
 - (BOOL)encodeWithCommands:(NV2AMetalCommands *)commands
@@ -159,6 +169,8 @@ static BOOL display_error(NSError **error, NSString *message)
           source.pixelFormat != MTLPixelFormatRGBA32Float))) {
         return display_error(error, @"Invalid Metal display source");
     }
+    if (!screenOff && ![self prepareDisplayWithError:error])
+        return NO;
     if (![commands addResource:target error:error] ||
         ![commands keepAlive:self error:error]) {
         return NO;
@@ -169,18 +181,15 @@ static BOOL display_error(NSError **error, NSString *message)
         captured.reserved = source.pixelFormat == MTLPixelFormatRGBA32Float ?
                                 (linear ? 2 : 1) :
                                 0;
-        id<MTLBuffer> constants =
-            [_device newBufferWithBytes:&captured
-                                 length:sizeof(captured)
-                                options:MTLResourceStorageModeShared];
-        if (!constants) {
-            return display_error(error, @"Could not allocate display uniforms");
-        }
-        if (![commands addResource:source error:error] ||
-            ![commands addResource:constants error:error]) {
+        NSUInteger offset;
+        id<MTLBuffer> constants = [commands uploadBytes:&captured
+                                                 length:sizeof(captured)
+                                                 offset:&offset
+                                                  error:error];
+        if (!constants || ![commands addResource:source error:error]) {
             return NO;
         }
-        [_arguments setAddress:constants.gpuAddress atIndex:0];
+        [_arguments setAddress:constants.gpuAddress + offset atIndex:0];
         [_arguments setTexture:source.gpuResourceID atIndex:0];
         [_arguments setSamplerState:(linear ? _linear : _nearest).gpuResourceID
                             atIndex:0];

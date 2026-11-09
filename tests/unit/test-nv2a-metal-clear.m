@@ -1,6 +1,7 @@
 /* Native masked-clear GPU tests, without a window or application.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "hw/xbox/nv2a/pgraph/metal/clear.h"
+#import "hw/xbox/nv2a/pgraph/metal/color-format.h"
 #import "hw/xbox/nv2a/pgraph/metal/lru-cache.h"
 #include <assert.h>
 #include <stdint.h>
@@ -151,6 +152,97 @@ static const MTLScissorRect rects[] = {
     { NSUIntegerMax, 3, 1, 1 },
     { 0, 0, 0, 2 },
 };
+static void load_clear_color_tests(void)
+{
+    NSError *error = nil;
+    NV2AMetalLRUCache *cache = [clearer valueForKey:@"pipelines"];
+    const MTLPixelFormat formats[] = {
+        MTLPixelFormatR8Unorm,     MTLPixelFormatRG8Unorm,
+        MTLPixelFormatRGBA8Unorm,  MTLPixelFormatBGRA8Unorm,
+        MTLPixelFormatB5G6R5Unorm, MTLPixelFormatBGR5A1Unorm
+    };
+    const unsigned bytes[] = { 1, 2, 4, 4, 2, 2 };
+    unsigned cases = 0;
+    assert(![clearer valueForKey:@"compiler"] &&
+           ![clearer valueForKey:@"library"] &&
+           ![clearer valueForKey:@"arguments"]);
+    for (unsigned samples = 1; samples <= 4; samples *= 2) {
+        for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+            @autoreleasepool {
+                id<MTLTexture> native = texture(formats[f], samples);
+                id<MTLTexture> shader = texture(formats[f], samples);
+                unsigned bits[4];
+                nv2a_metal_color_bits(formats[f], bits);
+                for (unsigned n = 0; n < 4; n++) {
+                    NV2AMetalClearConfig c = {
+                        .parameter = NV097_CLEAR_SURFACE_COLOR,
+                        .rect = { 0, 0, 9, 12 },
+                    };
+                    for (unsigned i = 0; i < 4 && bits[i]; i++) {
+                        unsigned maximum = (1u << bits[i]) - 1;
+                        c.uniforms.color[i] =
+                            (float)((n * 37 + i * 17) & maximum) / maximum;
+                    }
+                    initialize(native, nil, MTLClearColorMake(1, 1, 1, 1), 0,
+                               0);
+                    NSUInteger lookups = cache.hitCount + cache.missCount;
+                    require([clearer encodeColor:native
+                                            zeta:nil
+                                          config:&c
+                                        commands:commands
+                                           error:&error],
+                            error);
+                    assert(cache.hitCount + cache.missCount == lookups);
+                    if (!cases)
+                        assert(![clearer valueForKey:@"compiler"] &&
+                               ![clearer valueForKey:@"library"] &&
+                               ![clearer valueForKey:@"arguments"]);
+                    id<MTLTexture> actual = resolve(native);
+                    finish();
+                    initialize(shader, nil, MTLClearColorMake(0, 0, 0, 0), 0,
+                               0);
+                    c.rect = (MTLScissorRect){ 0, 0, 4, 8 };
+                    for (unsigned x = 0; x < 8; x += 4) {
+                        c.rect.x = x;
+                        require([clearer encodeColor:shader
+                                                zeta:nil
+                                              config:&c
+                                            commands:commands
+                                               error:&error],
+                                error);
+                    }
+                    assert(cache.hitCount + cache.missCount == lookups + 2);
+                    if (!cases)
+                        assert([clearer valueForKey:@"compiler"] &&
+                               [clearer valueForKey:@"library"] &&
+                               [clearer valueForKey:@"arguments"]);
+                    id<MTLTexture> expected = resolve(shader);
+                    finish();
+                    uint8_t a[8 * 8 * 4], b[sizeof(a)];
+                    const MTLRegion region = MTLRegionMake2D(0, 0, 8, 8);
+                    NSUInteger row = 8 * bytes[f];
+                    [actual getBytes:a
+                         bytesPerRow:row
+                          fromRegion:region
+                         mipmapLevel:0];
+                    [expected getBytes:b
+                           bytesPerRow:row
+                            fromRegion:region
+                           mipmapLevel:0];
+                    assert(!memcmp(a, b, row * 8));
+                    cases++;
+                }
+            }
+        }
+    }
+    assert(cases == 72);
+    puts("Metal 4 clear shader startup: first load clear keeps compiler, "
+         "library and arguments unallocated; first shader clear initializes "
+         "PASS");
+    printf("Metal 4 load clear: %u byte-exact color pairs, 1/2/4 samples, "
+           "clipped full rectangles; zero clear pipeline lookups PASS\n",
+           cases);
+}
 static void color_tests(void)
 {
     NSError *error = nil;
@@ -267,6 +359,7 @@ static id<MTLBuffer> read_zeta(id<MTLTexture> zeta, BOOL stencil)
 static void depth_tests(void)
 {
     NSError *error = nil;
+    NV2AMetalLRUCache *cache = [clearer valueForKey:@"pipelines"];
     const MTLPixelFormat formats[] = { MTLPixelFormatDepth16Unorm,
                                        MTLPixelFormatDepth32Float,
                                        MTLPixelFormatDepth32Float_Stencil8 };
@@ -287,15 +380,31 @@ static void depth_tests(void)
                             .stencil = 0x15a,
                             .uniforms = { .color = { 0 }, .depth = values[v] }
                         };
+                        NSUInteger lookups = cache.hitCount + cache.missCount;
                         require([clearer encodeColor:attached ? color : nil
                                                 zeta:depth
                                               config:&c
                                             commands:commands
                                                error:&error],
                                 error);
+                        if (!rectangle && (flags & NV097_CLEAR_SURFACE_Z)) {
+                            BOOL needsShader =
+                                f == 0 && values[v] > 0 && values[v] < 1;
+                            assert(cache.hitCount + cache.missCount ==
+                                   lookups + needsShader);
+                        }
                         id<MTLBuffer> z = read_zeta(depth, NO);
                         id<MTLBuffer> s = f == 2 ? read_zeta(depth, YES) : nil;
                         finish();
+                        if (attached && !rectangle) {
+                            float rgba[4];
+                            const float initial[] = { .1f, .2f, .3f, .4f };
+                            [color getBytes:rgba
+                                bytesPerRow:sizeof(rgba)
+                                 fromRegion:MTLRegionMake2D(0, 0, 1, 1)
+                                mipmapLevel:0];
+                            assert(!memcmp(rgba, initial, sizeof(rgba)));
+                        }
                         const unsigned char *raw = z.contents;
                         const unsigned char *st = s.contents;
                         for (unsigned y = 0; y < 8; y++) {
@@ -574,21 +683,38 @@ static void reject_tests(void)
             error);
     [commands cancel];
 }
-int main(void)
+
+#include "test-metal-clear-raster-continuation.h"
+
+int main(int argc, char **argv)
 {
+    BOOL loadOnly = argc == 2 && !strcmp(argv[1], "--load-clear");
+    BOOL continuationOnly =
+        argc == 2 && !strcmp(argv[1], "--clear-raster-continuation");
+    assert(argc == 1 || loadOnly || continuationOnly);
     @autoreleasepool {
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
-        pipeline_cache_test();
+        if (!loadOnly && !continuationOnly)
+            pipeline_cache_test();
         clearer = [[NV2AMetalClear alloc] initWithDevice:commands.device
                                                    error:&error];
         require(clearer != nil, error);
-        color_tests();
+        if (continuationOnly) {
+            clear_raster_continuation_tests();
+            return 0;
+        }
+        load_clear_color_tests();
+        if (!loadOnly)
+            color_tests();
         depth_tests();
         multisample_depth_tests();
-        snapshot_test();
-        reject_tests();
+        if (!loadOnly) {
+            snapshot_test();
+            reject_tests();
+            clear_raster_continuation_tests();
+        }
         printf("Metal 4 native clear: %u masked/scissored/MSAA/depth/stencil "
                "cases PASS\n",
                draws);

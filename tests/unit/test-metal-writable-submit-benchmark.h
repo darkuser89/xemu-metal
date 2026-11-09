@@ -30,14 +30,17 @@ static double submit_now(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 typedef id (*SubmitCaptureIMP)(id __attribute__((ns_consumed)), SEL,
-                               PGRAPHState *, NSError **)
+                               PGRAPHState *, NV2AMetalPGRAPHVertexState *,
+                               NSError **)
     __attribute__((ns_returns_retained));
 static SubmitCaptureIMP submit_original_capture;
 static id submit_capture(id object __attribute__((ns_consumed)), SEL selector,
-                         PGRAPHState *pg, NSError **error)
+                         PGRAPHState *pg, NV2AMetalPGRAPHVertexState *previous,
+                         NSError **error)
     __attribute__((ns_returns_retained));
 static id submit_capture(id object __attribute__((ns_consumed)), SEL selector,
-                         PGRAPHState *pg, NSError **error)
+                         PGRAPHState *pg, NV2AMetalPGRAPHVertexState *previous,
+                         NSError **error)
 {
     if (submit_sample) {
         submit_sample.captures++;
@@ -51,7 +54,7 @@ static id submit_capture(id object __attribute__((ns_consumed)), SEL selector,
             return nil;
         }
     }
-    return submit_original_capture(object, selector, pg, error);
+    return submit_original_capture(object, selector, pg, previous, error);
 }
 static BOOL (*submit_original_submit)(id, SEL, NSError **);
 static BOOL submit_count(id object, SEL selector, NSError **error)
@@ -187,8 +190,9 @@ static NSDictionary *submit_medians(NSArray<NSDictionary *> *samples)
 }
 static void writable_submit_benchmark(BOOL nonwriting)
 {
-    Method capture = class_getInstanceMethod(NV2AMetalPGRAPHVertexState.class,
-                                             @selector(initWithState:error:));
+    Method capture = class_getInstanceMethod(
+        NV2AMetalPGRAPHVertexState.class,
+        @selector(initWithState:reusingProgramFrom:error:));
     Method begin = class_getInstanceMethod(NV2AMetalCommands.class,
                                            @selector(beginWithError:));
     Method submit = class_getInstanceMethod(NV2AMetalCommands.class,
@@ -268,7 +272,7 @@ static void writable_submit_benchmark(BOOL nonwriting)
             NSMutableArray *measurements[2] = { [NSMutableArray new],
                                                 [NSMutableArray new] };
             unsigned referenceSubmits = 0, referenceWaits = 0,
-                     nativeSubmits = 0;
+                     nativeSubmits = 0, nativeWaits = 0;
             unsigned nativeTimed = 0, referenceTimed = 0;
             for (unsigned trial = 0; trial < 11; trial++) {
                 NSData *images[2], *constants[2], *dirty[2], *current[2],
@@ -311,36 +315,46 @@ static void writable_submit_benchmark(BOOL nonwriting)
                         require([surfaces.cache waitUntilIdleWithError:&error],
                                 error);
                         result.retireSeconds = submit_now() - t;
+                        unsigned expectedSubmits =
+                            reference ? ranges + 2 : nonwriting ? 1 : 2;
+                        unsigned expectedBegins =
+                            expectedSubmits + (!reference && nonwriting);
+                        unsigned expectedWaits =
+                            reference ? ranges + 1 : nonwriting ? 0 : 1;
                         if (!(result.denied == reference &&
                               result.captures == 2 &&
                               result.serialEpochs == (reference ? ranges : 0) &&
-                              result.begins == result.submits &&
-                              result.feedbacks == result.submits)) {
+                              result.begins == expectedBegins &&
+                              result.submits == expectedSubmits &&
+                              result.waits == expectedWaits &&
+                              result.feedbacks == expectedSubmits)) {
                             fprintf(stderr,
                                     "Submit observer:ranges%u vertices%u "
                                     "reference%u trial%u denied%u captures%u "
-                                    "epochs%u begins%u submits%u feedbacks%u\n",
+                                    "epochs%u begins%u submits%u waits%u "
+                                    "feedbacks%u\n",
                                     ranges, perRange, reference, trial,
                                     result.denied, result.captures,
                                     result.serialEpochs, result.begins,
-                                    result.submits, result.feedbacks);
+                                    result.submits, result.waits,
+                                    result.feedbacks);
                         }
                         assert(result.denied == reference &&
                                result.captures == 2 &&
                                result.serialEpochs ==
                                    (reference ? ranges : 0) &&
-                               result.begins == result.submits &&
-                               result.feedbacks == result.submits);
+                               result.begins == expectedBegins &&
+                               result.submits == expectedSubmits &&
+                               result.waits == expectedWaits &&
+                               result.feedbacks == expectedSubmits);
                         if (reference) {
                             referenceSubmits = result.submits;
                             referenceWaits = result.waits;
                             referenceTimed = result.timedFeedbacks;
-                            assert(result.submits == ranges + 3 &&
-                                   result.waits == ranges + 1);
                         } else {
                             nativeSubmits = result.submits;
+                            nativeWaits = result.waits;
                             nativeTimed = result.timedFeedbacks;
-                            assert(result.submits == 2 && result.waits == 1);
                         }
                         expect_context(191, 15, ranges * perRange, !nonwriting);
                         constants[reference] =
@@ -359,7 +373,7 @@ static void writable_submit_benchmark(BOOL nonwriting)
                                                   error:&error] &&
                                     [draw.reports processWithError:&error],
                                 error);
-                        samples[reference] = reported;
+                        samples[reference] = report_value(0);
                         assert(samples[reference]);
                         qemu_mutex_unlock(&pg->lock);
                         read_vram(1024, 256);
@@ -385,7 +399,7 @@ static void writable_submit_benchmark(BOOL nonwriting)
                 @"nonwriting" : @(nonwriting),
                 @"ranges" : @(ranges),
                 @"vertices_per_range" : @(perRange),
-                @"native_submits_waits" : @[ @(nativeSubmits), @1 ],
+                @"native_submits_waits" : @[ @(nativeSubmits), @(nativeWaits) ],
                 @"reference_submits_waits" :
                     @[ @(referenceSubmits), @(referenceWaits) ],
                 @"timed_gpu_feedbacks_native_reference" :

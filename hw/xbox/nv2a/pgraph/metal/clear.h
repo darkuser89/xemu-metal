@@ -15,6 +15,23 @@ typedef struct NV2AMetalClearConfig {
     BOOL dither;
 } NV2AMetalClearConfig;
 
+typedef struct NV2AMetalClearAttachmentLayout {
+    MTLPixelFormat pixel_format;
+    NSUInteger width, height;
+} NV2AMetalClearAttachmentLayout;
+
+/* Metadata-only form preserves absent attachments without borrowing textures.
+ */
+BOOL nv2a_metal_clear_layout_uses_load_actions(
+    const NV2AMetalClearAttachmentLayout *_Nullable color,
+    const NV2AMetalClearAttachmentLayout *_Nullable zeta,
+    const NV2AMetalClearConfig *config);
+
+/* Query the load-clear path for already selected, compatible attachments. */
+BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> _Nullable color,
+                                        id<MTLTexture> _Nullable zeta,
+                                        const NV2AMetalClearConfig *config);
+
 /* Native render clear with masks and scissor, independent of draw-state
  * blend/tests/window-clip/offset. The frontend captures the original clear
  * color/depth helpers and scales the inclusive rectangle by AA and surface
@@ -34,6 +51,20 @@ API_AVAILABLE(macos(26.0))
 - (BOOL)encodeColor:(nullable id<MTLTexture>)color
                zeta:(nullable id<MTLTexture>)zeta
              config:(const NV2AMetalClearConfig *_Nullable)config
+           commands:(NV2AMetalCommands *)commands
+              error:(NSError *_Nullable *_Nullable)error;
+/* Pure eligibility on a detached pending pass. Actual attachments and the
+ * complete command-pass match are checked again before encoding. */
+- (BOOL)canContinueRasterPass:(nullable MTL4RenderPassDescriptor *)pass
+                       config:(const NV2AMetalClearConfig *_Nullable)config;
+/* Shader clear in an already prepared compatible raster section. The owner
+ * validates dependencies and retains the parent visibility descriptor;
+ * this encoder disables counting and never reserves a query counter.
+ * Load-clears continue to use the standalone entry above. */
+- (BOOL)encodeColor:(nullable id<MTLTexture>)color
+               zeta:(nullable id<MTLTexture>)zeta
+             config:(const NV2AMetalClearConfig *_Nullable)config
+         rasterPass:(MTL4RenderPassDescriptor *)pass
            commands:(NV2AMetalCommands *)commands
               error:(NSError *_Nullable *_Nullable)error;
 @end

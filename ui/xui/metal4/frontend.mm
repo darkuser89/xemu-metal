@@ -4,21 +4,31 @@
 #import "imgui-renderer.h"
 #import "decal.h"
 #import "hw/xbox/nv2a/pgraph/metal/scanout-pgraph.h"
+#include "hw/xbox/nv2a/pgraph/metal/texture-alias.h"
 #include <imgui.h>
 #include <cmath>
+#include <vector>
 
-@interface XemuMetal4Frontend : NSObject
+struct XemuMetal4TargetState {
+    id<MTLTexture> texture;
+    bool needsInitialClear;
+};
+
+@interface XemuMetal4Frontend : NSObject {
+@public
+    std::vector<XemuMetal4TargetState> targets;
+}
 @property(nonatomic, strong) NV2AMetalCommands *commands;
 @property(nonatomic, strong) XemuMetal4Window *window;
 @property(nonatomic, strong) XemuMetal4ImGui *imgui;
 @property(nonatomic, strong) NV2AMetalFramebuffer *frame;
 @property(nonatomic, strong) id<MTLTexture> target;
-@property(nonatomic, strong) NSMutableArray *targets;
 @property(nonatomic, strong) NSMutableArray<XemuMetal4Decal *> *decals;
 @property(nonatomic, strong) NSMutableDictionary *decalPipelines;
 @property(nonatomic, strong) NSMutableDictionary *displayPipelines;
 @property(nonatomic) BOOL active;
 @property(nonatomic) BOOL drawable;
+@property(nonatomic) BOOL needsInitialClear;
 @end
 @implementation XemuMetal4Frontend
 @end
@@ -52,25 +62,19 @@ static bool ready()
         return false;
     return ui ? true : fail(@"Metal UI requires an open session");
 }
+static bool begin_recording(NSError **error)
+{
+    if (!ui.commands.commandBuffer && ![ui.commands beginWithError:error])
+        return false;
+    if (ui.frame && ![ui.commands keepAlive:ui.frame error:error]) {
+        xemu_metal4_ui_cancel();
+        return false;
+    }
+    return true;
+}
 static id<MTLTexture> texture(uintptr_t handle)
 {
     return (__bridge id<MTLTexture>)(void *)handle;
-}
-static bool flush_decals()
-{
-    NSError *error = nil;
-    UIErrorCapture capture(error);
-    if (!ui.decals.count)
-        return true;
-    XemuMetal4Decals *pipeline = ui.decalPipelines[@(ui.target.pixelFormat)];
-    BOOL ok = [pipeline encodeDecals:ui.decals
-                            commands:ui.commands
-                              target:ui.target
-                               clear:NO
-                               error:&error];
-    if (ok)
-        [ui.decals removeAllObjects];
-    return ok;
 }
 static bool clear_target(id<MTLTexture> target)
 {
@@ -84,6 +88,48 @@ static bool clear_target(id<MTLTexture> target)
                            target:target
                             clear:YES
                             error:&error];
+}
+static bool initialize_target()
+{
+    if (ui.needsInitialClear && !clear_target(ui.target))
+        return false;
+    ui.needsInitialClear = NO;
+    return true;
+}
+static bool initialize_ancestors(id<MTLTexture> access)
+{
+    for (auto &saved : ui->targets) {
+        if (!saved.needsInitialClear ||
+            !nv2a_metal_textures_alias(saved.texture, access))
+            continue;
+        if (!clear_target(saved.texture))
+            return false;
+        saved.needsInitialClear = false;
+    }
+    return true;
+}
+static bool flush_decals()
+{
+    NSError *error = nil;
+    UIErrorCapture capture(error);
+    if (!ui.decals.count)
+        return true;
+    if (!ui->targets.empty()) {
+        for (XemuMetal4Decal *decal in ui.decals)
+            if (!initialize_ancestors(decal.texture))
+                return false;
+    }
+    XemuMetal4Decals *pipeline = ui.decalPipelines[@(ui.target.pixelFormat)];
+    BOOL ok = [pipeline encodeDecals:ui.decals
+                            commands:ui.commands
+                              target:ui.target
+                               clear:ui.needsInitialClear
+                               error:&error];
+    if (ok) {
+        [ui.decals removeAllObjects];
+        ui.needsInitialClear = NO;
+    }
+    return ok;
 }
 const char *xemu_metal4_ui_error(void)
 {
@@ -122,7 +168,6 @@ bool xemu_metal4_ui_init(SDL_Window *window, bool vsync)
                                               error:&error];
         if (!session.imgui)
             return false;
-        session.targets = [NSMutableArray new];
         session.decals = [NSMutableArray new];
         session.decalPipelines = [NSMutableDictionary new];
         session.displayPipelines = [NSMutableDictionary new];
@@ -154,9 +199,9 @@ void xemu_metal4_ui_cancel(void)
     [ui.window cancelFrame];
     [ui.commands cancel];
     [ui.decals removeAllObjects];
-    [ui.targets removeAllObjects];
+    ui->targets.clear();
     ui.target = nil;
-    ui.active = ui.drawable = NO;
+    ui.active = ui.drawable = ui.needsInitialClear = NO;
 }
 bool xemu_metal4_ui_close(void)
 {
@@ -199,7 +244,13 @@ bool xemu_metal4_ui_set_frame(void *handle)
 {
     if (!ready())
         return false;
-    ui.frame = (__bridge NV2AMetalFramebuffer *)handle;
+    NV2AMetalFramebuffer *frame = (__bridge NV2AMetalFramebuffer *)handle;
+    NSError *error = nil;
+    UIErrorCapture capture(error);
+    if (ui.active && ui.commands.commandBuffer && frame &&
+        ![ui.commands keepAlive:frame error:&error])
+        return false;
+    ui.frame = frame;
     return true;
 }
 uintptr_t xemu_metal4_ui_frame_texture(void)
@@ -232,13 +283,12 @@ bool xemu_metal4_ui_begin(uintptr_t target_handle)
             return fail(@"Invalid offscreen UI target");
         ui.target = target;
     }
-    if (!ui.commands.commandBuffer && ![ui.commands beginWithError:&error])
+    /* A skipped window frame may still update offscreen assets later. Open
+     * its command recording only when such a target is actually selected. */
+    if (ui.target && !begin_recording(&error))
         return false;
     ui.active = YES;
-    if (!clear_target(ui.target)) {
-        xemu_metal4_ui_cancel();
-        return false;
-    }
+    ui.needsInitialClear = ui.target != nil;
     return true;
 }
 bool xemu_metal4_ui_end(const ImDrawData *data)
@@ -247,23 +297,28 @@ bool xemu_metal4_ui_end(const ImDrawData *data)
     UIErrorCapture capture(error);
     if (!ready())
         return false;
-    if (!ui.active || ui.targets.count)
+    if (!ui.active || !ui->targets.empty())
         return fail(@"Finish nested UI targets before ending the frame");
-    if (!flush_decals() || (data && ui.target &&
-                            ![ui.imgui encodeDrawData:data
-                                             commands:ui.commands
-                                               target:ui.target
-                                                error:&error])) {
+    if (!flush_decals()) {
         xemu_metal4_ui_cancel();
         return false;
     }
-    BOOL ok = ui.drawable ? [ui.window presentWithError:&error] :
+    BOOL encoded = data && ui.target ?
+        [ui.imgui encodeDrawData:data commands:ui.commands target:ui.target
+                            clear:ui.needsInitialClear error:&error] :
+        initialize_target();
+    if (!encoded) {
+        xemu_metal4_ui_cancel();
+        return false;
+    }
+    BOOL ok = !ui.target && !ui.commands.commandBuffer ? YES :
+              ui.drawable ? [ui.window presentWithError:&error] :
                             [ui.commands submitWithError:&error];
     if (!ok) {
         xemu_metal4_ui_cancel();
         return false;
     }
-    ui.active = ui.drawable = NO;
+    ui.active = ui.drawable = ui.needsInitialClear = NO;
     ui.target = nil;
     return true;
 }
@@ -275,18 +330,24 @@ bool xemu_metal4_ui_framebuffer(float sx, float sy, bool linear)
         return false;
     if (!ui.target)
         return true;
+    BOOL screenOff = !ui.frame || ui.frame.screenOff;
+    if (!screenOff && !initialize_ancestors(ui.frame.texture))
+        return false;
     NV2AMetalDisplayUniforms u =
         ui.frame ? ui.frame.displayUniforms : NV2AMetalDisplayUniforms{};
     u.scale[0] = sx;
     u.scale[1] = sy;
     NV2AMetalDisplay *display = ui.displayPipelines[@(ui.target.pixelFormat)];
-    return [display encodeWithCommands:ui.commands
-                                source:ui.frame.texture
-                                target:ui.target
-                              uniforms:&u
-                                linear:linear
-                             screenOff:!ui.frame || ui.frame.screenOff
-                                 error:&error];
+    BOOL ok = [display encodeWithCommands:ui.commands
+                                   source:ui.frame.texture
+                                   target:ui.target
+                                 uniforms:&u
+                                   linear:linear
+                                screenOff:screenOff
+                                    error:&error];
+    if (ok)
+        ui.needsInitialClear = NO;
+    return ok;
 }
 static uintptr_t make_texture(const void *rgba, uint32_t w, uint32_t h)
 {
@@ -335,6 +396,8 @@ bool xemu_metal4_ui_texture_size(uintptr_t handle, uint32_t *w, uint32_t *h)
 }
 bool xemu_metal4_ui_push_target(uintptr_t handle)
 {
+    NSError *error = nil;
+    UIErrorCapture capture(error);
     if (!ready() || !ui.active || !handle || !flush_decals())
         return false;
     id<MTLTexture> target = texture(handle);
@@ -343,19 +406,28 @@ bool xemu_metal4_ui_push_target(uintptr_t handle)
         !(target.usage & MTLTextureUsageRenderTarget) ||
         !ui.decalPipelines[@(target.pixelFormat)])
         return fail(@"Invalid nested Metal UI target");
-    if (!clear_target(target))
+    if (!ui.commands.commandBuffer && !begin_recording(&error))
         return false;
-    [ui.targets addObject:(id)ui.target ?: (id)[NSNull null]];
+    // A child view can write the same storage as an ancestor. Preserve the
+    // order of those clears before switching targets.
+    if (!initialize_ancestors(target) ||
+        (ui.needsInitialClear && nv2a_metal_textures_alias(ui.target, target) &&
+         !initialize_target()))
+        return false;
+    ui->targets.push_back({ ui.target, ui.needsInitialClear != NO });
     ui.target = target;
+    ui.needsInitialClear = YES;
     return true;
 }
 bool xemu_metal4_ui_pop_target(void)
 {
-    if (!ready() || !ui.active || !ui.targets.count || !flush_decals())
+    if (!ready() || !ui.active || ui->targets.empty() || !flush_decals() ||
+        !initialize_target())
         return false;
-    id previous = ui.targets.lastObject;
-    ui.target = previous == [NSNull null] ? nil : previous;
-    [ui.targets removeLastObject];
+    const auto &previous = ui->targets.back();
+    ui.target = previous.texture;
+    ui.needsInitialClear = previous.needsInitialClear;
+    ui->targets.pop_back();
     return true;
 }
 bool xemu_metal4_ui_decal(uintptr_t handle, const float dst[4],

@@ -82,7 +82,7 @@ static void packed_float_current_tests(void)
         assert(!memcmp((const uint8_t *)result.attributes.contents +
                            result.vertexCount * sizeof(NV2AMetalProgramInput),
                        bits.bytes, bits.length));
-        assert(!((uint32_t *)result.faults.contents)[result.vertexCount]);
+        assert(!*(const uint32_t *)result.faults.contents);
     }
     for (unsigned invalid = 0; invalid < 7; invalid++) {
         reset();

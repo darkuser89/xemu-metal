@@ -1,6 +1,7 @@
 /* Native framebuffer logic tests; no app, VM or window is started.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "hw/xbox/nv2a/pgraph/metal/pixel-shader.h"
+#import <objc/runtime.h>
 #include "hw/xbox/nv2a/pgraph/metal/geometry-types.h"
 #include <assert.h>
 #include <stdio.h>
@@ -22,6 +23,27 @@ static const LogicFormat formats[] = {
 static NV2AMetalCommands *commands;
 static unsigned images;
 static unsigned long pixels_checked;
+typedef id (*LogicPipelineBuilder)(id, SEL, id, id, NSError **)
+    __attribute__((ns_returns_retained));
+static LogicPipelineBuilder original_logic_pipeline;
+static NSString *expected_logic_function;
+static unsigned logic_function_builds;
+static id observe_logic_pipeline(id object, SEL selector, id descriptor,
+                                 id options, NSError **error)
+    __attribute__((ns_returns_retained));
+static id observe_logic_pipeline(id object, SEL selector, id descriptor,
+                                 id options, NSError **error)
+{
+    MTL4FunctionDescriptor *selected = [descriptor fragmentFunctionDescriptor];
+    assert([selected isKindOfClass:MTL4SpecializedFunctionDescriptor.class]);
+    MTL4SpecializedFunctionDescriptor *specialized =
+        (MTL4SpecializedFunctionDescriptor *)selected;
+    MTL4LibraryFunctionDescriptor *function =
+        (MTL4LibraryFunctionDescriptor *)specialized.functionDescriptor;
+    assert([function.name isEqualToString:expected_logic_function]);
+    logic_function_builds++;
+    return original_logic_pipeline(object, selector, descriptor, options, error);
+}
 static void require(BOOL ok, NSError *error)
 {
     if (!ok) {
@@ -349,7 +371,28 @@ static void float_and_msaa(void)
                            options:MTLResourceStorageModeShared];
             assert(vb);
         }
-        for (unsigned op = 0; op < 16; op++) {
+        id compiler = [shader valueForKey:@"compiler"];
+        Method method = class_getInstanceMethod(object_getClass(compiler),
+            @selector(newRenderPipelineStateWithDescriptor:compilerTaskOptions:error:));
+        assert(method);
+        original_logic_pipeline = (void *)method_setImplementation(method,
+            (IMP)observe_logic_pipeline);
+        logic_function_builds = 0;
+        for (unsigned op = 0; op <= 17; op++) {
+            BOOL sourceOnly = op == 0 || op == 3 || op == 12 || op == 15 || op == 17;
+            expected_logic_function = !msaa || op == 16 ? @"nv2a_pixel_fragment" :
+                sourceOnly ? @"nv2a_pixel_post_fragment" : @"nv2a_pixel_logic_fragment";
+            NV2AMetalDrawConfig config = state(op & 15, 15).config;
+            /* Finish with plain and dither-only draws of the same pixels. */
+            if (op >= 16)
+                config.blend = 0;
+            if (op & 1)
+                config.control[0] |= NV_PGRAPH_CONTROL_0_DITHERENABLE;
+            NV2AMetalDrawState *raster =
+                [[NV2AMetalDrawState alloc] initWithDevice:commands.device
+                                                   config:&config
+                                                    error:&error];
+            require(raster != nil, error);
             MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
             pass.colorAttachments[0].texture = target;
             pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -366,7 +409,7 @@ static void float_and_msaa(void)
                                   uniforms:&u
                                   textures:textures
                                       pass:pass
-                                 drawState:state(op, 15)
+                                 drawState:raster
                                   commands:commands
                                      error:&error],
                     error);
@@ -378,9 +421,12 @@ static void float_and_msaa(void)
                      bytesPerRow:4
                       fromRegion:MTLRegionMake2D(0, 0, 1, 1)
                      mipmapLevel:0];
-                for (unsigned k = 0; k < 4; k++)
-                    assert(actual[k] ==
-                           truth(17 + 31 * k, 51 * (k + 1), op, 8));
+                for (unsigned k = 0; k < 4; k++) {
+                    unsigned source = 17 + 31 * k;
+                    unsigned expected =
+                        op >= 16 ? source : truth(source, 51 * (k + 1), op, 8);
+                    assert(actual[k] == expected);
+                }
             } else {
                 float actual[4];
                 [result getBytes:actual
@@ -392,7 +438,15 @@ static void float_and_msaa(void)
             images++;
             pixels_checked++;
         }
+        NV2AMetalLRUCache *cache = [shader valueForKey:@"fragmentPipelines"];
+        assert(cache.count == (msaa ? 3u : 1u));
+        method_setImplementation(method, (IMP)original_logic_pipeline);
+        assert(logic_function_builds == (msaa ? 3u : 1u));
+        expected_logic_function = nil;
     }
+    puts("Metal 4 logic pipeline cache: float state shares one entry; "
+         "MSAA keeps source-only postprocessing, destination fetch and plain "
+         "output separate; actual fragment descriptors verified PASS");
 }
 static void points_and_lines(void)
 {
@@ -471,12 +525,17 @@ static void points_and_lines(void)
         }
     }
 }
-int main(void)
+int main(int argc, char **argv)
 {
     @autoreleasepool {
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        if (argc == 2 && !strcmp(argv[1], "--postprocess-selection")) {
+            float_and_msaa();
+            return 0;
+        }
+        assert(argc == 1);
         for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]); i++)
             exhaustive(&formats[i]);
         ordered();

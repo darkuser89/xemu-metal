@@ -178,11 +178,27 @@ static BOOL pixel_decode(NSData *data, PixelCapture *capture, NSError **error)
     return nv2a_metal_pixel_validate(u, error);
 }
 
+static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
+                               const NV2AMetalDrawConfig *b)
+{
+    return !memcmp(a->control, b->control, sizeof(a->control)) &&
+           a->blend == b->blend && a->blend_color == b->blend_color &&
+           a->setup_raster == b->setup_raster &&
+           a->antialiasing == b->antialiasing &&
+           a->viewport_width == b->viewport_width &&
+           a->viewport_height == b->viewport_height &&
+           a->scissor_enabled == b->scissor_enabled &&
+           a->scissor.x == b->scissor.x && a->scissor.y == b->scissor.y &&
+           a->scissor.width == b->scissor.width &&
+           a->scissor.height == b->scissor.height;
+}
+
 @interface NV2AMetalPGRAPHPixelState ()
 - (instancetype)initWithState:(PGRAPHState *)pg
                      textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
                        device:(id<MTLDevice>)device
                  frozenRaster:(NV2AMetalDrawState *)boundRaster
+                 reusingRaster:(NV2AMetalDrawState *)previousRaster
                         error:(NSError **)error;
 @end
 @implementation NV2AMetalPGRAPHPixelState {
@@ -222,13 +238,27 @@ static BOOL pixel_decode(NSData *data, PixelCapture *capture, NSError **error)
     return [self initWithState:pg
                       textures:textures
                         device:device
+                 reusingRaster:nil
+                         error:error];
+}
+- (instancetype)initWithState:(PGRAPHState *)pg
+                     textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
+                       device:(id<MTLDevice>)device
+                reusingRaster:(NV2AMetalDrawState *)previousRaster
+                        error:(NSError **)error
+{
+    return [self initWithState:pg
+                      textures:textures
+                        device:device
                   frozenRaster:nil
+                 reusingRaster:previousRaster
                          error:error];
 }
 - (instancetype)initWithState:(PGRAPHState *)pg
                      textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
                        device:(id<MTLDevice>)device
                  frozenRaster:(NV2AMetalDrawState *)boundRaster
+                 reusingRaster:(NV2AMetalDrawState *)previousRaster
                         error:(NSError **)error
 {
     self = [super init];
@@ -380,6 +410,11 @@ static BOOL pixel_decode(NSData *data, PixelCapture *capture, NSError **error)
                      (NSUInteger)pg->surface_shape.clip_width * sx,
                      (NSUInteger)pg->surface_shape.clip_height * sy },
     };
+    if (previousRaster && previousRaster.device == device) {
+        NV2AMetalDrawConfig previous = previousRaster.config;
+        if (same_raster_config(&raster, &previous))
+            boundRaster = previousRaster;
+    }
     _raster = boundRaster ?:
                             [[NV2AMetalDrawState alloc] initWithDevice:device
                                                                 config:&raster
@@ -399,6 +434,7 @@ static BOOL pixel_decode(NSData *data, PixelCapture *capture, NSError **error)
                                                 textures:_textures
                                                   device:device
                                             frozenRaster:_raster
+                                            reusingRaster:nil
                                                    error:error];
     if (state) {
         state->_offsetMask = _offsetMask;

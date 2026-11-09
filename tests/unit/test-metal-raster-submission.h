@@ -4,7 +4,7 @@
 #define TEST_METAL_RASTER_SUBMISSION_H
 static void check_raster_submissions(void)
 {
-    for (unsigned mode = 0; mode < 4; mode++) {
+    for (unsigned mode = 0; mode < 6; mode++) {
         TestDevice *device = [TestDevice new];
         device.supported = YES;
         device.queue = [TestQueue new];
@@ -54,19 +54,38 @@ static void check_raster_submissions(void)
                                       MTL4RenderEncoderOptionResuming));
         }
         /* Neither feedback order may publish a half-completed receipt. */
-        if (mode == 3)
+        BOOL reverse = mode >= 3;
+        BOOL producerFailure = mode == 1 || mode == 4;
+        BOOL rasterFailure = mode == 2 || mode == 3;
+        if (reverse)
             [device.queue.pending exchangeObjectAtIndex:0 withObjectAtIndex:1];
         NV2AMetalSubmission *receipt = commands.lastSubmitted;
+        assert(receipt.hasSeparateProducerFeedback &&
+               ![receipt completedProducersWithError:&error] && !error);
         NSError *failure = [NSError errorWithDomain:@"test.raster.commit"
                                                code:mode
                                            userInfo:nil];
-        [device.queue completeWithError:mode == 1 || mode == 3 ? failure : nil];
+        [device.queue completeWithError:(reverse ? rasterFailure : producerFailure) ? failure : nil];
         error = failure;
         assert(![receipt completedWithError:&error] && !error && lifetime);
-        [device.queue completeWithError:mode == 2 ? failure : nil];
+        if (!reverse) {
+            assert([receipt completedProducersWithError:&error] &&
+                   error == (producerFailure ? failure : nil));
+            assert([commands waitForProducersOfSubmission:receipt error:&error] == !producerFailure);
+        } else {
+            assert(![receipt completedProducersWithError:&error] && !error);
+        }
+        [device.queue completeWithError:(reverse ? producerFailure : rasterFailure) ? failure : nil];
         assert([receipt completedWithError:&error] &&
-               error == (mode ? failure : nil));
-        if (!mode) {
+               error == (producerFailure || rasterFailure ? failure : nil));
+        assert([receipt completedProducersWithError:&error] &&
+               error == (producerFailure || rasterFailure ? failure : nil));
+        assert([commands waitForProducersOfSubmission:receipt error:&error] ==
+               !(producerFailure || rasterFailure));
+        NV2AMetalCommands *foreign = [[NV2AMetalCommands alloc]
+            initWithDevice:(id<MTLDevice>)device error:&error];
+        assert(foreign && ![foreign waitForProducersOfSubmission:receipt error:&error] && error);
+        if (!producerFailure && !rasterFailure) {
             producer = raster = nil;
             assert([commands waitUntilIdleWithError:&error]);
             @autoreleasepool {
@@ -107,6 +126,7 @@ static void check_raster_submissions(void)
     }
     puts("Metal raster submissions:32 producers/33 contiguous suspend-resume "
          "buffers,one composite receipt,both errors/reversed feedback order,"
+         "separate producer readiness/wait,aggregate failure and foreign-owner checks,"
          "resource lifetime and three failed-encoder suffix cancellations PASS "
          "(CPU only)");
 }

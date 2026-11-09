@@ -16,8 +16,15 @@ static BOOL vga_error(NSError **error, NSString *message)
     id<MTLDevice> _device;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
+    NV2AMetalVGATargetAllocator _targetAllocator;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)device error:(NSError **)error
+{
+    return [self initWithDevice:device targetAllocator:nil error:error];
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+                targetAllocator:(NV2AMetalVGATargetAllocator)allocator
+                          error:(NSError **)error
 {
     self = [super init];
     if (!self)
@@ -29,34 +36,48 @@ static BOOL vga_error(NSError **error, NSString *message)
         return nil;
     }
     _device = device;
+    _targetAllocator = [allocator copy];
+    return self;
+}
+- (BOOL)prepareDecoderWithError:(NSError **)error
+{
+    if (_pipeline)
+        return YES;
+    id<MTLDevice> device = _device;
     id<MTL4Compiler> compiler =
         [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
                                     error:error];
     if (!compiler)
-        return nil;
+        return NO;
     MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
     ld.source = @(metal_shader_source);
     ld.options = [MTLCompileOptions new];
     ld.options.languageVersion = MTLLanguageVersion4_0;
     id<MTLLibrary> lib = [compiler newLibraryWithDescriptor:ld error:error];
     if (!lib)
-        return nil;
+        return NO;
     MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
     fn.library = lib;
     fn.name = @"nv2a_vga_graphics";
     MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
     pd.computeFunctionDescriptor = fn;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:pd
-                                            compilerTaskOptions:nil
-                                                          error:error];
-    if (!_pipeline)
-        return nil;
+    id<MTLComputePipelineState> pipeline =
+        [compiler newComputePipelineStateWithDescriptor:pd
+                                    compilerTaskOptions:nil
+                                                  error:error];
+    if (!pipeline)
+        return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
     ad.maxBufferBindCount = 3;
     ad.maxTextureBindCount = 1;
     ad.initializeBindings = YES;
-    _arguments = [device newArgumentTableWithDescriptor:ad error:error];
-    return _arguments ? self : nil;
+    id<MTL4ArgumentTable> arguments =
+        [device newArgumentTableWithDescriptor:ad error:error];
+    if (!arguments)
+        return NO;
+    _pipeline = pipeline;
+    _arguments = arguments;
+    return YES;
 }
 - (id<MTLTexture>)encodeData:(id<MTLBuffer>)data
                         rows:(const NV2AMetalVGARow *)rows
@@ -99,6 +120,8 @@ static BOOL vga_error(NSError **error, NSString *message)
             return nil;
         }
     }
+    if (![self prepareDecoderWithError:error])
+        return nil;
     MTLTextureDescriptor *td = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                      width:u->width
@@ -106,28 +129,39 @@ static BOOL vga_error(NSError **error, NSString *message)
                                  mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    id<MTLTexture> target = [_device newTextureWithDescriptor:td];
-    id<MTLBuffer> row_buffer =
-        [_device newBufferWithBytes:rows
-                             length:u->height * sizeof(*rows)
-                            options:MTLResourceStorageModeShared];
-    id<MTLBuffer> constants =
-        [_device newBufferWithBytes:u
-                             length:sizeof(*u)
-                            options:MTLResourceStorageModeShared];
-    if (!target || !row_buffer || !constants) {
-        vga_error(error, @"Cannot allocate native VGA decode resources");
+    id<MTLTexture> target = _targetAllocator ? _targetAllocator(td) :
+        [_device newTextureWithDescriptor:td];
+    if (!target) {
+        vga_error(error, @"Cannot allocate native VGA decode target");
         return nil;
     }
-    if (![commands addResource:data error:error] ||
+    if (_targetAllocator &&
+        (target.device != _device || target.width != td.width ||
+         target.height != td.height || target.pixelFormat != td.pixelFormat ||
+         target.storageMode != td.storageMode || target.usage != td.usage ||
+         target.textureType != td.textureType || target.sampleCount != 1 ||
+         target.mipmapLevelCount != 1)) {
+        vga_error(error, @"Incompatible native VGA decode target");
+        return nil;
+    }
+    NSUInteger row_offset, uniform_offset;
+    id<MTLBuffer> row_buffer = [commands uploadBytes:rows
+                                              length:u->height * sizeof(*rows)
+                                              offset:&row_offset
+                                               error:error];
+    if (!row_buffer)
+        return nil;
+    id<MTLBuffer> constants = [commands uploadBytes:u
+                                             length:sizeof(*u)
+                                             offset:&uniform_offset
+                                              error:error];
+    if (!constants || ![commands addResource:data error:error] ||
         ![commands addResource:target error:error] ||
-        ![commands addResource:row_buffer error:error] ||
-        ![commands addResource:constants error:error] ||
         ![commands keepAlive:self error:error])
         return nil;
     [_arguments setAddress:data.gpuAddress atIndex:0];
-    [_arguments setAddress:row_buffer.gpuAddress atIndex:1];
-    [_arguments setAddress:constants.gpuAddress atIndex:2];
+    [_arguments setAddress:row_buffer.gpuAddress + row_offset atIndex:1];
+    [_arguments setAddress:constants.gpuAddress + uniform_offset atIndex:2];
     [_arguments setTexture:target.gpuResourceID atIndex:0];
     id<MTL4ComputeCommandEncoder> e =
         [commands.commandBuffer computeCommandEncoder];

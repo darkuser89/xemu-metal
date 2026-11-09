@@ -11,6 +11,7 @@
 #include "surface-transfer-types.h"
 #include "surface-transfer-source.h"
 #include <stdint.h>
+#include <stdatomic.h>
 
 _Static_assert(sizeof(NV2AMetalSurfaceTransferUniforms) == 52,
                "CPU/MSL surface transfer");
@@ -112,8 +113,119 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
     return YES;
 }
 
+@interface NV2AMetalFreeSurfaceTexture : NSObject
+@property(nonatomic) id<MTLTexture> texture;
+@property(nonatomic) MTLTextureDescriptor *descriptor;
+@property(nonatomic) NSUInteger bytes;
+@end
+@implementation NV2AMetalFreeSurfaceTexture
+@end
+
+/* Compare the complete final SurfaceTransfer descriptor rather than guest
+ * config: different guest layouts may use identical native storage. This is
+ * private to the descriptors constructed below, not a general texture pool. */
+static BOOL surface_descriptors_equal(MTLTextureDescriptor *a,
+                                      MTLTextureDescriptor *b)
+{
+    return a.textureType == b.textureType && a.pixelFormat == b.pixelFormat &&
+           a.width == b.width && a.height == b.height && a.depth == b.depth &&
+           a.mipmapLevelCount == b.mipmapLevelCount &&
+           a.sampleCount == b.sampleCount && a.arrayLength == b.arrayLength &&
+           a.resourceOptions == b.resourceOptions &&
+           a.cpuCacheMode == b.cpuCacheMode && a.storageMode == b.storageMode &&
+           a.hazardTrackingMode == b.hazardTrackingMode && a.usage == b.usage &&
+           a.allowGPUOptimizedContents == b.allowGPUOptimizedContents &&
+           a.compressionType == b.compressionType &&
+           a.placementSparsePageSize == b.placementSparsePageSize &&
+           a.swizzle.red == b.swizzle.red &&
+           a.swizzle.green == b.swizzle.green &&
+           a.swizzle.blue == b.swizzle.blue &&
+           a.swizzle.alpha == b.swizzle.alpha;
+}
+
+@interface NV2AMetalSurfaceTexturePool ()
+- (nullable id<MTLTexture>)takeTextureWithDescriptor:
+    (MTLTextureDescriptor *)descriptor;
+- (void)returnTexture:(id<MTLTexture>)texture
+           descriptor:(MTLTextureDescriptor *)descriptor;
+@end
+
+@implementation NV2AMetalSurfaceTexturePool {
+    NSMutableArray<NV2AMetalFreeSurfaceTexture *> *_freeTextures;
+    NSUInteger _maximumBytes, _maximumCount, _freeBytes;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+{
+    return [self initWithDevice:device
+                   maximumBytes:32u * 1024u * 1024u
+                   maximumCount:8];
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+                  maximumBytes:(NSUInteger)maximumBytes
+                  maximumCount:(NSUInteger)maximumCount
+{
+    self = [super init];
+    if (self) {
+        _device = device;
+        _maximumBytes = maximumBytes;
+        _maximumCount = maximumCount;
+        _freeTextures = [NSMutableArray new];
+        if (!_freeTextures)
+            return nil;
+    }
+    return self;
+}
+- (id<MTLTexture>)takeTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+    if (!descriptor)
+        return nil;
+    @synchronized(self) {
+        for (NSUInteger i = _freeTextures.count; i; i--) {
+            NV2AMetalFreeSurfaceTexture *entry = _freeTextures[i - 1];
+            if (entry.texture.device == _device &&
+                surface_descriptors_equal(entry.descriptor, descriptor)) {
+                id<MTLTexture> texture = entry.texture;
+                _freeBytes -= entry.bytes;
+                [_freeTextures removeObjectAtIndex:i - 1];
+                return texture;
+            }
+        }
+    }
+    return nil;
+}
+- (void)returnTexture:(id<MTLTexture>)texture
+           descriptor:(MTLTextureDescriptor *)descriptor
+{
+    NSUInteger bytes = texture.allocatedSize;
+    if (!descriptor || texture.device != _device || !bytes || !_maximumCount ||
+        bytes > _maximumBytes)
+        return;
+    NV2AMetalFreeSurfaceTexture *entry = [NV2AMetalFreeSurfaceTexture new];
+    if (!entry)
+        return;
+    entry.texture = texture;
+    entry.descriptor = [descriptor copy];
+    if (!entry.descriptor)
+        return;
+    entry.bytes = bytes;
+    @synchronized(self) {
+        while (_freeTextures.count >= _maximumCount ||
+               _freeBytes > _maximumBytes - bytes) {
+            _freeBytes -= _freeTextures.firstObject.bytes;
+            [_freeTextures removeObjectAtIndex:0];
+        }
+        [_freeTextures addObject:entry];
+        _freeBytes += bytes;
+    }
+}
+@end
+
 @implementation NV2AMetalSurfaceTransfer {
     id<MTLDevice> _device;
+    id<MTLTexture> _texture;
+    __weak NV2AMetalSurfaceTexturePool *_texturePool;
+    MTLTextureDescriptor *_textureDescriptor;
+    atomic_bool _textureEscaped;
     NV2AMetalShaderLibrary *_sharedLibrary;
     id<MTLComputePipelineState> _upload, _download;
     id<MTL4ArgumentTable> _arguments;
@@ -127,10 +239,18 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
                         config:(const NV2AMetalSurfaceConfig *)c
                          error:(NSError **)error
 {
+    return [self initWithDevice:device config:c texturePool:nil error:error];
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+                        config:(const NV2AMetalSurfaceConfig *)c
+                   texturePool:(NV2AMetalSurfaceTexturePool *)texturePool
+                         error:(NSError **)error
+{
     self = [super init];
     if (!self) {
         return nil;
     }
+    atomic_init(&_textureEscaped, false);
     NV2AMetalSurfaceLayout layout;
     if (!device.hasUnifiedMemory ||
         ![device supportsFamily:MTLGPUFamilyApple7] ||
@@ -139,6 +259,11 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
         return nil;
     }
     if (!nv2a_metal_surface_layout(c, &layout, error)) {
+        return nil;
+    }
+    if (texturePool && texturePool.device != device) {
+        surface_error(error,
+                      @"Surface texture pool belongs to a different GPU");
         return nil;
     }
     MTLPixelFormat format = layout.pixel_format;
@@ -168,12 +293,54 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
-    _texture = [device newTextureWithDescriptor:td];
+    _texturePool = texturePool;
+    _textureDescriptor = texturePool ? [td copy] : nil;
+    _texture = [texturePool takeTextureWithDescriptor:td];
+    if (!_texture)
+        _texture = [device newTextureWithDescriptor:td];
     if (!_texture) {
         surface_error(error, @"Cannot allocate native surface texture");
         return nil;
     }
     return self;
+}
+
+- (id<MTLTexture>)texture
+{
+    atomic_store_explicit(&_textureEscaped, true, memory_order_release);
+    return _texture;
+}
+- (MTLPixelFormat)nativePixelFormat
+{
+    return _texture.pixelFormat;
+}
+- (NSUInteger)nativeWidth
+{
+    return _texture.width;
+}
+- (NSUInteger)nativeHeight
+{
+    return _texture.height;
+}
+- (MTLTextureSwizzleChannels)nativeSwizzle
+{
+    return _texture.swizzle;
+}
+- (id<MTLTexture>)textureForCommands:(NV2AMetalCommands *)commands
+                               error:(NSError **)error
+{
+    if (!commands.commandBuffer || commands.device != _device) {
+        surface_error(error, @"Invalid surface texture borrow context/device");
+        return nil;
+    }
+    return [commands keepAlive:self error:error] ? _texture : nil;
+}
+- (void)dealloc
+{
+    NV2AMetalSurfaceTexturePool *pool = _texturePool;
+    if (_texture && pool &&
+        !atomic_load_explicit(&_textureEscaped, memory_order_acquire))
+        [pool returnTexture:_texture descriptor:_textureDescriptor];
 }
 
 - (BOOL)prepareComputeForUpload:(BOOL)upload error:(NSError **)error
@@ -211,14 +378,24 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
     return YES;
 }
 
+- (BOOL)prepareDownloadWithError:(NSError **)error
+{
+    return [self prepareComputeForUpload:NO error:error];
+}
+
 - (BOOL)canCopyBufferAtOffset:(NSUInteger)offset
                      uniforms:(NV2AMetalSurfaceTransferUniforms)u
                        upload:(BOOL)upload
 {
     unsigned pitch = upload ? u.source_pitch : u.destination_pitch;
-    return _config.color && !u.swizzle && !u.flip && u.scale == 1 &&
-           u.width == _texture.width && u.height == _texture.height &&
-           !(offset % _bytes) && pitch <= 16384u * _bytes;
+    BOOL nativeFixedZ16 = !_config.color &&
+                          _config.format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 &&
+                          !_config.floating_depth &&
+                          _texture.pixelFormat == MTLPixelFormatDepth16Unorm;
+    return (_config.color || nativeFixedZ16) && !u.swizzle && !u.flip &&
+           u.scale == 1 && u.width == _texture.width &&
+           u.height == _texture.height && !(offset % _bytes) &&
+           pitch <= 16384u * _bytes;
 }
 
 - (BOOL)encodeBuffer:(id<MTLBuffer>)buffer
@@ -284,11 +461,10 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
     BOOL direct = !upload && _directColorDownload;
     id<MTLBuffer> staging =
         direct ? nil :
-                 [_device newBufferWithLength:_stagingLength
-                                      options:MTLResourceStorageModePrivate];
+                 [commands orderedTransferScratchWithLength:_stagingLength
+                                                      error:error];
     if (!direct && !staging)
-        return surface_error(error,
-                             @"Cannot allocate surface transfer buffers");
+        return NO;
     NSUInteger uniformOffset = 0;
     id<MTLBuffer> constants = [commands uploadBytes:&u
                                              length:sizeof(u)
@@ -297,7 +473,6 @@ BOOL nv2a_metal_surface_layout(const NV2AMetalSurfaceConfig *c,
     if (!constants)
         return NO;
     if (![commands addResource:buffer error:error] ||
-        (staging && ![commands addResource:staging error:error]) ||
         ![commands addResource:_texture error:error] ||
         ![commands keepAlive:self error:error]) {
         return NO;

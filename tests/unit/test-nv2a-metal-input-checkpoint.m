@@ -7,6 +7,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #pragma clang diagnostic pop
 #import "hw/xbox/nv2a/pgraph/metal/input-checkpoint.h"
+#include <time.h>
 static uint32_t raw(unsigned seed, unsigned index)
 {
     return 0x9e3779b9u * (index + 1) + seed;
@@ -63,9 +64,94 @@ static void mutate_fetch(PGRAPHState *pg)
         }
     }
 }
-int main(void)
+static void attribute_byte_tests(PGRAPHState *pg, float *buffers)
+{
+    set(pg, 0, 1, 42, buffers);
+    VertexAttribute original[16];
+    memcpy(original, pg->vertex_attributes, sizeof(original));
+    uint16_t compressed = pg->compressed_attrs;
+    unsigned accepted = 0, rejected = 0;
+    for (unsigned attribute = 0; attribute < 16; attribute++)
+        for (size_t byte = 0; byte < sizeof(VertexAttribute); byte++) {
+            memcpy(pg->vertex_attributes, original, sizeof(original));
+            pg->compressed_attrs = compressed;
+            NSError *error = nil;
+            NV2AMetalPGRAPHInputCheckpoint *checkpoint =
+                [[NV2AMetalPGRAPHInputCheckpoint alloc]
+                    initWithState:pg error:&error];
+            assert(checkpoint && !error);
+            mutate_fetch(pg);
+            ((uint8_t *)&pg->vertex_attributes[attribute])[byte] ^= 1;
+            VertexAttribute before[16];
+            memcpy(before, pg->vertex_attributes, sizeof(before));
+            size_t values = offsetof(VertexAttribute, inline_value),
+                   populated = offsetof(VertexAttribute, inline_buffer_populated);
+            BOOL permitted =
+                (byte >= values && byte < values + sizeof(original[0].inline_value)) ||
+                (byte >= populated && byte < populated +
+                    sizeof(original[0].inline_buffer_populated));
+            BOOL restored = [checkpoint restoreWithState:pg error:&error];
+            if (permitted) {
+                assert(restored && !error &&
+                       !memcmp(pg->vertex_attributes, original, sizeof(original)) &&
+                       pg->compressed_attrs == compressed);
+                accepted++;
+            } else {
+                assert(!restored && error &&
+                       !memcmp(pg->vertex_attributes, before, sizeof(before)) &&
+                       !pg->compressed_attrs);
+                rejected++;
+            }
+        }
+    assert(accepted + rejected == 16 * sizeof(VertexAttribute));
+    printf("Input checkpoint layout bytes: %u Current/flag bytes restored, "
+           "%u other layout/padding bytes rejected atomically PASS\n",
+           accepted, rejected);
+}
+static void checkpoint_benchmark(void)
+{
+    PGRAPHState *pg = calloc(1, sizeof(*pg));
+    float *buffers = calloc(16 * 128 * 4, sizeof(*buffers));
+    assert(pg && buffers);
+    const unsigned ranges[] = { 0, 2, 1250 };
+    for (unsigned shape = 0; shape < 3; shape++) {
+        set(pg, ranges[shape] ? 0 : 1, 1, 42, buffers);
+        pg->draw_arrays_length = ranges[shape];
+        assert(ranges[shape] <= ARRAY_SIZE(pg->draw_arrays_start));
+        for (unsigned i = 0; i < ranges[shape]; i++) {
+            pg->draw_arrays_start[i] = i * 4;
+            pg->draw_arrays_count[i] = 1;
+        }
+        struct timespec start, finish;
+        assert(!clock_gettime(CLOCK_MONOTONIC, &start));
+        for (unsigned i = 0; i < 10000; i++) {
+            @autoreleasepool {
+                NSError *error = nil;
+                NV2AMetalPGRAPHInputCheckpoint *checkpoint =
+                    [[NV2AMetalPGRAPHInputCheckpoint alloc]
+                        initWithState:pg error:&error];
+                assert(checkpoint && !error);
+                mutate_fetch(pg);
+                assert([checkpoint restoreWithState:pg error:&error] && !error);
+            }
+        }
+        assert(!clock_gettime(CLOCK_MONOTONIC, &finish));
+        double seconds = finish.tv_sec - start.tv_sec +
+                         (finish.tv_nsec - start.tv_nsec) * 1e-9;
+        printf("Input checkpoint CPU benchmark: 10000 capture/restore pairs, "
+               "%u ranges %.3f ms PASS; no guest or GPU timing\n",
+               ranges[shape], seconds * 1000);
+    }
+    free(buffers);
+    free(pg);
+}
+int main(int argc, char **argv)
 {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "--checkpoint-benchmark")) {
+            checkpoint_benchmark();
+            return 0;
+        }
         PGRAPHState *pg = calloc(1, sizeof(*pg)),
                     *expected = malloc(sizeof(*pg)),
                     *other = calloc(1, sizeof(*pg));
@@ -175,6 +261,7 @@ int main(void)
             assert(bits == raw(42, k));
         }
         assert(cases == 1152 && rejections == 2319);
+        attribute_byte_tests(pg, buffers);
         printf("Input checkpoints: %u full-PGRAPH byte comparisons/%u "
                "cross-owner, stale, repeat and invalid-input rejections PASS; "
                "source buffers and unrelated context writes preserved; no "

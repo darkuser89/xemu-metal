@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--target", choices=("texture-pgraph", "texture-cache",
-                                                 "visibility", "pixel-shader", "draw-pgraph", "renderer", "pending-journal", "pending-pgraph", "shader-library",
+                                                 "visibility", "pixel-shader", "draw-pgraph", "renderer", "pending-journal", "pending-pgraph", "shader-library", "pipeline-compiler",
                                                  "texture-snapshot",
                                                  "texture-upload", "vertex-fetch", "fetch-pgraph", "vertex-epoch", "vertex-writable", "vertex-state", "vertex-fixed", "vertex-capture", "vertex-constant-epoch", "pixel-pgraph",
                                                  "command", "clear", "blit", "transfer-uniforms", "pending-native", "pending-archive", "archive-native", "vertex-slices", "surface-cache", "surface-transfer",
@@ -191,7 +191,7 @@ def main():
         source = run([sys.executable, str(metal / "shader-source.py"),
                       str(root / "ui/xui/metal4/frame-images.metal")], omit_output=True)
         (generated / "frame-images-source.h").write_text(source)
-    native = ["command", "lru-cache", "shader-library", "texture-snapshot-pgraph", "texture-cache",
+    native = ["command", "lru-cache", "shader-library", "pipeline-compiler", "texture-snapshot-pgraph", "texture-cache",
               "texture-sampler", "texture-upload", "texture-snapshot",
               "surface-cache", "surface-transfer", "clear", "pixel-shader",
               "pixel-combiner", "draw-state"]
@@ -221,6 +221,9 @@ def main():
                     target, "test-nv2a-metal-" + target + ".m")
         sources = [root / "tests/unit" / test]
         sources += [metal / (name + ".m") for name in native]
+        if target == "pipeline-compiler":
+            # CPU-only fakes: no device, command queue or shader compilation.
+            sources = [sources[0], metal / "pipeline-compiler.m", metal / "lru-cache.m"]
         if target in ui_targets:
             sources = [sources[0], metal / "command.m"]
             if target in ("ui-decal", "ui-hazards"):
@@ -263,7 +266,8 @@ def main():
         if target == "fetch-pgraph":
             sources += [metal / (name + ".m") for name in (
                 "fetch-pgraph", "vertex-pgraph", "vertex-writable",
-                "pixel-pgraph", "geometry", "pending-journal")]
+                "pixel-pgraph", "geometry", "pending-journal",
+                "pending-archive", "vertex-stream")]
         if target in ("scanout", "display", "scanout-hazards"):
             sources += [metal / "scanout.m", metal / "display.m"]
         if target in ("surface-cache", "blit", "transfer-uniforms"):
@@ -276,7 +280,7 @@ def main():
                 "archive-native", "pending-archive", "vertex-program")]
         if target == "pixel-shader":
             sources += [metal / (name + ".m") for name in (
-                "geometry", "vertex-fetch", "vertex-program")]
+                "geometry", "vertex-fetch", "vertex-program", "vertex-stream")]
         if target in ("visibility", "geometry", "lines", "polygons", "direct-points", "direct-lines", "direct-triangles", "vertex-slices"):
             sources += [metal / "geometry.m"]
         if target in ("texture-pgraph", "draw-pgraph", "renderer"):
@@ -295,6 +299,14 @@ def main():
                 "util/event.c", "util/qsp.c", "util/notify.c",
                 "stubs/monitor-core.c",
                 "stubs/iothread-lock.c", "stubs/error-printf.c")]
+        if target == "draw-pgraph":
+            sources += [metal / (name + ".m") for name in (
+                "scanout-pgraph", "scanout", "vga")]
+            sources += [root / name for name in (
+                "util/qemu-timer.c", "util/qemu-timer-common.c",
+                "stubs/cpu-get-clock.c", "stubs/cpus-virtual-clock.c",
+                "stubs/replay-mode.c", "stubs/replay-tools.c",
+                "stubs/icount.c")]
         if target == "renderer":
             sources += [metal / (name + ".m") for name in (
                 "renderer", "scanout-pgraph", "scanout", "display", "vga")]

@@ -27,6 +27,7 @@ API_AVAILABLE(macos(26.0))
  * the entire target, and retains everything until submission completes.
  * source may be nil only when screenOff is YES. target and source must be
  * distinct, single-sample 2D textures; RGB is interpreted without sRGB decode.
+ * Screen-off clears do not require the display pipeline or sampling bindings.
  * The caller waits for a drawable before writing its texture. Scanout sources
  * may use R8/RG8, RGB565/RGB5A1, RGBA8/BGRA8 or RGBA32F. Float filtering uses
  * manual GPU reads so it also works on Apple7/8. */

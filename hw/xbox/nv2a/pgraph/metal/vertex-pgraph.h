@@ -5,6 +5,7 @@
 #import "vertex-program.h"
 typedef struct PGRAPHState PGRAPHState;
 @class NV2AMetalValidatedProgram;
+struct NV2AMetalFetchUniforms;
 
 NS_ASSUME_NONNULL_BEGIN
 API_AVAILABLE(macos(26.0))
@@ -27,9 +28,17 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly) BOOL fullAccess, writeEnable, rasterDiscard;
 @property(nonatomic, readonly) BOOL programmed, dynamicAddressing, smooth,
     zPerspective;
-/* Cached proof for this capture's access policy and immutable constants.
- * Only permits queued execution when actual context writes are disabled. */
+/* Numerical proof for this capture's access policy and immutable constants. */
 @property(nonatomic, readonly) BOOL faultFreeReadOnlyAccess;
+/* Select a candidate producer queue. The encoder must still check its actual
+ * live Fetch binding, constants and write policy before pending admission. */
+- (BOOL)mayUseReadonlyFetchPreview:
+    (const struct NV2AMetalFetchUniforms *_Nullable)preview;
+/* Queue-selection attempt only: active Float sources or guarded stride-zero
+ * Current may supply a later bound domain. No positive fault proof is implied.
+ */
+- (BOOL)mayAttemptReadonlyFloatProofWithPreview:
+    (const struct NV2AMetalFetchUniforms *_Nullable)preview;
 @property(nonatomic, readonly) uint16_t compressedAttributes, uniformAttributes,
     swizzleAttributes;
 @property(nonatomic, readonly) NV2AMetalProgramInput inlineValues;
@@ -40,6 +49,11 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic, readonly, nullable)
     NV2AMetalValidatedProgram *validatedProgram;
 - (nullable instancetype)initWithState:(PGRAPHState *)state
+                                 error:(NSError *_Nullable *_Nullable)error;
+/* Recapture live uniforms and metadata. Reuse only a byte-identical program. */
+- (nullable instancetype)initWithState:(PGRAPHState *)state
+                    reusingProgramFrom:
+                        (nullable NV2AMetalPGRAPHVertexState *)previous
                                  error:(NSError *_Nullable *_Nullable)error;
 /* XF-only execution may precede any raster attachment. Derive missing bound
  * dimensions from the declared surface shape without binding or mutating it.
@@ -57,6 +71,10 @@ API_AVAILABLE(macos(26.0))
 - (nullable instancetype)initRawXFWithState:(PGRAPHState *)state
                                       error:
                                           (NSError *_Nullable *_Nullable)error;
+- (nullable instancetype)
+    initRawXFWithState:(PGRAPHState *)state
+    reusingProgramFrom:(nullable NV2AMetalPGRAPHVertexState *)previous
+                 error:(NSError *_Nullable *_Nullable)error;
 /* Versioned big-endian words, without GPU resources or host pointers. */
 - (NSData *)snapshotData;
 - (nullable instancetype)initWithSnapshot:(NSData *)data

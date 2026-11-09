@@ -4,11 +4,14 @@
 #define TEST_METAL_FETCH_SPARSE_READS_H
 static void fetch_sparse_read_tests(void)
 {
-    unsigned cases = 0;
+    unsigned cases = 0, joinedCurrent = 0;
     for (unsigned host = 0; host < 2; host++)
-        for (unsigned layout = 0; layout < 12; layout++)
+        for (unsigned layout = 0; layout < 18; layout++)
             for (unsigned prefix = 0; prefix < 2; prefix++) {
                 unsigned selection = layout % 6;
+                BOOL overlapping = layout >= 12;
+                BOOL merged = layout < 6 || overlapping;
+                NSUInteger colorOffset = overlapping ? 12 : merged ? 16 : 24;
                 NSUInteger hole = layout < 6 ? 12288 : 16896;
                 NSError *error = nil;
                 require([surfaces discardForRestoreWithError:&error], error);
@@ -26,7 +29,7 @@ static void fetch_sparse_read_tests(void)
                 };
                 pg->vertex_attributes[3] = (VertexAttribute){
                     .dma_select = true,
-                    .offset = 4112,
+                    .offset = 4096 + colorOffset,
                     .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL,
                     .size = 1,
                     .count = 4,
@@ -49,7 +52,11 @@ static void fetch_sparse_read_tests(void)
                         colors[i][lane] = i * 30 + lane * 7;
                     }
                     memcpy(state->vram_ptr + 4096 + i * 4096, data[i], 16);
-                    memcpy(state->vram_ptr + 4112 + i * 4096, colors[i], 4);
+                    if (overlapping)
+                        memcpy(colors[i], &data[i][3], 4);
+                    else
+                        memcpy(state->vram_ptr + 4096 + colorOffset + i * 4096,
+                               colors[i], 4);
                 }
                 float constant[4] = { 100, 200, 300, 1 };
                 memcpy(state->vram_ptr + 50000, constant, 16);
@@ -62,9 +69,9 @@ static void fetch_sparse_read_tests(void)
                     pg->draw_arrays_start[1] = 0;
                     pg->draw_arrays_count[1] = selection ? 2 : 1;
                     pg->draw_arrays_start[2] = 3;
-                    pg->draw_arrays_count[2] = 2;
+                    pg->draw_arrays_count[2] = 1;
                     prefixes = selection ?
-                                   @[ @(prefix), @(prefix), @(prefix) ] :
+                                   @[ @(prefix), @(prefix), @0 ] :
                                    @[ @(prefix), @0 ];
                     selected = 4;
                 } else {
@@ -116,6 +123,30 @@ static void fetch_sparse_read_tests(void)
                                          indexedBytes:pg->inline_elements
                                                 count:5
                                      matchingPrevious:nil];
+                unsigned suffixPages = 0;
+                if (selection < 2) {
+                    for (unsigned batch = 0; batch < pg->draw_arrays_length; batch++)
+                        for (unsigned i = prefixes[batch].unsignedIntValue;
+                             i < (unsigned)pg->draw_arrays_count[batch]; i++)
+                            suffixPages |= 1u << (pg->draw_arrays_start[batch] + i + 1);
+                } else {
+                    for (unsigned i = prefixes[0].unsignedIntValue;
+                         i < pg->inline_elements_length; i++)
+                        suffixPages |= 1u << (pg->inline_elements[i] + 1);
+                }
+                unsigned currentPage = 1u << (selected + 1);
+                unsigned expectedPages = suffixPages | currentPage | 1u << 12;
+                unsigned lanePages = suffixPages | currentPage;
+                unsigned laneRuns =
+                    __builtin_popcount(lanePages & ~(lanePages << 1));
+                unsigned separateRuns =
+                    __builtin_popcount(suffixPages & ~(suffixPages << 1)) +
+                    !(suffixPages & currentPage);
+                joinedCurrent += separateRuns > laneRuns;
+                NSData *pendingReads = [surfaces valueForKey:@"pendingReads"];
+                NSUInteger pendingBytes = pendingReads.length;
+                unsigned dirtyReads = reads;
+                dirty_read_pages = 0;
                 NSArray<NV2AMetalPGRAPHFetchBatch *> *batches =
                     host ?
                         [adapter encodeCurrentSnapshotsWithPrefixes:prefixes
@@ -125,6 +156,15 @@ static void fetch_sparse_read_tests(void)
                                                            indexedInput:input
                                                                   error:&error];
                 require(batches != nil, error);
+                unsigned runs = __builtin_popcount(expectedPages & ~(expectedPages << 1));
+                assert(dirty_read_pages == expectedPages && reads - dirtyReads == runs);
+                NSUInteger registeredBytes =
+                    host ? pendingReads.length - pendingBytes :
+                           [(NSData *)[[adapter valueForKey:@"independentReads"]
+                               valueForKey:@"spans"] length];
+                unsigned expectedPatterns = laneRuns * (merged ? 1 : 2) + 1;
+                assert(registeredBytes ==
+                       expectedPatterns * sizeof(NV2AMetalVRAMReadPattern));
                 assert(dirty.dirty && notifications == downloads &&
                        !token.submitted && !token.cancelled);
                 if (!host)
@@ -139,6 +179,12 @@ static void fetch_sparse_read_tests(void)
                                                       error:&error],
                         error);
                 assert(ready); /* Same hole page, outside the dirty surface. */
+                require([surfaces tryIdleCPUAccessAtAddress:4096 + selected * 4096 + 20
+                                                     length:1
+                                                      write:YES
+                                                  completed:&ready
+                                                      error:&error], error);
+                assert(ready);
                 ready = YES;
                 require([surfaces
                             tryIdleCPUAccessAtAddress:4096 + selected * 4096
@@ -189,6 +235,13 @@ static void fetch_sparse_read_tests(void)
            "stride;index/stride holes undownloaded,unused bytes writable,selected "
            "Current protected,exact GPU attributes PASS\n",
            cases);
+    puts("Sparse DMA dirty pages: one TCG query per page run, "
+         "no queries across gaps and unchanged GPU byte ownership PASS");
+    puts("Sparse DMA interleaved lanes: adjacent and overlapping attributes "
+         "share read records; gapped lanes and unused writable bytes PASS");
+    assert(joinedCurrent == 6);
+    puts("Sparse DMA Current ranges: six adjacent accepted Current values "
+         "share exact stride records with decoded suffix vertices PASS");
     groups++;
 }
 #endif

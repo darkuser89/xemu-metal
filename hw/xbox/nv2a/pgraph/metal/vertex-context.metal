@@ -28,6 +28,30 @@ void writable_write(thread VPReadOnlyRegisters &r, uint destination,
         vp_write(r.output[destination & 255u], value, mask,
                  (destination & 255u) == 5);
 }
+void writable_write(thread VPIndependentWriteRegisters &r, uint destination,
+                    float4 value, uint mask, bool enable)
+{
+    if (destination & 256u) {
+        vp_write(r.output[destination & 255u], value, mask,
+                 (destination & 255u) == 5);
+    } else if (enable) {
+        if (destination >= 192 ||
+            (!r.full_access && destination < 96 && destination != 58 &&
+             destination != 59)) {
+            r.fault = NV2AMetalProgramFaultConstantRange;
+        } else if (r.publish) {
+            float4 old(r.context->constants[destination][0],
+                       r.context->constants[destination][1],
+                       r.context->constants[destination][2],
+                       r.context->constants[destination][3]);
+            vp_write(old, value, mask, false);
+            for (uint lane = 0; lane < 4; lane++)
+                r.context->constants[destination][lane] = old[lane];
+            if (mask)
+                r.context->dirty[destination] = 1;
+        }
+    }
+}
 template <typename Registers>
 inline __attribute__((always_inline))
 void writable_step(constant NV2AMetalProgramInstruction &op,
@@ -333,6 +357,86 @@ NV2A_METAL_READONLY_ENTRY(nv2a_readonly_raster_program, true,
     }
 NV2A_METAL_READONLY_RAW_ENTRY(nv2a_readonly_raw_program,
                               NV2AMetalReadonlyInterpreter)
+
+/* Host admission proves static fault-free apertures and excludes every read
+ * of a written row. Each vertex resets its registers independently, while
+ * the last invocation supplies exactly the serial loop's final context.
+ * A chained predecessor is immutable for this entire dispatch. */
+template <bool Compact, bool OmitRaster = false, bool Chained = false>
+static void independent_writable_program(
+    device const NV2AMetalProgramInput *inputs,
+    device NV2AMetalProgramOutput *raw, device NV2AMetalVertex *vertices,
+    constant NV2AMetalWritableParameters &parameters,
+    constant NV2AMetalProgramInstruction *program,
+    device NV2AMetalWritableContext *context,
+    device const NV2AMetalWritableContext *previous, uint index)
+{
+    constant NV2AMetalProgramUniforms &u = parameters.common;
+    if (index >= max(u.vertex_count, 1u))
+        return;
+    VPIndependentWriteRegisters r;
+    r.full_access = parameters.full_access != 0;
+    r.address = 0;
+    r.fault = Chained ? previous->fault : 0;
+    r.previous = Chained ? previous : nullptr;
+    r.context = context;
+    r.publish = index + 1 == max(u.vertex_count, 1u);
+    if (r.publish) {
+        for (uint row = 0; row < 192; row++) {
+            float4 value = vp_context_constant(u, r, row);
+            for (uint lane = 0; lane < 4; lane++)
+                context->constants[row][lane] = value[lane];
+            context->dirty[row] = 0;
+        }
+        context->fault = r.fault;
+        for (uint i = 0; i < 3; i++)
+            context->reserved[i] = 0;
+    }
+    if (!r.fault && index < u.vertex_count) {
+        for (uint row = 0; row < 12; row++)
+            r.temporary[row] = float4(0);
+        for (uint row = 0; row < 13; row++)
+            r.output[row] = float4(0, 0, 0, 1);
+        writable_execute(program, u, inputs[index], r, true);
+        writable_store<false, Compact, OmitRaster>(
+            r, u, raw, vertices, index, parameters.rasterize);
+    }
+    if (r.publish)
+        context->fault = r.fault;
+}
+
+#define NV2A_METAL_INDEPENDENT_WRITE_ENTRY(Name, Compact, OmitRaster)          \
+kernel void Name(                                                           \
+    device const NV2AMetalProgramInput *inputs [[buffer(0)]],                 \
+    device NV2AMetalProgramOutput *raw [[buffer(1)]],                         \
+    device NV2AMetalVertex *vertices [[buffer(2)]],                           \
+    constant NV2AMetalWritableParameters &parameters [[buffer(3)]],           \
+    constant NV2AMetalProgramInstruction *program [[buffer(4)]],              \
+    device NV2AMetalWritableContext *context [[buffer(5)]],                   \
+    uint index [[thread_position_in_grid]])                                  \
+{                                                                           \
+    independent_writable_program<Compact, OmitRaster>(                       \
+        inputs, raw, vertices, parameters, program, context, nullptr, index); \
+}                                                                           \
+kernel void Name##_chained(                                                 \
+    device const NV2AMetalProgramInput *inputs [[buffer(0)]],                 \
+    device NV2AMetalProgramOutput *raw [[buffer(1)]],                         \
+    device NV2AMetalVertex *vertices [[buffer(2)]],                           \
+    constant NV2AMetalWritableParameters &parameters [[buffer(3)]],           \
+    constant NV2AMetalProgramInstruction *program [[buffer(4)]],              \
+    device NV2AMetalWritableContext *context [[buffer(5)]],                   \
+    device const NV2AMetalWritableContext *previous [[buffer(6)]],            \
+    uint index [[thread_position_in_grid]])                                  \
+{                                                                           \
+    independent_writable_program<Compact, OmitRaster, true>(                 \
+        inputs, raw, vertices, parameters, program, context, previous, index); \
+}
+NV2A_METAL_INDEPENDENT_WRITE_ENTRY(nv2a_independent_writable_program, false,
+                                  false)
+NV2A_METAL_INDEPENDENT_WRITE_ENTRY(nv2a_independent_writable_raster_program,
+                                  true, false)
+NV2A_METAL_INDEPENDENT_WRITE_ENTRY(nv2a_independent_writable_raw_program, true,
+                                  true)
 
 kernel void
 nv2a_state_program(device const NV2AMetalStateInput *inputs [[buffer(0)]],

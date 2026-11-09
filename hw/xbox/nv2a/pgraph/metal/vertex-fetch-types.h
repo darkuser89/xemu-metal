@@ -32,6 +32,7 @@ typedef struct NV2AMetalFetchUniforms {
     /* Accepted Pending vertices precede this full-input ordinal. The GPU emits
      * only the suffix, plus Current even when it selects the cached prefix. */
     unsigned int first_decoded_vertex;
+    unsigned int record_faults;
 } NV2AMetalFetchUniforms;
 
 #endif

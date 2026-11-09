@@ -155,11 +155,14 @@ static TransferUniformOutput *encode_case(TransferUniformCommands *commands,
         ((uint8_t *)source.contents)[i] =
             (i * 73 + test * 29 + round * 19) & 255;
     memset(output.contents, 0xa5, output.length);
+    NSUInteger uploadsBefore = commands.uploads.count;
+    BOOL directUpload = kind == 1 && config.scale == 1 && !config.swizzle;
     require([surface encodeUploadFromBuffer:source
                                      offset:3
                                    commands:commands
                                       error:&error],
             error);
+    assert(commands.uploads.count == uploadsBefore + !directUpload);
     const unsigned channels[] = { NV097_CLEAR_SURFACE_R, NV097_CLEAR_SURFACE_G,
                                   NV097_CLEAR_SURFACE_B,
                                   NV097_CLEAR_SURFACE_A };
@@ -481,11 +484,14 @@ int main(void)
                                                       clearer, blitter, round,
                                                       test)];
                         }
-                assert(arena.uploads.count == 193 &&
-                       dedicated.uploads.count == 193);
+                /* Two linear, scale-one R8 uploads use native buffer-to-
+                 * texture copies and need no uniform upload. All remaining
+                 * transfers, clears and blits still capture their uniforms. */
+                assert(arena.uploads.count == 191 &&
+                       dedicated.uploads.count == 191);
                 assert(arena.copied == dedicated.copied && arena.nonzero > 180);
                 assert(arena.buffers.count == 2 &&
-                       dedicated.buffers.count == 193);
+                       dedicated.buffers.count == 191);
                 for (TransferUniformCommands *commands in
                      @[ arena, dedicated ]) {
                     verify_uniforms(commands);

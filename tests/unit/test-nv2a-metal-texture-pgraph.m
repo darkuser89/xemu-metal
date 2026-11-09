@@ -14,6 +14,7 @@
 #include "test-metal-legacy-cube.h"
 #include "test-metal-texture-readback.h"
 #import "hw/xbox/nv2a/pgraph/metal/texture-snapshot.h"
+#import <objc/runtime.h>
 
 static NV2AState *state;
 static NV2AMetalSurfaceCache *surfaces;
@@ -22,11 +23,34 @@ static DMAObject dma_a, dma_b;
 static bool dirty_pages[64];
 static unsigned vram_size = 65536;
 static unsigned checks, dirty_checks, dirty_restores, dma_loads;
+@interface NV2AMetalSurfaceCache (TextureTestWaits)
+- (BOOL)waitForRecording:(NV2AMetalSurfaceRecording *)recording
+           producersOnly:(BOOL)producersOnly
+                   error:(NSError **)error;
+- (BOOL)waitForSubmission:(NV2AMetalSubmission *)submission
+                   prefix:(NSUInteger)prefix
+            producersOnly:(BOOL)producersOnly
+                    error:(NSError **)error;
+@end
 @interface TextureTestSurfaces : NV2AMetalSurfaceCache
-@property(nonatomic) NSUInteger submissions, waits;
-@property(nonatomic) BOOL failNextWait, cancelNextSubmit;
+@property(nonatomic) NSUInteger submissions, waits, collections;
+@property(nonatomic) NSUInteger splitReadAddress;
+@property(nonatomic) BOOL failNextWait, cancelNextSubmit, failNextCollection;
 @end
 @implementation TextureTestSurfaces
+- (BOOL)collectCompletedWithError:(NSError **)error
+{
+    self.collections++;
+    if (self.failNextCollection) {
+        self.failNextCollection = NO;
+        if (error)
+            *error = [NSError errorWithDomain:@"test.texture.collection"
+                                        code:1 userInfo:nil];
+        return NO;
+    }
+    return [super collectCompletedWithError:error];
+}
+
 - (BOOL)submitWithError:(NSError **)error
 {
     self.submissions++;
@@ -40,17 +64,54 @@ static unsigned checks, dirty_checks, dirty_restores, dma_loads;
     }
     return [super submitWithError:error];
 }
-- (BOOL)waitUntilIdleWithError:(NSError **)error
+- (BOOL)waitForRecording:(NV2AMetalSurfaceRecording *)recording
+           producersOnly:(BOOL)producersOnly
+                   error:(NSError **)error
+{
+    if (self.cancelNextSubmit && producersOnly && self.recording == recording) {
+        self.cancelNextSubmit = NO;
+        /* The producer submit seals this section; cancel before it is accepted.
+         */
+        [self cancel];
+        assert(recording.cancelled);
+        if (error)
+            *error = [NSError errorWithDomain:@"test.texture.cancelled"
+                                         code:1
+                                     userInfo:nil];
+        return NO;
+    }
+    return [super waitForRecording:recording
+                     producersOnly:producersOnly
+                             error:error];
+}
+- (BOOL)waitForSubmission:(NV2AMetalSubmission *)submission
+                   prefix:(NSUInteger)prefix
+            producersOnly:(BOOL)producersOnly
+                    error:(NSError **)error
 {
     self.waits++;
     if (self.failNextWait) {
         self.failNextWait = NO;
         if (error)
             *error = [NSError errorWithDomain:@"test.texture.completion"
-                                        code:1 userInfo:nil];
+                                         code:1
+                                     userInfo:nil];
         return NO;
     }
-    return [super waitUntilIdleWithError:error];
+    return [super waitForSubmission:submission prefix:prefix
+                    producersOnly:producersOnly error:error];
+}
+- (BOOL)prepareGPUReadPatterns:(const NV2AMetalVRAMReadPattern *)patterns
+                         count:(NSUInteger)count
+                         error:(NSError **)error
+{
+    if (_splitReadAddress && count && patterns[0].address == _splitReadAddress) {
+        _splitReadAddress = 0;
+        assert(self.recording);
+        if (![self submitWithError:error])
+            return NO;
+    }
+    return [super prepareGPUReadPatterns:patterns count:count error:error];
 }
 @end
 bool tcg_allowed = true;
@@ -5823,10 +5884,57 @@ static void palette_completion_tests(void)
     memset(state->vram_ptr + palette, 0, 128);
     uint32_t words[] = { 0xff112233, 0xffaa3355 };
     memcpy(state->vram_ptr + palette, words, sizeof(words));
+    id<MTLDevice> device = surfaces.commands.device;
+    NV2AMetalCommands *readerCommands =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    require(readerCommands != nil, error);
+    const NV2AMetalVRAMReadSpan span = { 61440, sizeof(uint32_t) };
+    uint32_t expected = 0x1728394a;
+    cpu_write(span.address, span.length);
+    memcpy(state->vram_ptr + span.address, &expected, sizeof(expected));
+    NV2AMetalIndependentReads *reader = nil;
+    require([surfaces tryBeginIndependentReads:&span
+                                         count:1
+                                      commands:readerCommands
+                                         reads:&reader
+                                         error:&error],
+            error);
+    assert(reader);
+    id<MTLBuffer> readback =
+        [device newBufferWithLength:span.length
+                            options:MTLResourceStorageModeShared];
+    require(readback && [readerCommands addResource:readback error:&error],
+            error);
+    id<MTL4ComputeCommandEncoder> encoder =
+        [readerCommands.commandBuffer computeCommandEncoder];
+    assert(encoder);
+    [encoder copyFromBuffer:surfaces.vram
+               sourceOffset:span.address
+                   toBuffer:readback
+          destinationOffset:0
+                       size:span.length];
+    [encoder endEncoding];
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    Ivar queueIvar =
+        class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(readerCommands, queueIvar);
+    assert(gate && queue);
+    [queue waitForEvent:gate value:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!gate.signaledValue)
+                         gate.signaledValue = 2;
+                   });
+    require([surfaces submitIndependentReads:reader error:&error], error);
     NSUInteger waits = counted.waits;
     NV2AMetalPGRAPHTextureSnapshot *first = prepare();
+    assert(!gate.signaledValue);
+    assert(![readerCommands.lastSubmitted completedWithError:&error] && !error);
     assert(counted.waits == waits + 1);
     require([first validateCompletedWithError:&error], error);
+    gate.signaledValue = 1;
+    require([surfaces completeIndependentReads:reader error:&error], error);
+    assert(!memcmp(readback.contents, &expected, sizeof(expected)));
     id<MTLBuffer> oldPixels = read_texture(first, 0);
     id<MTL4CommandBuffer> pending = surfaces.commands.commandBuffer;
     waits = counted.waits;
@@ -5925,13 +6033,164 @@ static void palette_completion_tests(void)
     assert(![mixed validateCompletedWithError:&error]);
     finish();
     require([mixed validateCompletedWithError:&error], error);
+
+    /* Model a dependency boundary between a new short palette and a later
+     * ordinary decode. Only the palette's submitted prefix needs feedback. */
+    cpu_write(indices, 16);
+    memset(state->vram_ptr + indices, 0, 16);
+    cpu_write(mixedAddress, 16);
+    memset(state->vram_ptr + mixedAddress, 123, 16);
+    counted.splitReadAddress = mixedAddress;
+    submissions = counted.submissions;
+    mixed = prepare();
+    NV2AMetalCachedTexture *shortPalette = [mixed textureAtIndex:0];
+    NV2AMetalCachedTexture *ordinary = [mixed textureAtIndex:1];
+    assert(!counted.splitReadAddress && counted.submissions == submissions + 1);
+    assert(shortPalette.decodeValidated && shortPalette.producerRecording.completed &&
+           !ordinary.decodeValidated && ordinary.producerRecording == surfaces.recording &&
+           !ordinary.producerRecording.submitted);
+    id<MTLBuffer> palettePixels = read_texture(mixed, 0);
+    id<MTLBuffer> ordinaryPixels = read_texture(mixed, 1);
+    finish();
+    require([mixed validateCompletedWithError:&error], error);
+    pixel(palettePixels, 4, 0, 0, 0x33 / 255.f, 0x44 / 255.f, 0x77 / 255.f, 1);
+    pixel(ordinaryPixels, 4, 0, 0, 123 / 255.f, 123 / 255.f, 123 / 255.f, 1);
+    puts("PGRAPH short palette prefix: completed palette, later ordinary "
+         "decode stays open, no additional submission and exact pixels PASS");
+    uint64_t captureSerial = surfaces.commands.recordingSerial;
+    NSData *mixedCapture = [mixed snapshotWithCommands:surfaces.commands
+                                               error:&error];
+    require(mixedCapture != nil, error);
+    assert(surfaces.commands.recordingSerial == captureSerial + 1);
+    stage_roundtrip(mixed);
+    puts("PGRAPH texture snapshot batch: two distinct stages, one readback "
+         "submission and byte-exact restore/resave PASS");
+
     only_stage0();
     stage_roundtrip(changed);
-    puts("PGRAPH palette completion: initial/changed uploads validate; eight "
+
+    /* Every byte is a valid index for a full palette. The consumer can read
+     * the pending decode on the GPU before any CPU validation wait. */
+    pg->regs_[NV_PGRAPH_TEXPALETTE0] = 512 | NV_PGRAPH_TEXPALETTE0_CONTEXT_DMA;
+    cpu_write(indices, 16);
+    memset(state->vram_ptr + indices, UINT8_MAX, 16);
+    cpu_write(palette, 256 * sizeof(uint32_t));
+    uint32_t lastColor = 0xff447788;
+    memcpy(state->vram_ptr + palette + UINT8_MAX * sizeof(lastColor),
+           &lastColor, sizeof(lastColor));
+    waits = counted.waits;
+    submissions = counted.submissions;
+    NV2AMetalPGRAPHTextureSnapshot *full = prepare();
+    assert(surfaces.commands.commandBuffer && counted.waits == waits &&
+           counted.submissions == submissions &&
+           ![full textureAtIndex:0].decodeValidated);
+    pixels = read_texture(full, 0);
+    finish();
+    require([full validateCompletedWithError:&error], error);
+    pixel(pixels, 4, 0, 0, 0x44 / 255.f, 0x77 / 255.f, 0x88 / 255.f, 1);
+    puts("PGRAPH palette completion: initial/changed uploads validate; "
+         "unrelated GPU reader stays gated; eight "
          "completed hits add zero submissions/waits; invalid indices, injected "
          "completion failure and cancellation/retry, queued old pixels, "
-         "mixed pending stage and "
-         "snapshot roundtrip PASS");
+         "mixed pending stage, snapshot roundtrip and full palette index 255 "
+         "without producer wait PASS");
+    checks++;
+}
+static void palette_alias_prefix_test(void)
+{
+    NSError *error = nil;
+    const NSUInteger indices = 24576, palette = 32768;
+    const uint32_t oldColor = 0xff123456;
+    cpu_write(indices, 64);
+    cpu_write(palette, 64);
+    memcpy(state->vram_ptr + palette, &oldColor, sizeof(oldColor));
+    const NV2AMetalSurfaceConfig config = {
+        .format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+        .width = 4, .height = 4, .pitch = 16, .scale = 1, .color = YES,
+    };
+    NV2AMetalCachedSurface *targets[] = {
+        [surfaces prepareSurfaceAtAddress:indices config:&config frame:1
+                                    error:&error],
+        [surfaces prepareSurfaceAtAddress:palette config:&config frame:1
+                                    error:&error],
+    };
+    require(targets[0] && targets[1], error);
+    finish();
+
+    id<MTLDevice> device = surfaces.commands.device;
+    NV2AMetalCommands *readerCommands =
+        [[NV2AMetalCommands alloc] initWithDevice:device error:&error];
+    require(readerCommands != nil, error);
+    const NV2AMetalVRAMReadSpan span = { palette, sizeof(oldColor) };
+    NV2AMetalIndependentReads *reader = nil;
+    require([surfaces tryBeginIndependentReads:&span count:1
+                                      commands:readerCommands reads:&reader
+                                         error:&error] && reader,
+            error);
+    id<MTLBuffer> before =
+        [device newBufferWithLength:span.length
+                            options:MTLResourceStorageModeShared];
+    require(before && [readerCommands addResource:before error:&error], error);
+    id<MTL4ComputeCommandEncoder> copy =
+        [readerCommands.commandBuffer computeCommandEncoder];
+    assert(copy);
+    [copy copyFromBuffer:surfaces.vram sourceOffset:span.address
+               toBuffer:before destinationOffset:0 size:span.length];
+    [copy endEncoding];
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    Ivar queueIvar = class_getInstanceVariable(NV2AMetalCommands.class, "_queue");
+    id<MTL4CommandQueue> queue = object_getIvar(readerCommands, queueIvar);
+    assert(gate && queue);
+    [queue waitForEvent:gate value:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                     if (!gate.signaledValue)
+                         gate.signaledValue = 2;
+                   });
+    require([surfaces submitIndependentReads:reader error:&error], error);
+
+    NV2AMetalClear *clearer = [[NV2AMetalClear alloc] initWithDevice:device
+                                                             error:&error];
+    require(clearer != nil, error);
+    for (unsigned i = 0; i < 2; i++) {
+        require([surfaces prepareSelectedSurface:targets[i]
+                              discardingContents:YES error:&error], error);
+        NV2AMetalClearConfig clear = {
+            .parameter = NV097_CLEAR_SURFACE_COLOR,
+            .rect = { 0, 0, 4, 4 },
+            .uniforms = { .color = { i, 0, 0, i } },
+        };
+        require([clearer encodeColor:targets[i].transfer.texture zeta:nil
+                              config:&clear commands:surfaces.commands
+                               error:&error] &&
+                    [surfaces markWritten:targets[i] replacingContents:YES
+                                    error:&error], error);
+    }
+    NV2AMetalSurfaceRecording *prefix = surfaces.recording;
+    require([surfaces checkpointWithError:&error], error);
+    only_stage0();
+    registers(0, NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8, 4, 0,
+              indices - dma_a.address, false);
+    state->pgraph.regs_[NV_PGRAPH_TEXPALETTE0] =
+        (palette - dma_b.address) | NV_PGRAPH_TEXPALETTE0_CONTEXT_DMA;
+    NV2AMetalPGRAPHTextureSnapshot *snapshot = prepare();
+    NV2AMetalSurfaceRecording *decode = surfaces.recording;
+    assert(prefix.submitted && decode && !decode.submitted &&
+           !gate.signaledValue);
+    require([surfaces waitForSubmission:surfaces.commands.lastSubmitted
+                                  error:&error], error);
+    assert(prefix.completed && surfaces.recording == decode &&
+           !gate.signaledValue);
+    id<MTLBuffer> out = read_texture(snapshot, 0);
+    require([surfaces submitWithError:&error], error);
+    gate.signaledValue = 1;
+    require([surfaces completeIndependentReads:reader error:&error], error);
+    finish();
+    require([snapshot validateCompletedWithError:&error], error);
+    assert(!memcmp(before.contents, &oldColor, sizeof(oldColor)));
+    pixel(out, 4, 0, 0, 1, 0, 0, 1);
+    puts("Palette alias prefix: accepted clears complete ahead of the gated "
+         "palette reader; decode uses both ordered GPU writebacks PASS");
     checks++;
 }
 static void tcg_external_surface_test(void)
@@ -6005,10 +6264,22 @@ static void tcg_external_surface_test(void)
     /* A prior completed writeback may leave the same dirty-client page set.
      * It must not discard a newer GPU-owned green surface in favour of yellow
      * RAM. */
+    /* RTT capture must bind its own upload slice, even with preceding data. */
+    const uint32_t unused[4] = { 0 };
+    NSUInteger unusedOffset;
+    require([surfaces.commands uploadBytes:unused
+                                    length:sizeof(unused)
+                                    offset:&unusedOffset
+                                     error:&error] != nil,
+            error);
+    NV2AMetalSurfaceRecording *recording = surfaces.recording;
     dirty_pages[10] = true;
     snapshot = prepare();
+    assert([snapshot textureAtIndex:0].producerRecording == recording &&
+           ![snapshot validateCompletedWithError:&error]);
     out = read_texture(snapshot, 0);
     finish();
+    require([snapshot validateCompletedWithError:&error], error);
     pixel(out, 4, 0, 0, 0, 1, 0, 1);
     assert(surface.dirty);
     uint32_t unchanged;
@@ -6214,8 +6485,10 @@ int main(int argc, char **argv)
         require(adapter != nil, error);
         if (captureOnly) {
             texture_capture_tests();
+            tcg_external_surface_test();
         } else if (paletteOnly) {
             palette_completion_tests();
+            palette_alias_prefix_test();
         } else if (scaledGradientOnly) {
             for (unsigned mode = 0; mode < 3; mode++)
                 hilo16_gradient_tests(mode, 2);
@@ -6255,6 +6528,7 @@ int main(int argc, char **argv)
             volume_mip_chain_tests();
             legacy_cropped_cube_tests();
             palette_completion_tests();
+            palette_alias_prefix_test();
             palette_tests();
             tcg_external_surface_test();
             dirty_page_and_dma_tests();

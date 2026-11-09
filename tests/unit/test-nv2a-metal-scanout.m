@@ -89,12 +89,36 @@ static double quantize(double x, unsigned bits)
     unsigned n = (1u << bits) - 1;
     return floor(fmin(1, fmax(0, x)) * n + .5) / n;
 }
+static void shared_scanout_shader_test(void)
+{
+    NSError *error = nil;
+    NV2AMetalScanout *rgba = [[NV2AMetalScanout alloc]
+        initWithDevice:commands.device pixelFormat:MTLPixelFormatRGBA8Unorm
+                 error:&error];
+    require(rgba != nil, error);
+    id module = [rgba valueForKey:@"module"];
+    id context = [module valueForKey:@"context"];
+    NSUInteger builds = [[context valueForKey:@"libraryBuildCount"]
+        unsignedIntegerValue];
+    NV2AMetalScanout *bgra = [[NV2AMetalScanout alloc]
+        initWithDevice:commands.device pixelFormat:MTLPixelFormatBGRA8Unorm
+                 error:&error];
+    require(bgra != nil, error);
+    assert(module && context && builds && module == [bgra valueForKey:@"module"] &&
+           [[context valueForKey:@"libraryBuildCount"] unsignedIntegerValue] ==
+               builds);
+    assert([rgba valueForKey:@"arguments"] != [bgra valueForKey:@"arguments"] &&
+           [rgba valueForKey:@"pipeline"] != [bgra valueForKey:@"pipeline"]);
+    puts("Scanout shader library: two target formats share compilation and "
+         "retain separate pipelines and argument tables PASS");
+}
 int main(void)
 {
     @autoreleasepool {
         NSError *error = nil;
         commands = [[NV2AMetalCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        shared_scanout_shader_test();
         for (unsigned y = 0; y < 4; y++)
             for (unsigned x = 0; x < 4; x++)
                 for (unsigned k = 0; k < 4; k++) {
@@ -588,6 +612,35 @@ int main(void)
               }
             });
         assert(alias_rejects == 24 && alias_draws == 33);
+        id<MTLTexture> single = texture(MTLPixelFormatRGBA8Unorm, 1, 1,
+                                       MTLTextureUsageShaderRead);
+        id<MTLTexture> repeated = texture(MTLPixelFormatRGBA8Unorm, 4, 4,
+                                         MTLTextureUsageRenderTarget);
+        const uint8_t sample[] = { 13, 73, 201, 129 };
+        [single replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                  mipmapLevel:0
+                    withBytes:sample
+                  bytesPerRow:4];
+        for (unsigned border = 0; border < 2; border++) {
+            NV2AMetalScanoutUniforms wrap = {
+                .output_size = { 4, 4 },
+                .line_offset = 1e-20f,
+                .source_border = border,
+            };
+            require([commands beginWithError:&error] != nil, error);
+            require([alias_scanout encodeSource:single overlay:nil
+                                         target:repeated uniforms:&wrap
+                                       commands:commands error:&error], error);
+            require([commands submitWithError:&error], error);
+            require([commands waitUntilIdleWithError:&error], error);
+            uint8_t bytes[4 * 4 * 4];
+            [repeated getBytes:bytes bytesPerRow:16
+                     fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+            for (unsigned i = 0; i < sizeof(bytes); i++)
+                assert(bytes[i] == (border ? 0 : sample[i % 4]));
+        }
+        puts("Scanout single texel: extreme repeat and transparent border "
+             "match exact RGBA bytes PASS");
         printf("Scanout storage: %u rejections, %u GPU draws, "
                "inactive overlay aliases allowed PASS\n",
                alias_rejects, alias_draws);

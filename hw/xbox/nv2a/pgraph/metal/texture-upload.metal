@@ -285,6 +285,27 @@ kernel void nv2a_texture_decode(uint3 id [[thread_position_in_grid]],
                                           uint3(u.source_width, u.source_height,
                                                 u.source_depth)) *
                                u.bytes_per_pixel;
+        if (u.linear && !u.signed_channels && u.bytes_per_pixel == 4 &&
+            ((u.output_storage == NV2AMetalTextureStorageBGRA8 &&
+              u.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8) ||
+             (u.output_storage == NV2AMetalTextureStorageBGRX8 &&
+              u.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8))) {
+            ((device uchar4 *)output)[index] =
+                uchar4(source[address], source[address + 1],
+                       source[address + 2], source[address + 3]);
+            return;
+        }
+        if (u.output_storage >= NV2AMetalTextureStorageByteY8 &&
+            u.output_storage <= NV2AMetalTextureStorageByteA8) {
+            output[index] = source[address];
+            return;
+        }
+        if (u.output_storage >= NV2AMetalTextureStorageByteA8Y8 &&
+            u.output_storage <= NV2AMetalTextureStorageByteR8B8) {
+            ((device uchar2 *)output)[index] =
+                uchar2(source[address], source[address + 1]);
+            return;
+        }
         if (u.output_storage == NV2AMetalTextureStorageSnorm8 &&
             u.format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5 &&
             !u.signed_channels) {
@@ -361,5 +382,80 @@ kernel void nv2a_texture_decode(uint3 id [[thread_position_in_grid]],
         ((device float *)output)[index] = color.r;
     } else {
         ((device float4 *)output)[index] = color;
+    }
+}
+
+/* One thread owns one compressed XY block in one depth slice. The legacy
+ * per-texel decoder above remains the independent reference. Only unsigned
+ * RGBA8 layouts with identical source/output dimensions reach this kernel. */
+kernel void
+nv2a_texture_decode_bc_blocks(uint3 id [[thread_position_in_grid]],
+                              device const uchar *source [[buffer(0)]],
+                              device const uchar *palette [[buffer(1)]],
+                              constant NV2AMetalTextureDecodeUniforms &u
+                              [[buffer(2)]],
+                              device uchar *output [[buffer(3)]],
+                              device atomic_uint &faults [[buffer(4)]])
+{
+    uint blocks_x = (u.source_width + 3) / 4;
+    uint blocks_y = (u.source_height + 3) / 4;
+    if (id.x >= blocks_x || id.y >= blocks_y || id.z >= u.depth)
+        return;
+    uint chunk = id.z / 4;
+    uint chunk_depth = min(4u, u.source_depth - chunk * 4);
+    uint block = chunk * 4 * blocks_x * blocks_y +
+                 (id.y * blocks_x + id.x) * chunk_depth + id.z % 4;
+    device const uchar *p = source + block * u.block_size;
+    device const uchar *colors = p + (u.block_size == 8 ? 0 : 8);
+    uint c0 = texture_u16(colors), c1 = texture_u16(colors + 2);
+    uint color_bits = texture_u32(colors + 4);
+    uint3 rgb[4];
+    rgb[0] = texture_rgb565(c0);
+    rgb[1] = texture_rgb565(c1);
+    bool transparent = u.block_size == 8 && c0 <= c1;
+    if (transparent) {
+        rgb[2] = (rgb[0] + rgb[1]) / 2;
+        rgb[3] = uint3(0);
+    } else {
+        rgb[2] = (2 * rgb[0] + rgb[1]) / 3;
+        rgb[3] = (rgb[0] + 2 * rgb[1]) / 3;
+    }
+    bool dxt3 = u.format == NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8;
+    bool dxt5 = u.format == NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8;
+    ulong alpha_bits = 0;
+    uint alpha_table[8];
+    if (dxt3) {
+        for (uint i = 0; i < 8; i++)
+            alpha_bits |= ulong(p[i]) << (8 * i);
+    } else if (dxt5) {
+        for (uint i = 0; i < 6; i++)
+            alpha_bits |= ulong(p[2 + i]) << (8 * i);
+        uint a0 = p[0], a1 = p[1];
+        alpha_table[0] = a0;
+        alpha_table[1] = a1;
+        for (uint ai = 2; ai < 8; ai++) {
+            alpha_table[ai] = a0 > a1 ? ((8 - ai) * a0 + (ai - 1) * a1) / 7 :
+                              ai < 6  ? ((6 - ai) * a0 + (ai - 1) * a1) / 5 :
+                              ai == 6 ? 0 :
+                                        255;
+        }
+    }
+    uint2 origin = id.xy * 4;
+    for (uint y = 0; y < 4 && origin.y + y < u.height; y++) {
+        for (uint x = 0; x < 4 && origin.x + x < u.width; x++) {
+            uint pixel = y * 4 + x;
+            uint ci = (color_bits >> (2 * pixel)) & 3;
+            uint alpha = transparent && ci == 3 ? 0 : 255;
+            if (dxt3)
+                alpha = uint((alpha_bits >> (4 * pixel)) & 15) * 17;
+            else if (dxt5)
+                alpha = alpha_table[uint(alpha_bits >> (3 * pixel)) & 7];
+            uint index = id.z * u.output_slice + (origin.y + y) * u.output_row +
+                         origin.x + x;
+            /* The old Unorm8 store rounds (integerByte / 255) * 255 back
+             * to this same byte; all interpolation above is integer. */
+            ((device uchar4 *)output)[index] =
+                uchar4(uchar3(rgb[ci]), uchar(alpha));
+        }
     }
 }

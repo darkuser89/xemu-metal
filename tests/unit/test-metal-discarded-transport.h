@@ -58,9 +58,11 @@ static void discarded_transport_tests(NV2AMetalCommands *commands)
                           vertices:@[ expected ]
                              limit:32
                              error:&error];
+            NV2AMetalSubmission *previous = commands.lastSubmitted;
             NV2AMetalPendingArchive *captured =
                 nv2a_metal_pending_capture(journal, commands, &error);
             require(reference && captured, error);
+            assert(commands.lastSubmitted == previous);
             assert([captured.data isEqualToData:reference.data] &&
                    !memcmp(source.bytes, buffer.contents, source.length));
             for (unsigned cycle = 0; cycle < 2; cycle++) {
@@ -76,9 +78,11 @@ static void discarded_transport_tests(NV2AMetalCommands *commands)
                         [resource
                             isMemberOfClass:NV2AMetalDiscardedVertices.class] :
                         [resource conformsToProtocol:@protocol(MTLBuffer)]);
+                previous = commands.lastSubmitted;
                 captured =
                     nv2a_metal_pending_capture(restored, commands, &error);
                 require(captured != nil, error);
+                assert((commands.lastSubmitted == previous) == (mask == 7));
                 assert([captured.data isEqualToData:reference.data]);
             }
             NV2AMetalPendingJournal *regular =
@@ -155,5 +159,7 @@ static void discarded_transport_tests(NV2AMetalCommands *commands)
          "two raw restore cycles/canonical wire,nonzero legacy bytes and "
          "regular GPU restore preserved;"
          "drawing/size/bounds rejects and exact Metal fill PASS");
+    puts("Pending vertex host capture: 32 shared/zero cases without a GPU "
+         "submission; private restores retain GPU readback PASS");
 }
 #endif

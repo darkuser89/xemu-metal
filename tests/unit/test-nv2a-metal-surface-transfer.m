@@ -30,9 +30,6 @@ static id<MTLBuffer> copyTransferBuffer;
 @implementation SurfaceTransferTestCommands
 - (BOOL)addResource:(id<MTLResource>)resource error:(NSError **)error
 {
-    if (measureDownload && resource.storageMode == MTLStorageModePrivate &&
-        [resource conformsToProtocol:@protocol(MTLBuffer)])
-        privateDownloadBytes += ((id<MTLBuffer>)resource).length;
     if (measureCopy && resource != copyTransferBuffer &&
         resource.storageMode == MTLStorageModePrivate &&
         [resource conformsToProtocol:@protocol(MTLBuffer)])
@@ -47,6 +44,17 @@ static id<MTLBuffer> copyTransferBuffer;
     if (measureCopy)
         copyUniformBytes += length;
     return [super uploadBytes:bytes length:length offset:offset error:error];
+}
+- (id<MTLBuffer>)orderedTransferScratchWithLength:(NSUInteger)length
+                                            error:(NSError **)error
+{
+    id<MTLBuffer> buffer = [super orderedTransferScratchWithLength:length
+                                                             error:error];
+    /* These existing download counters describe the logical transfer span;
+     * a cached backing can be larger than the requested scratch. */
+    if (measureDownload && buffer)
+        privateDownloadBytes += length;
+    return buffer;
 }
 @end
 
@@ -1697,12 +1705,27 @@ static void direct_download_comparison(void)
     method_setImplementation(feedback, (IMP)original_feedback);
 }
 
+#include "test-metal-transfer-scratch.h"
+#include "test-metal-direct-z16.h"
+#include "test-metal-surface-pool.h"
+
 int main(int argc, char **argv)
 {
     @autoreleasepool {
         NSError *error = nil;
         commands = [[SurfaceTransferTestCommands alloc] initWithError:&error];
         require(commands != nil, error);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--surface-pool")))
+            surface_pool_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--surface-pool"))
+            return 0;
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--direct-z16")))
+            direct_z16_tests();
+        if (argc == 2 && !strcmp(argv[1], "--direct-z16"))
+            return 0;
+        transfer_scratch_tests(commands.device);
+        if (argc == 2 && !strcmp(argv[1], "--transfer-scratch"))
+            return 0;
         lazy_surface_tests();
         if (argc == 2 && !strcmp(argv[1], "--lazy-resources"))
             return 0;

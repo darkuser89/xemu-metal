@@ -191,30 +191,38 @@ static BOOL stage_decode(NSData *data, TextureRecord *records,
     if (hilo16)
         _hilo16Mask |= 1u << index;
 }
+- (BOOL)matchesTexture:(NV2AMetalCachedTexture *)texture
+                 stage:(const NV2AMetalTextureStage *)stage
+                 index:(unsigned)index
+                hilo16:(BOOL)hilo16
+{
+    return _textures[index] == texture &&
+           !!(_hilo16Mask & (1u << index)) == hilo16 &&
+           !memcmp(&_stages[index], stage, sizeof(*stage));
+}
 - (NSData *)snapshotWithCommands:(NV2AMetalCommands *)commands
                            error:(NSError **)error
 {
     if (![self validateCompletedWithError:error])
         return nil;
+    NSMutableArray<id<MTLTexture>> *sources = [NSMutableArray new];
+    for (unsigned i = 0; i < 4; i++)
+        if (_enabledMask & (1u << i))
+            [sources addObject:_textures[i].binding.texture];
+    NSUInteger metadataSize = (3 + StageRecordWords * sources.count) * 4;
+    NSArray<NSData *> *images = nv2a_metal_texture_snapshot_images(
+        sources, NV2A_METAL_TEXTURE_SNAPSHOT_MAX - metadataSize, commands, error);
+    if (!images)
+        return nil;
     NSMutableData *data = [NSMutableData new];
     uint32_t header[] = { 0x4d345453, 3, _enabledMask };
     stage_append(data, header, sizeof(header));
+    NSUInteger imageIndex = 0;
     for (unsigned i = 0; i < 4; i++) {
         if (!(_enabledMask & (1u << i)))
             continue;
         NV2AMetalCachedTexture *texture = _textures[i];
-        NSData *image = nv2a_metal_texture_snapshot(texture.binding.texture,
-                                                    commands, error);
-        if (!image)
-            return nil;
-        if (data.length >
-                NV2A_METAL_TEXTURE_SNAPSHOT_MAX - StageRecordWords * 4 ||
-            image.length > NV2A_METAL_TEXTURE_SNAPSHOT_MAX - data.length -
-                               StageRecordWords * 4) {
-            texture_pgraph_error(error,
-                                 @"Texture-stage snapshot exceeds host bound");
-            return nil;
-        }
+        NSData *image = images[imageIndex++];
         uint32_t words[StageRecordWords] = {
             i, texture.scale,
             texture.rectangle | texture.signedNormalized << 1 |
@@ -273,14 +281,20 @@ static BOOL stage_decode(NSData *data, TextureRecord *records,
                                                   error:error];
     if (!sampler)
         return nil;
+    NSMutableArray<NSData *> *images = [NSMutableArray new];
+    for (unsigned i = 0; i < 4; i++)
+        if (mask & (1u << i))
+            [images addObject:records[i].image];
+    NSArray<id<MTLTexture>> *restored =
+        nv2a_metal_texture_restore_images(images, commands, error);
+    if (!restored)
+        return nil;
+    NSUInteger imageIndex = 0;
     for (unsigned i = 0; i < 4; i++) {
         if (!(mask & (1u << i)))
             continue;
         TextureRecord r = records[i];
-        id<MTLTexture> image =
-            nv2a_metal_texture_restore(r.image, commands, error);
-        if (!image)
-            return nil;
+        id<MTLTexture> image = restored[imageIndex++];
         NV2AMetalTextureBinding *binding =
             [sampler bindingForSnapshotTexture:image
                                       sampling:&r.sampling

@@ -28,9 +28,12 @@ static NSArray<NV2AMetalPendingInput *> *read_inputs(PGRAPHState *pg,
     }
     return inputs;
 }
+#include "test-metal-inline-input-reuse.h"
+
 int main(void)
 {
     @autoreleasepool {
+        inline_input_reuse_tests();
         PGRAPHState *pg = calloc(1, sizeof(*pg));
         assert(pg);
         assert(read_inputs(pg, YES).count == 0);
@@ -47,7 +50,29 @@ int main(void)
                        inputs[i].first ==
                            (NSUInteger)pg->draw_arrays_start[i] &&
                        inputs[i].count == (NSUInteger)pg->draw_arrays_count[i]);
+            NSError *error = nil;
+            NSArray *same =
+                [NV2AMetalPGRAPHPendingInputs inputsWithState:pg
+                                                reusingInputs:inputs
+                                                        error:&error];
+            assert(same == inputs && !error);
+            pg->draw_arrays_start[ranges - 1]++;
+            NSArray *changed =
+                [NV2AMetalPGRAPHPendingInputs inputsWithState:pg
+                                                reusingInputs:inputs
+                                                        error:&error];
+            assert(changed && !error && changed != inputs &&
+                   changed.lastObject != inputs.lastObject &&
+                   ((NV2AMetalPendingInput *)changed.lastObject).first ==
+                       ((NV2AMetalPendingInput *)inputs.lastObject).first + 1);
+            pg->draw_arrays_start[ranges - 1]--;
+            pg->draw_arrays_count[ranges - 1] = 0;
+            assert(![NV2AMetalPGRAPHPendingInputs inputsWithState:pg
+                                                 reusingInputs:inputs
+                                                         error:&error] && error);
         }
+        puts("PGRAPH array capture: 1250 exact range-list reuses, changed "
+             "last range preserves the old snapshot, zero counts reject PASS");
         memset(pg, 0, sizeof(*pg));
         NSArray<NV2AMetalPendingInput *> *previous = nil;
         NSUInteger minimum = UINT32_MAX, maximum = 0;
@@ -68,7 +93,7 @@ int main(void)
                 [NV2AMetalPGRAPHPendingInputs inputsWithState:pg
                                                 reusingInputs:next
                                                         error:&error];
-            assert(same && same[0] == next[0] && !error);
+            assert(same == next && same[0] == next[0] && !error);
             previous = next;
         }
         NSError *reuseError = nil;

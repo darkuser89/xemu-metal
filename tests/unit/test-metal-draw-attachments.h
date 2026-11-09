@@ -3,19 +3,22 @@
 #ifndef TEST_METAL_DRAW_ATTACHMENTS_H
 #define TEST_METAL_DRAW_ATTACHMENTS_H
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *(*attachment_original_fetch)(
-    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, NSError **);
+    id, SEL, NSArray<NSNumber *> *, NV2AMetalPendingInput *, BOOL, uint64_t,
+    NSError **);
 static uint64_t attachment_expected_serial;
 static unsigned attachment_fetch_calls;
 static NSArray<NV2AMetalPGRAPHFetchBatch *> *
 attachment_fetch(id owner, SEL selector, NSArray<NSNumber *> *prefixes,
-                 NV2AMetalPendingInput *input, NSError **error)
+                 NV2AMetalPendingInput *input, BOOL dedupe, uint64_t proofLanes,
+                 NSError **error)
 {
     NV2AMetalSurfaceCache *cache = surfaces.cache;
     assert(cache.commands.recordingSerial == attachment_expected_serial &&
            !cache.commands.commandBuffer && !cache.recording &&
            !cache.commands.sealedBufferCount);
     attachment_fetch_calls++;
-    return attachment_original_fetch(owner, selector, prefixes, input, error);
+    return attachment_original_fetch(owner, selector, prefixes, input, dedupe,
+                                     proofLanes, error);
 }
 static unsigned attachment_fault_polls;
 static BOOL attachment_feedback_failure(id owner, SEL selector, NSError **error)
@@ -135,7 +138,8 @@ static void draw_attachment_tests(void)
     }
     Method method = class_getInstanceMethod(
         NV2AMetalPGRAPHFetch.class,
-        @selector(encodeCurrentSnapshotsWithPrefixes:indexedInput:error:));
+        @selector(encodeCurrentSnapshotsWithPrefixes:indexedInput:
+                  deduplicateReadonly:proofAttributeLanes:error:));
     assert(method);
     for (unsigned mode = 0; mode < 3; mode++)
         for (unsigned active = 0; active < 2; active++) {

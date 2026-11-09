@@ -2,9 +2,11 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #ifndef TEST_METAL_RASTER_CHAINS_H
 #define TEST_METAL_RASTER_CHAINS_H
+#import "hw/xbox/nv2a/pgraph/metal/clear.h"
 static id chain_queue;
+static __weak NV2AMetalCommands *chain_commands;
 static NSMutableDictionary<NSValue *, NSNumber *> *chain_flags;
-static unsigned chain_passes, chain_draws;
+static unsigned chain_passes, chain_draws, chain_clear_sections;
 static BOOL chain_fail_emit;
 static id<MTL4RenderCommandEncoder> (*chain_original_encoder)(
     id, SEL, MTL4RenderPassDescriptor *, MTL4RenderEncoderOptions);
@@ -13,6 +15,21 @@ static void (*chain_original_commit)(id, SEL, const id<MTL4CommandBuffer> *,
                                      NSUInteger, MTL4CommitOptions *);
 static BOOL (*chain_original_emit)(id, SEL, id<MTL4RenderCommandEncoder>,
                                    NV2AMetalCommands *, NSError **);
+static BOOL (*chain_original_clear)(id, SEL, id<MTLTexture>, id<MTLTexture>,
+                                    const NV2AMetalClearConfig *,
+                                    MTL4RenderPassDescriptor *,
+                                    NV2AMetalCommands *, NSError **);
+static BOOL chain_clear(id owner, SEL selector, id<MTLTexture> color,
+                        id<MTLTexture> zeta, const NV2AMetalClearConfig *config,
+                        MTL4RenderPassDescriptor *pass,
+                        NV2AMetalCommands *commands, NSError **error)
+{
+    BOOL ok = chain_original_clear(owner, selector, color, zeta, config, pass,
+                                   commands, error);
+    if (ok && commands == chain_commands)
+        chain_clear_sections++;
+    return ok;
+}
 static void chain_begin(id owner, SEL selector,
                         id<MTL4CommandAllocator> allocator)
 {
@@ -93,7 +110,10 @@ static void raster_chain_tests(void)
     Method emit = class_getInstanceMethod(
         NV2AMetalPixelDraw.class,
         @selector(encodeWithRenderEncoder:commands:error:));
-    assert(encoder && begin && commit && emit && queueIvar);
+    Method clear = class_getInstanceMethod(
+        NV2AMetalClear.class,
+        @selector(encodeColor:zeta:config:rasterPass:commands:error:));
+    assert(encoder && begin && commit && emit && clear && queueIvar);
     chain_flags = [NSMutableDictionary new];
     chain_original_encoder =
         (void *)method_setImplementation(encoder, (IMP)chain_encoder);
@@ -103,6 +123,8 @@ static void raster_chain_tests(void)
         (void *)method_setImplementation(commit, (IMP)chain_commit);
     chain_original_emit =
         (void *)method_setImplementation(emit, (IMP)chain_emit);
+    chain_original_clear = (void *)method_getImplementation(clear);
+    method_setImplementation(clear, (IMP)chain_clear);
     unsigned pairs = 0, separate = 0, merged = 0;
     for (unsigned boundaries = 0; boundaries < 2; boundaries++)
         for (unsigned active = 0; active < 2; active++)
@@ -118,7 +140,8 @@ static void raster_chain_tests(void)
                     qemu_mutex_unlock(&pg->lock);
                     chain_queue =
                         object_getIvar(surfaces.cache.commands, queueIvar);
-                    chain_passes = chain_draws = 0;
+                    chain_commands = surfaces.cache.commands;
+                    chain_passes = chain_draws = chain_clear_sections = 0;
                     [chain_flags removeAllObjects];
                     pg->zpass_pixel_count_enable = false;
                     dma[4].limit = 8191;
@@ -220,7 +243,11 @@ static void raster_chain_tests(void)
                     unsigned query = batch_report();
                     assert(query > 0);
                     read_vram(1024, 256);
-                    assert(chain_draws == 70);
+                    /* Committed sections include a continued shader clear;
+                     * all seventy guest draws must still be present. */
+                    assert(chain_clear_sections <=
+                           (boundaries && grouped ? 1u : 0u));
+                    assert(chain_draws == 70 + chain_clear_sections);
                     if (!grouped) {
                         assert(chain_passes == chain_draws);
                         separate += chain_passes;
@@ -279,7 +306,9 @@ static void raster_chain_tests(void)
     method_setImplementation(begin, (IMP)chain_original_begin);
     method_setImplementation(commit, (IMP)chain_original_commit);
     method_setImplementation(emit, (IMP)chain_original_emit);
+    method_setImplementation(clear, (IMP)chain_original_clear);
     chain_queue = nil;
+    chain_commands = nil;
     chain_flags = nil;
     printf("Metal native raster chains:%u exact 70-draw "
            "image/Current/context/query pairs;"

@@ -4,6 +4,7 @@
  */
 
 #import "command.h"
+#include <stdatomic.h>
 #include <string.h>
 
 static const NSUInteger command_slot_count = 3;
@@ -35,13 +36,19 @@ static BOOL command_error(NSError **error, NSString *message)
 - (BOOL)completePartWithError:(nullable NSError *)error
                       failure:(NSError **)failure;
 - (BOOL)waitForOwner:(NV2AMetalCommands *)owner error:(NSError **)error;
+- (void)finishProducersWithError:(nullable NSError *)error;
+- (BOOL)waitForProducersForOwner:(NV2AMetalCommands *)owner
+                           error:(NSError **)error;
 - (BOOL)belongsToOwner:(NV2AMetalCommands *)owner;
 @end
 @implementation NV2AMetalSubmission {
-    BOOL _completed;
+    atomic_bool _completed;
     NSError *_error;
     __weak NV2AMetalCommands *_owner;
     dispatch_group_t _completion;
+    dispatch_group_t _producerCompletion;
+    atomic_bool _producersCompleted;
+    NSError *_producerError;
     NSUInteger _parts;
 }
 - (instancetype)initPendingWithOwner:(NV2AMetalCommands *)owner
@@ -51,12 +58,18 @@ static BOOL command_error(NSError **error, NSString *message)
 {
     self = [super init];
     if (self) {
+        atomic_init(&_completed, false);
+        atomic_init(&_producersCompleted, false);
         _owner = owner;
         _signalEvent = event;
         _signalValue = value;
         _parts = parts;
         _completion = dispatch_group_create();
         dispatch_group_enter(_completion);
+        if (parts > 1) {
+            _producerCompletion = dispatch_group_create();
+            dispatch_group_enter(_producerCompletion);
+        }
     }
     return self;
 }
@@ -76,7 +89,7 @@ static BOOL command_error(NSError **error, NSString *message)
 {
     @synchronized(self) {
         _error = error;
-        _completed = YES;
+        atomic_store_explicit(&_completed, true, memory_order_release);
     }
     dispatch_group_leave(_completion);
 }
@@ -99,13 +112,63 @@ static BOOL command_error(NSError **error, NSString *message)
 {
     return owner && _owner == owner;
 }
+- (BOOL)hasSeparateProducerFeedback
+{
+    return _producerCompletion != nil;
+}
+- (void)finishProducersWithError:(NSError *)error
+{
+    assert(_producerCompletion);
+    _producerError = error;
+    atomic_store_explicit(&_producersCompleted, true, memory_order_release);
+    dispatch_group_leave(_producerCompletion);
+}
+- (BOOL)completedProducersWithError:(NSError **)error
+{
+    if (!_producerCompletion)
+        return [self completedWithError:error];
+    BOOL completed =
+        atomic_load_explicit(&_producersCompleted, memory_order_acquire);
+    /* Full completion can publish just before the producer callback reaches
+     * its separate flag. That full receipt already covers every producer. */
+    if (!completed)
+        return [self completedWithError:error];
+    NSError *failure = nil;
+    /* The producer callback publishes its part after the aggregate update.
+     * If raster feedback arrived first, preserve its now-known failure. */
+    if (completed && !([self completedWithError:&failure] && failure))
+        failure = _producerError;
+    if (error)
+        *error = failure;
+    return completed;
+}
+- (BOOL)waitForProducersForOwner:(NV2AMetalCommands *)owner
+                           error:(NSError **)error
+{
+    if (!_producerCompletion)
+        return [self waitForOwner:owner error:error];
+    if (![self belongsToOwner:owner])
+        return command_error(error,
+                             @"Submission belongs to another Metal queue");
+    if (dispatch_group_wait(
+            _producerCompletion,
+            dispatch_time(DISPATCH_TIME_NOW, completion_timeout_ns)))
+        return command_error(error, @"Timed out waiting for Metal producers");
+    NSError *failure = nil;
+    if (![self completedProducersWithError:&failure])
+        return command_error(error, @"Metal producer completion is missing");
+    if (error)
+        *error = failure;
+    return !failure;
+}
 - (BOOL)completedWithError:(NSError **)error
 {
-    @synchronized(self) {
-        if (error)
-            *error = _completed ? _error : nil;
-        return _completed;
-    }
+    /* The last feedback publishes the immutable result and GPU visibility.
+     * Pending readers never access the error while parts can still write it. */
+    BOOL completed = atomic_load_explicit(&_completed, memory_order_acquire);
+    if (error)
+        *error = completed ? _error : nil;
+    return completed;
 }
 @end
 
@@ -114,8 +177,17 @@ static BOOL command_error(NSError **error, NSString *message)
 @property(nonatomic) id<MTL4CommandQueue> queue;
 @property(nonatomic) id<MTLEvent> event;
 @property(nonatomic) uint64_t value;
+@property(nonatomic) BOOL feedbackSucceeded, needsEventWait;
 @end
 @implementation NV2AMetalQueueWait
+@end
+
+@interface NV2AMetalCommandPart : NSObject
+@property(nonatomic) BOOL producer, completed;
+@property(nonatomic, nullable) NSError *error;
+@property(nonatomic, nullable) NV2AMetalSubmission *receipt;
+@end
+@implementation NV2AMetalCommandPart
 @end
 
 API_AVAILABLE(macos(26.0))
@@ -130,22 +202,131 @@ API_AVAILABLE(macos(26.0))
 @property(nonatomic) BOOL inRaster;
 @property(nonatomic, strong) id<MTLResidencySet> residency;
 @property(nonatomic, strong) NSMutableArray *objects;
+/* Raw identity index. The ordered objects array owns every entry. */
+@property(nonatomic, readonly) CFMutableSetRef objectIdentities;
 @property(nonatomic) NSMutableArray<NV2AMetalQueueWait *> *waits;
+/* The ordered waits retain queue/event state and determine error priority. */
+@property(nonatomic)
+    NSMapTable<NV2AMetalSubmission *, NV2AMetalQueueWait *> *waitReceipts;
 @property(nonatomic, strong) NSMutableArray<id<MTLResource>> *resources;
+@property(nonatomic, strong) NSHashTable<id<MTLResource>> *registeredResources;
 @property(nonatomic, strong) NSHashTable<id<MTLResource>> *resourceRoots;
-@property(nonatomic) NSUInteger resourceBytes, baselineResourceBytes;
+@property(nonatomic, strong) NSMutableArray<id<MTLResource>> *sectionRoots;
+@property(nonatomic) NSUInteger resourceBytes, sealedResourceBytes,
+    baselineResourceBytes;
 @property(nonatomic) uint64_t baselineAllocatorBytes;
 @property(nonatomic) BOOL hasBudgetBaseline;
 @property(nonatomic, strong) NSMutableArray<id<MTLBuffer>> *uploadPages;
+@property(nonatomic, strong, nullable) id<MTLBuffer> transferScratch;
 @property(nonatomic) NSUInteger uploadPage, uploadOffset;
 @property(nonatomic) NSUInteger sealedCount, sealedObjects, sealedResources,
     sealedUploadPage, sealedUploadOffset, sealedWaits;
+/* Encoding owner appends section metadata; callbacks touch only part status
+ * under this slot's monitor. The open host lease prevents early slot reuse. */
+@property(nonatomic) uint64_t batchSerial;
+@property(nonatomic) NSUInteger submittedProducers;
+@property(nonatomic) NSMutableArray<NSNumber *> *sectionWaitCounts, *prefixEnds;
+@property(nonatomic) NSMutableArray<NV2AMetalSubmission *> *prefixReceipts;
+@property(nonatomic) NSMutableArray<NV2AMetalCommandPart *> *parts;
+@property(nonatomic) NSUInteger pendingParts;
+@property(nonatomic) BOOL closed, signaled, aggregateFinished,
+    producersFinished;
+@property(nonatomic, nullable) NV2AMetalSubmission *aggregate;
+- (nullable NSError *)knownFailure;
+- (void)registerPart:(NV2AMetalCommandPart *)part;
+- (void)completePart:(NV2AMetalCommandPart *)part
+               error:(nullable NSError *)error;
+- (void)closeWithAggregate:(nullable NV2AMetalSubmission *)aggregate;
 @property(nonatomic, strong) dispatch_semaphore_t available;
 @property(nonatomic, strong, nullable) NSError *failure;
 @property(nonatomic, strong, nullable) id<CAMetalDrawable> drawable;
 @end
 
 @implementation NV2AMetalCommandSlot
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _objectIdentities = CFSetCreateMutable(NULL, 0, NULL);
+        if (!_objectIdentities)
+            return nil;
+    }
+    return self;
+}
+
+- (NSError *)knownFailure
+{
+    @synchronized(self) {
+        for (NV2AMetalCommandPart *part in _parts)
+            if (part.completed && part.error)
+                return part.error;
+        return nil;
+    }
+}
+- (void)registerPart:(NV2AMetalCommandPart *)part
+{
+    @synchronized(self) {
+        assert(!_closed);
+        [_parts addObject:part];
+        _pendingParts++;
+    }
+}
+- (void)publishCompletion
+{
+    /* Called only under the slot monitor. Commit order, rather than callback
+     * order, selects the error. No resource collections change on this thread.
+     */
+    if (!_closed)
+        return;
+    NSError *failure = [self knownFailure];
+    BOOL producersPending = NO;
+    for (NV2AMetalCommandPart *part in _parts)
+        producersPending |= part.producer && !part.completed;
+    if (_aggregate.hasSeparateProducerFeedback && !_producersFinished &&
+        !producersPending) {
+        _producersFinished = YES;
+        [_aggregate finishProducersWithError:failure];
+    }
+    if (!_pendingParts) {
+        if (_aggregate && !_aggregateFinished) {
+            _aggregateFinished = YES;
+            [_aggregate finishWithError:failure];
+        }
+        if (!_signaled) {
+            _signaled = YES;
+            _failure = failure;
+            dispatch_semaphore_signal(_available);
+        }
+    }
+}
+- (void)completePart:(NV2AMetalCommandPart *)part error:(NSError *)error
+{
+    @synchronized(self) {
+        assert(!part.completed && _pendingParts);
+        part.error = error;
+        part.completed = YES;
+        _pendingParts--;
+        if (part.receipt) {
+            NSError *failure = nil;
+            [part.receipt completePartWithError:error failure:&failure];
+        }
+        [self publishCompletion];
+    }
+}
+- (void)closeWithAggregate:(NV2AMetalSubmission *)aggregate
+{
+    @synchronized(self) {
+        assert(!_closed);
+        _aggregate = aggregate;
+        _closed = YES;
+        [self publishCompletion];
+    }
+}
+- (void)dealloc
+{
+    if (_objectIdentities)
+        CFRelease(_objectIdentities);
+}
 @end
 
 static id<MTLResource> allocation_root(id<MTLResource> resource)
@@ -158,19 +339,6 @@ static id<MTLResource> allocation_root(id<MTLResource> resource)
         return buffer ?: (id<MTLResource>)texture;
     }
     return resource;
-}
-
-static void track_allocation(NSHashTable<id<MTLResource>> *roots,
-                             id<MTLResource> resource, NSUInteger *total)
-{
-    if ([roots containsObject:resource])
-        return;
-    id<MTLResource> root = allocation_root(resource);
-    if ([roots containsObject:root])
-        return;
-    [roots addObject:root];
-    NSUInteger bytes = root.allocatedSize;
-    *total = bytes > NSUIntegerMax - *total ? NSUIntegerMax : *total + bytes;
 }
 
 static BOOL raster_attachment_matches(MTLRenderPassAttachmentDescriptor *a,
@@ -279,13 +447,25 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         }
         slot.objects = [NSMutableArray array];
         slot.waits = [NSMutableArray array];
+        slot.waitReceipts = [NSMapTable
+            mapTableWithKeyOptions:NSPointerFunctionsStrongMemory |
+                                   NSPointerFunctionsObjectPointerPersonality
+                      valueOptions:NSPointerFunctionsStrongMemory];
         slot.resources = [NSMutableArray array];
+        slot.registeredResources = [NSHashTable
+            hashTableWithOptions:NSPointerFunctionsStrongMemory |
+                                 NSPointerFunctionsObjectPointerPersonality];
         slot.resourceRoots = [NSHashTable
             hashTableWithOptions:NSPointerFunctionsStrongMemory |
                                  NSPointerFunctionsObjectPointerPersonality];
+        slot.sectionRoots = [NSMutableArray new];
         slot.buffers = [NSMutableArray arrayWithObject:slot.buffer];
         slot.rasters = [NSMutableArray new];
         slot.uploadPages = [NSMutableArray array];
+        slot.sectionWaitCounts = [NSMutableArray new];
+        slot.prefixEnds = [NSMutableArray new];
+        slot.prefixReceipts = [NSMutableArray new];
+        slot.parts = [NSMutableArray new];
         slot.available = dispatch_semaphore_create(1);
         [slots addObject:slot];
     }
@@ -305,6 +485,12 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     }
 
     if (_batch) {
+        NSError *failure = [_batch knownFailure];
+        if (failure) {
+            if (error)
+                *error = failure;
+            return nil;
+        }
         if (_batch.sealedCount == NV2AMetalCommandBatchLimit) {
             command_error(error, @"Submit the full Metal command batch first");
             return nil;
@@ -344,6 +530,15 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     /* Return secondary buffers' storage before recycling its allocator
      * generation. Only the head is rebound on every reuse; an unused tail
      * must not retain command storage across subsequent allocator resets. */
+    slot.batchSerial = _recordingSerial + 1;
+    slot.submittedProducers = slot.pendingParts = 0;
+    slot.closed = slot.signaled = slot.aggregateFinished =
+        slot.producersFinished = NO;
+    slot.aggregate = nil;
+    [slot.sectionWaitCounts removeAllObjects];
+    [slot.prefixEnds removeAllObjects];
+    [slot.prefixReceipts removeAllObjects];
+    [slot.parts removeAllObjects];
     slot.buffer = slot.buffers[0];
     [slot.rasters removeAllObjects];
     slot.rasterTail = nil;
@@ -358,14 +553,19 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     slot.sealedWaits = 0;
     slot.sealedUploadPage = slot.sealedUploadOffset = 0;
     slot.hasBudgetBaseline = NO;
-    slot.resourceBytes = slot.baselineResourceBytes = 0;
+    slot.resourceBytes = slot.sealedResourceBytes = slot.baselineResourceBytes =
+        0;
     slot.baselineAllocatorBytes = 0;
     slot.buffer = slot.buffers[0];
     slot.drawable = nil;
+    CFSetRemoveAllValues(slot.objectIdentities);
     [slot.objects removeAllObjects];
     [slot.waits removeAllObjects];
+    [slot.waitReceipts removeAllObjects];
     [slot.resources removeAllObjects];
+    [slot.registeredResources removeAllObjects];
     [slot.resourceRoots removeAllObjects];
+    [slot.sectionRoots removeAllObjects];
     [slot.residency removeAllAllocations];
     [slot.residency commit];
     [slot.buffer beginCommandBufferWithAllocator:slot.allocator];
@@ -377,9 +577,18 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
 
 - (void)trackResource:(id<MTLResource>)resource
 {
-    NSUInteger bytes = _current.resourceBytes;
-    track_allocation(_current.resourceRoots, resource, &bytes);
-    _current.resourceBytes = bytes;
+    NSHashTable *roots = _current.resourceRoots;
+    if ([roots containsObject:resource])
+        return;
+    id<MTLResource> root = allocation_root(resource);
+    if ([roots containsObject:root])
+        return;
+    [roots addObject:root];
+    if (_current.sealedCount)
+        [_current.sectionRoots addObject:root];
+    NSUInteger total = _current.resourceBytes, bytes = root.allocatedSize;
+    _current.resourceBytes =
+        bytes > NSUIntegerMax - total ? NSUIntegerMax : total + bytes;
 }
 
 - (BOOL)orderAfterSubmission:(NV2AMetalSubmission *)submission
@@ -390,26 +599,34 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         ![source ownsSubmission:submission])
         return command_error(
             error, @"Invalid Metal GPU dependency owner or recording");
-    NSError *failure = nil;
-    if ([submission completedWithError:&failure] && failure) {
-        if (error)
-            *error = failure;
-        return NO;
+    NV2AMetalQueueWait *wait = [_current.waitReceipts objectForKey:submission];
+    BOOL ready = wait.feedbackSucceeded;
+    if (!ready) {
+        NSError *failure = nil;
+        ready = [submission completedWithError:&failure];
+        if (ready && failure) {
+            if (error)
+                *error = failure;
+            return NO;
+        }
     }
     if (source == self)
         return YES;
+    if (wait) {
+        wait.feedbackSucceeded = ready;
+        return YES;
+    }
     if (!submission.signalEvent || !submission.signalValue)
         return command_error(error,
                              @"Metal GPU dependency has no submitted timeline");
-    for (NV2AMetalQueueWait *prior in _current.waits)
-        if (prior.submission == submission)
-            return YES;
-    NV2AMetalQueueWait *wait = [NV2AMetalQueueWait new];
+    wait = [NV2AMetalQueueWait new];
     wait.submission = submission;
     wait.queue = source->_queue;
     wait.event = submission.signalEvent;
     wait.value = submission.signalValue;
+    wait.feedbackSucceeded = ready;
     [_current.waits addObject:wait];
+    [_current.waitReceipts setObject:wait forKey:submission];
     return YES;
 }
 
@@ -422,15 +639,26 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         return command_error(error,
                              @"Metal resource belongs to a different GPU");
     }
+    /* Deduplicate the exact resource. Views sharing an allocation root
+     * still need their own residency and lifetime registration. */
+    if ([_current.registeredResources containsObject:resource])
+        return YES;
+    [_current.registeredResources addObject:resource];
     [_current.residency addAllocation:resource];
     [_current.resources addObject:resource];
     [self trackResource:resource];
-    return [self keepAlive:resource error:error];
+    /* The exact-resource list already retains this allocation. */
+    return YES;
 }
 
 - (nullable id<MTL4CommandBuffer>)commandBuffer
 {
     return _current.buffer;
+}
+
+- (uint64_t)batchSerial
+{
+    return _batch.batchSerial;
 }
 
 - (NSUInteger)sealedBufferCount
@@ -443,9 +671,19 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     return _batch.rasterPass != nil;
 }
 
+- (BOOL)recordingAllowsProducerWork
+{
+    return !_current || (!_current.inRaster && !_current.drawable);
+}
+
 - (BOOL)rasterPassMatches:(MTL4RenderPassDescriptor *)pass
 {
     return raster_pass_matches(_batch.rasterPass ?: pass, pass);
+}
+
+- (MTL4RenderPassDescriptor *)copyPendingRasterPass
+{
+    return [_batch.rasterPass copy];
 }
 
 - (id<MTL4RenderCommandEncoder>)beginRasterPass:(MTL4RenderPassDescriptor *)pass
@@ -530,7 +768,10 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     _current.sealedRasters += _current.inRaster;
     _current.sealedObjects = _current.objects.count;
     _current.sealedResources = _current.resources.count;
+    _current.sealedResourceBytes = _current.resourceBytes;
+    [_current.sectionRoots removeAllObjects];
     _current.sealedWaits = _current.waits.count;
+    [_current.sectionWaitCounts addObject:@(_current.sealedWaits)];
     _current.sealedUploadPage = _current.uploadPage;
     _current.sealedUploadOffset = _current.uploadOffset;
     if (!_current.hasBudgetBaseline && _current.resourceRoots.count) {
@@ -591,12 +832,54 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     return page;
 }
 
+- (id<MTLBuffer>)orderedTransferScratchWithLength:(NSUInteger)length
+                                            error:(NSError **)error
+{
+    if (!_current || !length || length > _device.maxBufferLength) {
+        command_error(error, @"Invalid Metal 4 transfer scratch or recording");
+        return nil;
+    }
+    NSUInteger limit = MIN((NSUInteger)NV2AMetalCommandTransferScratchLimit,
+                           _device.maxBufferLength);
+    id<MTLBuffer> buffer = length <= limit ? _current.transferScratch : nil;
+    if (buffer.length < length) {
+        NSUInteger capacity = length;
+        if (length <= limit) {
+            capacity = MIN((NSUInteger)4096, limit);
+            while (capacity < length) {
+                if (capacity > limit / 2) {
+                    capacity = length;
+                    break;
+                }
+                capacity *= 2;
+            }
+        }
+        buffer = [_device newBufferWithLength:capacity
+                                      options:MTLResourceStorageModePrivate];
+        if (!buffer) {
+            command_error(error,
+                          @"Could not allocate Metal 4 transfer scratch");
+            return nil;
+        }
+        if (length <= limit && buffer.allocatedSize <= limit)
+            _current.transferScratch = buffer;
+    }
+    return [self addResource:buffer error:error] ? buffer : nil;
+}
+
 - (BOOL)keepAlive:(id)object error:(NSError **)error
 {
     if (!_current) {
         return command_error(error, @"No Metal 4 command buffer is recording");
     }
-    [_current.objects addObject:object];
+    if (!object)
+        return command_error(error, @"Missing Metal 4 object to retain");
+    CFMutableSetRef identities = _current.objectIdentities;
+    const void *identity = (__bridge const void *)object;
+    if (!CFSetContainsValue(identities, identity)) {
+        [_current.objects addObject:object];
+        CFSetAddValue(identities, identity);
+    }
     return YES;
 }
 
@@ -614,105 +897,222 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         return command_error(error,
                              @"Drawable belongs to an invalid Metal layer");
     }
-    if (![self addResource:drawable.texture error:error]) {
+    if (![self addResource:drawable.texture error:error] ||
+        ![self keepAlive:residency error:error] ||
+        ![self keepAlive:layer error:error]) {
         return NO;
     }
     /* The layer's set includes private presentation resources as well as the
      * drawable texture. Apple owns and updates this set; never mutate it. */
     [_current.buffer useResidencySet:residency];
-    [_current.objects addObject:residency];
-    [_current.objects addObject:layer];
     _current.drawable = drawable;
     return YES;
 }
 
+/* Only dependencies introduced through this sealed cut can delay a prefix.
+ * A later section's pending or failed receipt must remain entirely untouched.
+ */
+- (NSArray<NV2AMetalQueueWait *> *)waitsForSlot:(NV2AMetalCommandSlot *)slot
+                                          count:(NSUInteger)count
+                                          error:(NSError **)error
+{
+    NSError *failure = [slot knownFailure];
+    if (failure) {
+        if (error)
+            *error = failure;
+        return nil;
+    }
+    NV2AMetalQueueWait *singleEvent = nil;
+    NSMapTable<id<MTLEvent>, NV2AMetalQueueWait *> *events = nil;
+    for (NSUInteger i = 0; i < count; i++) {
+        NV2AMetalQueueWait *wait = slot.waits[i];
+        if (!wait.feedbackSucceeded) {
+            NSError *errorValue = nil;
+            BOOL ready = [wait.submission completedWithError:&errorValue];
+            if (ready && errorValue) {
+                if (error)
+                    *error = errorValue;
+                return nil;
+            }
+            wait.feedbackSucceeded = ready;
+        }
+        wait.needsEventWait = !wait.feedbackSucceeded;
+        if (!events && singleEvent && singleEvent.event != wait.event) {
+            events = [NSMapTable
+                mapTableWithKeyOptions:
+                    NSPointerFunctionsStrongMemory |
+                    NSPointerFunctionsObjectPointerPersonality
+                          valueOptions:NSPointerFunctionsStrongMemory];
+            [events setObject:singleEvent forKey:singleEvent.event];
+        }
+        NV2AMetalQueueWait *highest =
+            events ? [events objectForKey:wait.event] : singleEvent;
+        if (!highest || highest.value < wait.value) {
+            wait.needsEventWait |= highest.needsEventWait;
+            if (events)
+                [events setObject:wait forKey:wait.event];
+            else
+                singleEvent = wait;
+        } else {
+            highest.needsEventWait |= wait.needsEventWait;
+        }
+    }
+    return events      ? events.objectEnumerator.allObjects :
+           singleEvent ? @[ singleEvent ] :
+                         @[];
+}
+- (BOOL)validateRasterContinuationWithError:(NSError **)error
+{
+    if (!_batch.rasterPass)
+        return command_error(error, @"No pending raster continuation");
+    return [self waitsForSlot:_batch count:_batch.waits.count
+                        error:error] != nil;
+}
+
+- (void)enqueueWaits:(NSArray<NV2AMetalQueueWait *> *)waits
+{
+    if (_lastSubmission) {
+        NSError *failure = nil;
+        if (![_lastSubmitted completedWithError:&failure] || failure)
+            [_queue waitForEvent:_submissionEvent value:_lastSubmission];
+    }
+    for (NV2AMetalQueueWait *wait in waits)
+        if (wait.needsEventWait)
+            [_queue waitForEvent:wait.event value:wait.value];
+}
+- (MTL4CommitOptions *)optionsForSlot:(NV2AMetalCommandSlot *)slot
+                                 part:(NV2AMetalCommandPart *)part
+{
+    MTL4CommitOptions *options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+      [slot completePart:part error:feedback.error];
+    }];
+    return options;
+}
+- (NV2AMetalSubmission *)submitProducersThroughSectionCount:(NSUInteger)count
+                                                batchSerial:
+                                                    (uint64_t)batchSerial
+                                                      error:(NSError **)error
+{
+    NV2AMetalCommandSlot *slot = _batch;
+    if (!slot || _current || !batchSerial || batchSerial != slot.batchSerial ||
+        !count || count > slot.sealedCount) {
+        command_error(error, @"Invalid sealed Metal producer prefix or batch");
+        return nil;
+    }
+    if (count <= slot.submittedProducers) {
+        for (NSUInteger i = 0; i < slot.prefixEnds.count; i++)
+            if (count <= slot.prefixEnds[i].unsignedIntegerValue) {
+                if (error)
+                    *error = nil;
+                return slot.prefixReceipts[i];
+            }
+        assert(false);
+    }
+    if (_lastSubmission == UINT64_MAX) {
+        command_error(error, @"Metal 4 submission timeline is exhausted");
+        return nil;
+    }
+    NSArray *waits = [self
+        waitsForSlot:slot
+               count:slot.sectionWaitCounts[count - 1].unsignedIntegerValue
+               error:error];
+    if (!waits)
+        return nil;
+    NV2AMetalSubmission *receipt =
+        [[NV2AMetalSubmission alloc] initPendingWithOwner:self
+                                                    event:_submissionEvent
+                                                    value:_lastSubmission + 1
+                                                    parts:1];
+    NV2AMetalCommandPart *part = [NV2AMetalCommandPart new];
+    part.producer = YES;
+    part.receipt = receipt;
+    MTL4CommitOptions *options = [self optionsForSlot:slot part:part];
+    if (!receipt || !part || !options) {
+        command_error(error, @"Cannot allocate Metal producer prefix receipt");
+        return nil;
+    }
+    id<MTL4CommandBuffer> buffers[NV2AMetalCommandBatchLimit];
+    NSUInteger pending = count - slot.submittedProducers;
+    for (NSUInteger i = 0; i < pending; i++)
+        buffers[i] = slot.buffers[slot.submittedProducers + i];
+    [slot.residency commit];
+    [slot registerPart:part];
+    [self enqueueWaits:waits];
+    [_queue commit:buffers count:pending options:options];
+    [_queue signalEvent:_submissionEvent value:++_lastSubmission];
+    slot.submittedProducers = count;
+    [slot.prefixEnds addObject:@(count)];
+    [slot.prefixReceipts addObject:receipt];
+    _lastSubmitted = receipt;
+    if (error)
+        *error = nil;
+    return receipt;
+}
 - (BOOL)submitWithError:(NSError **)error
 {
-    if (!_batch) {
+    if (!_batch)
         return command_error(error, @"No Metal 4 command buffer is recording");
-    }
-    NSUInteger parts = _batch.rasterPass ? 2 : 1;
-    if (_lastSubmission > UINT64_MAX - parts) {
+    NV2AMetalCommandSlot *slot = _batch;
+    NSUInteger end = slot.sealedCount + (_current != nil);
+    NSUInteger producers = end - slot.submittedProducers;
+    NSUInteger commits = (producers != 0) + (slot.rasterPass != nil);
+    if (_lastSubmission > UINT64_MAX - commits)
         return command_error(error,
                              @"Metal 4 submission timeline is exhausted");
-    }
-
-    NV2AMetalCommandSlot *slot = _batch;
-    NSMutableDictionary<NSValue *, NV2AMetalQueueWait *> *waits =
-        slot.waits.count ? [NSMutableDictionary new] : nil;
-    NSMutableSet<NSValue *> *pending =
-        slot.waits.count ? [NSMutableSet new] : nil;
-    for (NV2AMetalQueueWait *wait in slot.waits) {
-        NSError *failure = nil;
-        BOOL ready = [wait.submission completedWithError:&failure];
-        if (ready && failure) {
-            if (error)
-                *error = failure;
-            return NO;
-        }
-        NSValue *key = [NSValue valueWithNonretainedObject:wait.event];
-        if (!ready)
-            [pending addObject:key];
-        if (!waits[key] || waits[key].value < wait.value)
-            waits[key] = wait;
-    }
-    NV2AMetalSubmission *submission = [[NV2AMetalSubmission alloc]
+    NSArray *waits = [self waitsForSlot:slot
+                                  count:slot.waits.count
+                                  error:error];
+    if (!waits)
+        return NO;
+    /* This receipt aggregates the complete batch, including earlier partial
+     * commits. Only a raster phase needs distinct producer completion; an
+     * all-producer batch uses its full aggregate completion for both queries.
+     */
+    NV2AMetalSubmission *receipt = [[NV2AMetalSubmission alloc]
         initPendingWithOwner:self
                        event:_submissionEvent
-                       value:_lastSubmission + parts
-                       parts:parts];
-    if (!submission)
+                       value:_lastSubmission + commits
+                       parts:slot.rasterPass ? 2 : 1];
+    if (!receipt)
         return command_error(error,
-                             @"Could not allocate Metal submission identity");
+                             @"Cannot allocate Metal submission identity");
+    NV2AMetalCommandPart *producerPart =
+        producers ? [NV2AMetalCommandPart new] : nil;
+    producerPart.producer = YES;
+    NV2AMetalCommandPart *rasterPart =
+        slot.rasterPass ? [NV2AMetalCommandPart new] : nil;
+    MTL4CommitOptions *producerOptions =
+        producers ? [self optionsForSlot:slot part:producerPart] : nil;
+    MTL4CommitOptions *rasterOptions =
+        slot.rasterPass ? [self optionsForSlot:slot part:rasterPart] : nil;
+    if ((producers && (!producerPart || !producerOptions)) ||
+        (slot.rasterPass && (!rasterPart || !rasterOptions)))
+        return command_error(error, @"Cannot allocate Metal commit feedback");
     [slot.residency commit];
     if (_current)
         [slot.buffer endCommandBuffer];
-    MTL4CommitOptions *options = [MTL4CommitOptions new];
-    /* The feedback block owns the slot until completion, even if the renderer
-     * is destroyed. This retains the allocator and every referenced resource.
-     */
-    MTL4CommitFeedbackHandler handler = ^(id<MTL4CommitFeedback> feedback) {
-      NSError *failure = nil;
-      if ([submission completePartWithError:feedback.error failure:&failure]) {
-          slot.failure = failure;
-          dispatch_semaphore_signal(slot.available);
-      }
-    };
-    [options addFeedbackHandler:handler];
-    MTL4CommitOptions *rasterOptions = nil;
+    if (producerPart)
+        [slot registerPart:producerPart];
+    if (rasterPart)
+        [slot registerPart:rasterPart];
+    if (commits) {
+        [self enqueueWaits:waits];
+        if (slot.drawable)
+            [_queue waitForDrawable:slot.drawable];
+    }
+    if (producers) {
+        id<MTL4CommandBuffer> buffers[NV2AMetalCommandBatchLimit];
+        for (NSUInteger i = 0; i < producers; i++)
+            buffers[i] = slot.buffers[slot.submittedProducers + i];
+        [_queue commit:buffers count:producers options:producerOptions];
+        [_queue signalEvent:_submissionEvent value:++_lastSubmission];
+    }
     if (slot.rasterPass) {
-        rasterOptions = [MTL4CommitOptions new];
-        [rasterOptions addFeedbackHandler:handler];
-    }
-    id<MTL4CommandBuffer> buffers[NV2AMetalCommandBatchLimit];
-    NSUInteger count = slot.sealedCount + (_current != nil);
-    for (NSUInteger i = 0; i < count; i++)
-        buffers[i] = slot.buffers[i];
-    /* Metal 4 does not insert the implicit hazards of the legacy API. Keep
-     * NV2A submissions ordered, including render-target reuse across buffers.
-     * Encoders must still issue barriers for hazards within a command buffer.
-     */
-    if (_lastSubmission) {
-        [_queue waitForEvent:_submissionEvent value:_lastSubmission];
-    }
-    for (NV2AMetalQueueWait *wait in waits.allValues) {
-        NSValue *key = [NSValue valueWithNonretainedObject:wait.event];
-        /* Skip only when every requested workload on this event is complete.
-         * A later callback alone must not erase an earlier pending one. */
-        if ([pending containsObject:key])
-            [_queue waitForEvent:wait.event value:wait.value];
-    }
-    if (slot.drawable) {
-        [_queue waitForDrawable:slot.drawable];
-    }
-    [_queue commit:buffers count:count options:options];
-    [_queue signalEvent:_submissionEvent value:++_lastSubmission];
-    if (slot.rasterPass) {
-        /* A suspended/resumed chain must be one contiguous commit array,
-         * without interleaved compute or blits. Complete every independent
-         * producer first; the GPU event orders the raster-only commit. Both
-         * feedback callbacks retain this slot and contribute to its receipt. */
-        [_queue waitForEvent:_submissionEvent value:_lastSubmission];
+        /* Preserve the complete suspended/resumed raster chain in exactly one
+         * contiguous commit array. No producer head is replayed. */
+        if (producers)
+            [_queue waitForEvent:_submissionEvent value:_lastSubmission];
         id<MTL4CommandBuffer> rasters[NV2AMetalCommandBatchLimit + 1];
         NSUInteger rasterCount = slot.rasters.count;
         for (NSUInteger i = 0; i < rasterCount; i++)
@@ -725,7 +1125,8 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         [_queue signalDrawable:slot.drawable];
         [slot.drawable present];
     }
-    _lastSubmitted = submission;
+    _lastSubmitted = receipt;
+    [slot closeWithAggregate:receipt];
     _current = _batch = nil;
     _nextSlot = (_nextSlot + 1) % command_slot_count;
     return YES;
@@ -748,29 +1149,40 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         }
     }
     _current.drawable = nil;
-    [_current.objects
-        removeObjectsInRange:NSMakeRange(_current.sealedObjects,
-                                         _current.objects.count -
-                                             _current.sealedObjects)];
-    [_current.waits removeObjectsInRange:NSMakeRange(_current.sealedWaits,
-                                                     _current.waits.count -
-                                                         _current.sealedWaits)];
-    [_current.resources
-        removeObjectsInRange:NSMakeRange(_current.sealedResources,
-                                         _current.resources.count -
-                                             _current.sealedResources)];
-    [_current.residency removeAllAllocations];
-    NSHashTable<id<MTLResource>> *roots = [NSHashTable
-        hashTableWithOptions:NSPointerFunctionsStrongMemory |
-                             NSPointerFunctionsObjectPointerPersonality];
-    NSUInteger bytes = 0;
-    for (id<MTLResource> resource in _current.resources) {
-        [_current.residency addAllocation:resource];
-        track_allocation(roots, resource, &bytes);
+    if (!_current.submittedProducers) {
+        NSRange objects =
+            NSMakeRange(_current.sealedObjects,
+                        _current.objects.count - _current.sealedObjects);
+        for (NSUInteger i = objects.location; i < NSMaxRange(objects); i++)
+            CFSetRemoveValue(_current.objectIdentities,
+                             (__bridge const void *)_current.objects[i]);
+        [_current.objects removeObjectsInRange:objects];
     }
-    _current.resourceRoots = roots;
-    _current.resourceBytes = bytes;
-    [_current.residency commit];
+    NSUInteger end = _current.waits.count;
+    for (NSUInteger i = _current.sealedWaits; i < end; i++)
+        [_current.waitReceipts removeObjectForKey:_current.waits[i].submission];
+    [_current.waits
+        removeObjectsInRange:NSMakeRange(_current.sealedWaits,
+                                         end - _current.sealedWaits)];
+    NSRange discarded =
+        NSMakeRange(_current.sealedResources,
+                    _current.resources.count - _current.sealedResources);
+    if (discarded.length && !_current.submittedProducers) {
+        /* Remove only discarded resource identities. A view can share the
+         * sealed prefix's backing allocation and still have its own entry. */
+        for (NSUInteger i = discarded.location; i < NSMaxRange(discarded);
+             i++) {
+            id<MTLResource> resource = _current.resources[i];
+            [_current.residency removeAllocation:resource];
+            [_current.registeredResources removeObject:resource];
+        }
+        [_current.residency commit];
+        [_current.resources removeObjectsInRange:discarded];
+        for (id<MTLResource> root in _current.sectionRoots)
+            [_current.resourceRoots removeObject:root];
+        [_current.sectionRoots removeAllObjects];
+        _current.resourceBytes = _current.sealedResourceBytes;
+    }
     _current.uploadPage = _current.sealedUploadPage;
     _current.uploadOffset = _current.sealedUploadOffset;
     _current = nil;
@@ -780,20 +1192,31 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
 {
     if (!_batch)
         return;
+    NV2AMetalCommandSlot *slot = _batch;
     if (_current)
-        [_current.buffer endCommandBuffer];
-    [_batch.rasters removeAllObjects];
-    _batch.rasterTail = nil;
-    _batch.rasterPass = nil;
-    _batch.buffer = _batch.buffers[0];
-    _batch.drawable = nil;
-    [_batch.objects removeAllObjects];
-    [_batch.waits removeAllObjects];
-    [_batch.resources removeAllObjects];
-    [_batch.resourceRoots removeAllObjects];
-    [_batch.residency removeAllAllocations];
-    [_batch.residency commit];
-    dispatch_semaphore_signal(_batch.available);
+        [slot.buffer endCommandBuffer];
+    [slot.rasters removeAllObjects];
+    slot.rasterTail = nil;
+    slot.rasterPass = nil;
+    slot.buffer = slot.buffers[0];
+    slot.drawable = nil;
+    if (!slot.submittedProducers) {
+        CFSetRemoveAllValues(slot.objectIdentities);
+        [slot.objects removeAllObjects];
+        [slot.waits removeAllObjects];
+        [slot.waitReceipts removeAllObjects];
+        [slot.resources removeAllObjects];
+        [slot.registeredResources removeAllObjects];
+        [slot.resourceRoots removeAllObjects];
+        [slot.sectionRoots removeAllObjects];
+        [slot.residency removeAllAllocations];
+        [slot.residency commit];
+    } else {
+        /* Committed heads still own this allocator generation and residency.
+         * Cancel ends only the host lease; final feedback releases the slot. */
+        _nextSlot = (_nextSlot + 1) % command_slot_count;
+    }
+    [slot closeWithAggregate:nil];
     _current = _batch = nil;
 }
 
@@ -808,6 +1231,14 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
     if (!submission)
         return command_error(error, @"No Metal submission to wait for");
     return [submission waitForOwner:self error:error];
+}
+
+- (BOOL)waitForProducersOfSubmission:(NV2AMetalSubmission *)submission
+                               error:(NSError **)error
+{
+    if (!submission)
+        return command_error(error, @"No Metal submission to wait for");
+    return [submission waitForProducersForOwner:self error:error];
 }
 
 - (BOOL)waitUntilIdleWithError:(NSError **)error
@@ -831,10 +1262,18 @@ static BOOL raster_pass_matches(MTL4RenderPassDescriptor *a,
         slot.rasterTail = nil;
         slot.rasterPass = nil;
         slot.buffer = slot.buffers[0];
+        slot.aggregate = nil;
+        [slot.parts removeAllObjects];
+        [slot.prefixReceipts removeAllObjects];
+        [slot.prefixEnds removeAllObjects];
+        CFSetRemoveAllValues(slot.objectIdentities);
         [slot.objects removeAllObjects];
         [slot.waits removeAllObjects];
+        [slot.waitReceipts removeAllObjects];
         [slot.resources removeAllObjects];
+        [slot.registeredResources removeAllObjects];
         [slot.resourceRoots removeAllObjects];
+        [slot.sectionRoots removeAllObjects];
         [slot.residency removeAllAllocations];
         [slot.residency commit];
         dispatch_semaphore_signal(slot.available);

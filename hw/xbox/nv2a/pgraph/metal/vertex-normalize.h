@@ -2,6 +2,10 @@
 #ifndef HW_XBOX_NV2A_METAL_VERTEX_NORMALIZE_H
 #define HW_XBOX_NV2A_METAL_VERTEX_NORMALIZE_H
 
+#ifdef __METAL_VERSION__
+#include <metal_stdlib>
+#endif
+
 /* Kelvin IDX normalization derived from envytools nvhw/pgraph_idx.c.
  * MIT notice below applies to these helpers. */
 /*
@@ -28,6 +32,19 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/* Move the highest bit of a nonzero fraction to the implicit bit at 23. */
+static inline unsigned nv2a_metal_normalized_bits(unsigned fraction,
+                                                  unsigned exponent)
+{
+#ifdef __METAL_VERSION__
+    unsigned leading = metal::clz(fraction);
+#else
+    unsigned leading = __builtin_clz(fraction);
+#endif
+    fraction = (fraction << leading) >> 8;
+    return ((exponent + 8 - leading) << 23) | (fraction & 0x7fffffu);
+}
+
 static inline unsigned nv2a_metal_ubyte_bits(unsigned value)
 {
     if (value == 0) {
@@ -36,13 +53,7 @@ static inline unsigned nv2a_metal_ubyte_bits(unsigned value)
     if (value == 255) {
         return 0x3f800000u;
     }
-    unsigned fraction = value * 0x010101u;
-    unsigned exponent = 126;
-    while ((fraction & 0x800000u) == 0) {
-        fraction <<= 1;
-        exponent--;
-    }
-    return (exponent << 23) | (fraction & 0x7fffffu);
+    return nv2a_metal_normalized_bits(value * 0x010101u, 126);
 }
 
 static inline unsigned nv2a_metal_nshort_bits(int value)
@@ -55,17 +66,8 @@ static inline unsigned nv2a_metal_nshort_bits(int value)
     }
     int scaled = value * 2 + 1;
     unsigned fraction = (unsigned)(scaled < 0 ? -scaled : scaled) * 0x10001u;
-    unsigned exponent = 118;
-    while (fraction >= 0x1000000u) {
-        fraction >>= 1;
-        exponent++;
-    }
-    while ((fraction & 0x800000u) == 0) {
-        fraction <<= 1;
-        exponent--;
-    }
-    return (value < 0 ? 0x80000000u : 0) | (exponent << 23) |
-           (fraction & 0x7fffffu);
+    return (value < 0 ? 0x80000000u : 0) |
+           nv2a_metal_normalized_bits(fraction, 118);
 }
 
 #endif

@@ -5,12 +5,35 @@
 
 #import "ui/xui/metal4/imgui-renderer.h"
 #import "hw/xbox/nv2a/pgraph/metal/display.h"
+#import <objc/runtime.h>
 #include <imgui.h>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "test-metal-texture-alias.h"
+
+typedef id (*ImGuiPipelineBuilder)(id, SEL, id, id, NSError **)
+    __attribute__((ns_returns_retained));
+static ImGuiPipelineBuilder original_pipeline;
+static unsigned pipeline_builds;
+static BOOL fail_pipeline;
+
+static id observe_pipeline(id object, SEL selector, id descriptor, id options,
+                           NSError **error) __attribute__((ns_returns_retained));
+static id observe_pipeline(id object, SEL selector, id descriptor, id options,
+                           NSError **error)
+{
+    pipeline_builds++;
+    if (fail_pipeline) {
+        *error = [NSError errorWithDomain:@"test.imgui.pipeline"
+                                     code:1
+                                 userInfo:nil];
+        return nil;
+    }
+    return original_pipeline(object, selector, descriptor, options, error);
+}
 
 static void require(BOOL success, NSError *error)
 {
@@ -67,6 +90,15 @@ int main(void)
                                          pixelFormat:MTLPixelFormatRGBA8Unorm
                                                error:&error];
         require(display != nil, error);
+        id<MTL4Compiler> compiler = [commands.device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        require(compiler != nil, error);
+        Method pipeline = class_getInstanceMethod(
+            object_getClass(compiler),
+            @selector(newRenderPipelineStateWithDescriptor:compilerTaskOptions:error:));
+        assert(pipeline);
+        original_pipeline = reinterpret_cast<ImGuiPipelineBuilder>(
+            method_setImplementation(pipeline, (IMP)observe_pipeline));
         XemuMetal4ImGui *renderer =
             [[XemuMetal4ImGui alloc] initWithDevice:commands.device
                                         pixelFormat:MTLPixelFormatRGBA8Unorm
@@ -97,9 +129,39 @@ int main(void)
         NV2AMetalDisplayUniforms uniforms = {};
         uniforms.scale[0] = uniforms.scale[1] = 1;
         unsigned callbacks = 0;
+        unsigned char pixels[8 * 8 * 4];
 
+        ImDrawData empty;
+        empty.DisplaySize = io.DisplaySize;
+        empty.FramebufferScale = io.DisplayFramebufferScale;
+        require([commands beginWithError:&error] != nil, error);
+        require([renderer encodeDrawData:&empty commands:commands target:target
+                                  clear:YES error:&error], error);
         ImGui::NewFrame();
         ImDrawList *list = ImGui::GetBackgroundDrawList();
+        list->AddRectFilled(ImVec2(0, 0), ImVec2(4, 4), IM_COL32_WHITE);
+        list->AddCallback(callback, &callbacks);
+        list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+        list->AddCallback(callback, &callbacks);
+        ImGui::Render();
+        for (ImDrawCmd &draw : list->CmdBuffer) {
+            draw.ElemCount = 0;
+        }
+        require([renderer encodeDrawData:ImGui::GetDrawData()
+                                commands:commands target:target error:&error],
+                error);
+        assert(callbacks == 2);
+        assert(pipeline_builds == 0);
+        assert(![renderer valueForKey:@"pipeline"]);
+        assert(![renderer valueForKey:@"arguments"]);
+        require([commands submitWithError:&error], error);
+        require([commands waitUntilIdleWithError:&error], error);
+        read_texture(target, pixels);
+        check_pixel(pixels, 0, 0, 0, 0, 0, 0);
+        callbacks = 0;
+
+        ImGui::NewFrame();
+        list = ImGui::GetBackgroundDrawList();
         list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
         list->AddRectFilled(ImVec2(0, 0), ImVec2(4, 4),
                             IM_COL32(255, 0, 0, 255));
@@ -116,11 +178,27 @@ int main(void)
         /* Exercise nonzero DisplayPos, alongside Retina scaling. */
         drawData->DisplayPos = ImVec2(10, 20);
         for (ImDrawList *drawList : drawData->CmdLists) {
+            /* Keep this list arena-sized while exercising nonzero base
+             * vertex and an odd first-index offset. */
+            int vertices = drawList->VtxBuffer.Size;
+            int indices = drawList->IdxBuffer.Size;
+            drawList->VtxBuffer.resize(vertices + 1);
+            drawList->IdxBuffer.resize(indices + 1);
+            std::memmove(drawList->VtxBuffer.Data + 1, drawList->VtxBuffer.Data,
+                         vertices * sizeof(ImDrawVert));
+            std::memmove(drawList->IdxBuffer.Data + 1, drawList->IdxBuffer.Data,
+                         indices * sizeof(ImDrawIdx));
+            drawList->VtxBuffer[0] = ImDrawVert{};
+            drawList->IdxBuffer[0] = 0;
+            drawData->TotalVtxCount++;
+            drawData->TotalIdxCount++;
             for (ImDrawVert &vertex : drawList->VtxBuffer) {
                 vertex.pos.x += 10;
                 vertex.pos.y += 20;
             }
             for (ImDrawCmd &draw : drawList->CmdBuffer) {
+                draw.VtxOffset++;
+                draw.IdxOffset++;
                 draw.ClipRect.x += 10;
                 draw.ClipRect.z += 10;
                 draw.ClipRect.y += 20;
@@ -136,14 +214,30 @@ int main(void)
                                          screenOff:YES
                                              error:&error];
         require(success, error);
+        id<MTL4CommandBuffer> recording = commands.commandBuffer;
+        fail_pipeline = YES;
+        success = [renderer encodeDrawData:drawData
+                                  commands:commands
+                                    target:target
+                                     error:&error];
+        assert(!success && [error.domain isEqualToString:@"test.imgui.pipeline"]);
+        assert(commands.commandBuffer == recording);
+        assert(callbacks == 0 && pipeline_builds == 1);
+        assert(![renderer valueForKey:@"pipeline"]);
+        assert(![renderer valueForKey:@"arguments"]);
+        fail_pipeline = NO;
+        error = nil;
         success = [renderer encodeDrawData:drawData
                                   commands:commands
                                     target:target
                                      error:&error];
         require(success, error);
+        assert(pipeline_builds == 2);
+        assert([renderer valueForKey:@"pipeline"]);
+        assert([renderer valueForKey:@"arguments"]);
+        method_setImplementation(pipeline, (IMP)original_pipeline);
         require([commands submitWithError:&error], error);
         require([commands waitUntilIdleWithError:&error], error);
-        unsigned char pixels[8 * 8 * 4];
         read_texture(target, pixels);
         check_pixel(pixels, 0, 0, 255, 0, 0, 255);
         check_pixel(pixels, 2, 2, 127, 0, 128, 255);
@@ -210,6 +304,8 @@ int main(void)
         read_texture(target, pixels);
         check_pixel(pixels, 0, 0, 0, 255, 0, 255);
         check_pixel(pixels, 7, 7, 0, 255, 0, 255);
+        puts("Metal 4 ImGui startup: empty/callback-only frames skip pipeline; "
+             "first draw compiler failure and retry PASS");
         puts("Metal 4 ImGui clipping, alpha, DPI, callbacks, VtxOffset and "
              "shutdown: PASS (offscreen)");
     }
