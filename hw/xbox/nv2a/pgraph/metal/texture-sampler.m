@@ -205,7 +205,12 @@ float nv2a_metal_texture_lod_bias(unsigned int filter)
         s.border_color[2] = s.border_color[1];
         s.border_color[3] = 1;
     }
-    if (c->min_level || c->max_level + 1 != texture.mipmapLevelCount) {
+    /* LOD0 filters read image level zero even without a mip-range view.
+     * The min/max LOD clamps apply only when mip selection is enabled. */
+    NSUInteger view_min = s.mip_filter ? c->min_level : 0;
+    NSUInteger view_max = s.mip_filter ? c->max_level :
+                                         texture.mipmapLevelCount - 1;
+    if (view_min || view_max + 1 != texture.mipmapLevelCount) {
         if (!(texture.usage & MTLTextureUsagePixelFormatView)) {
             sampler_error(error, @"Mip range requires a texture view");
             return nil;
@@ -213,9 +218,8 @@ float nv2a_metal_texture_lod_bias(unsigned int filter)
         texture = [texture
             newTextureViewWithPixelFormat:texture.pixelFormat
                               textureType:type
-                                   levels:NSMakeRange(c->min_level,
-                                                      c->max_level -
-                                                          c->min_level + 1)
+                                   levels:NSMakeRange(view_min,
+                                                      view_max - view_min + 1)
                                    slices:NSMakeRange(
                                               0, type == MTLTextureTypeCube ?
                                                      6 :
