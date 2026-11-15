@@ -239,8 +239,7 @@ static BOOL same_texture_shape(const NV2AMetalTextureShape *a,
     return a->format == b->format && a->dimension == b->dimension &&
            a->width == b->width && a->height == b->height &&
            a->depth == b->depth && a->levels == b->levels &&
-           a->pitch == b->pitch && a->min_level == b->min_level &&
-           a->max_level == b->max_level && a->cubemap == b->cubemap &&
+           a->pitch == b->pitch && a->cubemap == b->cubemap &&
            a->border == b->border && a->signed_channels == b->signed_channels;
 }
 
@@ -533,7 +532,10 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
      * this uploader. A failed layout leaves source_length zero. */
     if (_layout.source_length && shape &&
         _layoutPaletteLength == paletteLength &&
-        same_texture_shape(&_layoutShape, shape)) {
+        same_texture_shape(&_layoutShape, shape) &&
+        (_layout.format.linear ||
+         (shape->min_level <= shape->max_level &&
+          shape->max_level < _layout.levels))) {
         return YES;
     }
     if (!texture_layout(shape, paletteLength, _device.maxBufferLength,

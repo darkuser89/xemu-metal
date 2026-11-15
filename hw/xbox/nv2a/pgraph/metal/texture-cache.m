@@ -1068,8 +1068,10 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
         c.shape.depth,
         c.shape.levels,
         c.shape.pitch,
-        c.shape.min_level,
-        c.shape.max_level,
+        /* Mip clamps select a sampler view; the level count above fixes the
+         * decoded image data and source length. */
+        0,
+        0,
         !!c.shape.cubemap,
         !!c.shape.border,
         c.shape.signed_channels,
@@ -1226,8 +1228,10 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
         c.shape.format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_YB16YA16;
     policy.rectangle = content.rectangle;
     policy.bordered = c.shape.border;
-    policy.min_level = content.minLevel;
-    policy.max_level = content.maxLevel;
+    policy.min_level = rtt || content.rectangle ? content.minLevel :
+                                                   c.shape.min_level;
+    policy.max_level = rtt || content.rectangle ? content.maxLevel :
+                                                   c.shape.max_level;
     NV2AMetalCachedTexture *result = previous;
     if (![previous matchesPolicy:&policy]) {
         NV2AMetalTextureBinding *binding =
