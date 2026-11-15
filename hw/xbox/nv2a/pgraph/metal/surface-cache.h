@@ -135,8 +135,9 @@ API_AVAILABLE(macos(26.0))
  * read-only attachments in a pending raster chain. */
 - (BOOL)prepareTextureRead:(NV2AMetalCachedSurface *)surface
                      error:(NSError *_Nullable *_Nullable)error;
-/* Prepare only an immutable private RTT snapshot. Earlier raster use is
- * submitted before the binding is revalidated and any upload is encoded.
+/* Prepare only an immutable private RTT snapshot. Earlier use of this source
+ * is submitted before the binding is revalidated; a completed disjoint source
+ * may keep an unrelated raster pass pending while the private copy is encoded.
  * Encode the copy from the returned surface in this recording, then call
  * markRTTSnapshotCaptured:error:. Rendering retains its own capture intent. */
 - (nullable NV2AMetalCachedSurface *)

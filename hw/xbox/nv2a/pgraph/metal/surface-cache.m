@@ -1082,6 +1082,17 @@ static NSMutableIndexSet *reader_pattern_pages(
     return YES;
 }
 
+- (BOOL)beginNativeRecordingWithError:(NSError **)error
+{
+    if (![_commands beginWithError:error])
+        return NO;
+    _recording = YES;
+    _token = [[NV2AMetalSurfaceRecording alloc]
+        initWithSerial:_commands.recordingSerial];
+    _token.producerBatchSerial = _commands.batchSerial;
+    return YES;
+}
+
 - (BOOL)begin:(NSError **)error
 {
     if (![self healthy:error]) {
@@ -1095,13 +1106,9 @@ static NSMutableIndexSet *reader_pattern_pages(
             ![self submitWithError:error])
             return NO;
         if (![self collectCompletedWithError:error] ||
-            ![_commands beginWithError:error]) {
+            ![self beginNativeRecordingWithError:error]) {
             return NO;
         }
-        _recording = YES;
-        _token = [[NV2AMetalSurfaceRecording alloc]
-            initWithSerial:_commands.recordingSerial];
-        _token.producerBatchSerial = _commands.batchSerial;
     }
     return YES;
 }
@@ -1159,6 +1166,23 @@ static NSMutableIndexSet *reader_pattern_pages(
                [self submitWithError:error];
     }
 }
+/* A completed surface can be copied into a private RTT texture ahead of an
+ * unrelated suspended raster pass. Keep the source and every pending VRAM
+ * owner disjoint; a current upload or an uncertain writer uses begin's normal
+ * full-submit path instead. No guest RAM is written by the private copy. */
+- (BOOL)canQueuePrivateRTTSnapshot:(NV2AMetalCachedSurface *)surface
+{
+    return !_rasterProducers && _rasterTargets.count &&
+           _commands.hasPendingRasterPass &&
+           _commands.recordingAllowsProducerWork &&
+           !_commands.batchNeedsSubmit &&
+           ![_rasterTargets containsObject:surface] &&
+           (!_recording || (_token && !_token.hasNonProducerSurfaceCapture)) &&
+           !_overwriteTargets.count &&
+           _pendingWrites.length == _sealedWriteBytes &&
+           _pendingDownloads.count == _sealedDownloads &&
+           [self canDownloadCompletedSurfaces:@[ surface ]];
+}
 - (NV2AMetalCachedSurface *)prepareSurfaceForRTTSnapshot:
                                 (NV2AMetalCachedSurface *)surface
                                                    frame:(uint64_t)frame
@@ -1173,7 +1197,78 @@ static NSMutableIndexSet *reader_pattern_pages(
                                           frame:frame
                                    forRendering:NO
                                           error:error];
-        if (!surface || ![self begin:error])
+        if (!surface)
+            return nil;
+        BOOL continuation = [self canQueuePrivateRTTSnapshot:surface];
+        BOOL reprepare = continuation;
+        if (continuation) {
+            NV2AMetalSurfaceTransfer *sourceTransfer = surface.transfer;
+            uint64_t sourceGeneration = surface.generation;
+            NSArray<NV2AMetalCachedSurface *> *rasterTargets = _rasterTargets;
+            NV2AMetalSurfaceRecording *token = _token;
+            BOOL recording = _recording;
+            id<MTL4CommandBuffer> commandBuffer = _commands.commandBuffer;
+            uint64_t batchSerial = _commands.batchSerial;
+            NSUInteger sealedCount = _sealedTokens.count;
+            NSUInteger readBytes = _pendingReads.length;
+            NSUInteger writeBytes = _pendingWrites.length;
+            NSUInteger downloadCount = _pendingDownloads.count;
+            NSUInteger dependencyCount = _pendingDependencies.count;
+            NSUInteger witnessCount = _pendingReadWitnesses.count;
+            if (![self validateRasterContinuationWithError:error] ||
+                (!recording && ![self collectCompletedWithError:error]))
+                return nil;
+            /* Collection may notify the VRAM owner. A callback can change the
+             * source or even the batch while the recursive guard is held. */
+            if (![self healthy:error])
+                return nil;
+            continuation = surface.transfer == sourceTransfer &&
+                           surface.generation == sourceGeneration &&
+                           _rasterTargets == rasterTargets && _token == token &&
+                           _recording == recording &&
+                           _commands.commandBuffer == commandBuffer &&
+                           _commands.batchSerial == batchSerial &&
+                           _sealedTokens.count == sealedCount &&
+                           _pendingReads.length == readBytes &&
+                           _pendingWrites.length == writeBytes &&
+                           _pendingDownloads.count == downloadCount &&
+                           _pendingDependencies.count == dependencyCount &&
+                           _pendingReadWitnesses.count == witnessCount &&
+                           [self canQueuePrivateRTTSnapshot:surface];
+            if (continuation &&
+                ![self validateRasterContinuationWithError:error])
+                return nil;
+        }
+        if (!continuation) {
+            /* Reenter the original preparation once after a changed callback.
+             * Never encode a copy of the stale binding from the first pass. */
+            if (reprepare) {
+                if (![self prepareTextureRead:surface error:error])
+                    return nil;
+                surface = [self prepareSurfaceAtAddress:surface.address
+                                                 config:&config
+                                                  frame:frame
+                                           forRendering:NO
+                                                  error:error];
+                if (!surface)
+                    return nil;
+            }
+            uint64_t preparedGeneration = surface.generation;
+            NV2AMetalSurfaceTransfer *preparedTransfer = surface.transfer;
+            if (![self begin:error])
+                return nil;
+            if (reprepare &&
+                (surface.generation != preparedGeneration ||
+                 surface.transfer != preparedTransfer)) {
+                cache_error(error, @"RTT source changed during recording");
+                return nil;
+            }
+        } else if (!_recording &&
+                   ![self beginNativeRecordingWithError:error]) {
+            return nil;
+        }
+        if (![self healthy:error] || !surface.valid ||
+            ![_surfaces containsObject:surface])
             return nil;
         if (![self captureState:surface error:error])
             return nil;
