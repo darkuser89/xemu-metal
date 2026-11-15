@@ -2131,12 +2131,13 @@ defer_independent_reader(NV2AMetalReaderPrefixes *prefixes,
     return YES;
 }
 
-/* Caller holds the metadata guard. Stop at the requested receipt prefix
- * without probing unrelated reader queues or later submissions. */
-- (BOOL)collectSurfaceSubmissions:(NSUInteger)count error:(NSError **)error
+/* A writeback callback can retire the rest of the original prefix or append
+ * a later receipt. Keep the original tail by identity across those callbacks. */
+- (BOOL)collectSurfaceSubmissionsThrough:(NV2AMetalSurfaceSubmission *)tail
+                                  error:(NSError **)error
 {
-    for (NSUInteger i = 0; i < count; i++) {
-        NV2AMetalSurfaceSubmission *submitted = _submissions[0];
+    while ([self prefixThroughSubmission:tail]) {
+        NV2AMetalSurfaceSubmission *submitted = _submissions.firstObject;
         BOOL pending = NO;
         NSOrderedSet<NV2AMetalIndependentReads *> *dependencies =
             submitted.dependencies;
@@ -2166,10 +2167,23 @@ defer_independent_reader(NV2AMetalReaderPrefixes *prefixes,
         }
         if (pending)
             break;
-        if (![self retireSurfaceSubmission:submitted error:error])
+        if (![self retireSurfaceSubmission:submitted error:error] ||
+            ![self healthy:error])
             return NO;
     }
     return YES;
+}
+
+/* Caller holds the metadata guard. Stop at the requested receipt prefix
+ * without probing unrelated reader queues or later submissions. */
+- (BOOL)collectSurfaceSubmissions:(NSUInteger)count error:(NSError **)error
+{
+    if (!count)
+        return YES;
+    if (count > _submissions.count)
+        return cache_error(error, @"Invalid surface submission prefix");
+    NV2AMetalSurfaceSubmission *tail = _submissions[count - 1];
+    return [self collectSurfaceSubmissionsThrough:tail error:error];
 }
 
 - (BOOL)collectCompletedWithError:(NSError **)error
@@ -2246,6 +2260,14 @@ defer_independent_reader(NV2AMetalReaderPrefixes *prefixes,
              producersOnly:(BOOL)producersOnly
                      error:(NSError **)error
 {
+    NV2AMetalSurfaceSubmission *originalTail = nil;
+    if (prefix) {
+        @synchronized(_stateLock) {
+            if (prefix > _submissions.count)
+                return cache_error(error, @"Invalid surface submission prefix");
+            originalTail = _submissions[prefix - 1];
+        }
+    }
     /* GPU execution is ordered, but feedback callbacks need not arrive in
      * that order. Validate the earlier prefix before publishing dependent
      * state. The PGRAPH owner alone changes this array. */
@@ -2298,23 +2320,27 @@ defer_independent_reader(NV2AMetalReaderPrefixes *prefixes,
             /* Only the final receipt can be partial. Its GPU read witnesses
              * are compute copies, but its raster work and downloads are not
              * yet publishable. Collection retires full receipts only. */
-            for (NSUInteger i = 1; i < prefix; i++)
+            while ([self prefixThroughSubmission:originalTail] > 1)
                 if (![self retireSurfaceSubmission:_submissions.firstObject
-                                              error:error])
+                                              error:error] ||
+                    ![self healthy:error])
                     return NO;
-            NV2AMetalSurfaceSubmission *tail = _submissions.firstObject;
-            for (NV2AMetalReadWitness *witness in tail.readWitnesses)
+            if (![self prefixThroughSubmission:originalTail])
+                return YES;
+            for (NV2AMetalReadWitness *witness in originalTail.readWitnesses)
                 if (![self validateReadWitness:witness error:error])
                     return NO;
-            for (NV2AMetalSurfaceRecording *recording in tail.recordings)
+            for (NV2AMetalSurfaceRecording *recording in originalTail.recordings)
                 recording.producersCompleted = YES;
-            return [self collectSurfaceSubmissions:1 error:error];
+            return [self collectSurfaceSubmissionsThrough:originalTail
+                                                   error:error];
         }
         /* The required receipts were validated above. Later feedback and
          * independent reader retirement belong to the next collection. */
-        for (NSUInteger i = 0; i < prefix; i++)
+        while ([self prefixThroughSubmission:originalTail])
             if (![self retireSurfaceSubmission:_submissions.firstObject
-                                          error:error])
+                                          error:error] ||
+                ![self healthy:error])
                 return NO;
         return YES;
     }
@@ -4226,7 +4252,8 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
         return [self independentReadFailure:writerFailure error:error];
     @synchronized(_stateLock) {
         if (![self validateReadWitnessesForPrefix:prefix producerTail:producerTail error:error] ||
-            ![self collectSurfaceSubmissions:writerCount error:error])
+            (producerTail && ![self collectSurfaceSubmissionsThrough:producerTail
+                                                               error:error]))
             return NO;
         /* Release only this queue's validated reader prefix. A foreign or
          * later receipt belongs to its own completion or normal collection. */
