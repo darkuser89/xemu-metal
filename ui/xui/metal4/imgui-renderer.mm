@@ -343,7 +343,18 @@ static BOOL imgui_error(NSError **error, NSString *message)
         }
         NSUInteger indexBytes = 0, indexOffset = 0;
         id<MTLBuffer> indices = nil;
+        BOOL uploadList = NO;
         if (needsPipeline) {
+            for (const ImDrawCmd &draw : list->CmdBuffer) {
+                if ((draw.UserCallback &&
+                     draw.UserCallback != ImDrawCallback_ResetRenderState) ||
+                    (!draw.UserCallback && draw.ElemCount)) {
+                    uploadList = YES;
+                    break;
+                }
+            }
+        }
+        if (uploadList) {
             NSUInteger vertexBytes = (NSUInteger)list->VtxBuffer.Size *
                                      sizeof(ImDrawVert);
             indexBytes = (NSUInteger)list->IdxBuffer.Size * sizeof(ImDrawIdx);
