@@ -242,7 +242,7 @@ static float4 nv2a_combiner(constant NV2AMetalCombinerState &u,
     float3 c = combiner_read(first >> 8, false, 8, u, registers, ef).rgb;
     float3 d = combiner_read(first, false, 8, u, registers, ef).rgb;
     float g = combiner_read(second >> 8, true, 8, u, registers, ef).x;
-    return float4(d + mix(c, b, a), g);
+    return float4(min(d + mix(c, b, a), 1.0f), g);
 }
 
 #ifndef NV2A_METAL_COMBINER_NO_KERNEL
