@@ -353,6 +353,7 @@ static NSData *vga_version_spans(const GArray *reads)
     NV2AMetalCachedSurface *_lastSource;
     uint64_t _lastSourceGeneration, _lastSourceVersion;
     uint64_t _lastOverlayKey[6];
+    id<MTLTexture> _lastOverlayTexture;
     NV2AMetalScanoutUniforms _lastUniforms;
     NSData *_lastVGARows;
     NV2AMetalVGAUniforms _lastVGAUniforms;
@@ -399,6 +400,7 @@ static NSData *vga_version_spans(const GArray *reads)
 {
     self.frame = nil;
     _lastSource = nil;
+    _lastOverlayTexture = nil;
     _lastVGARows = nil;
     _lastVGASpans = nil;
     _lastVGAReads = nil;
@@ -466,6 +468,7 @@ static NSData *vga_version_spans(const GArray *reads)
         /* A failed wait may leave the target in use. Never recycle it. */
         _pendingFrame.targetLease.pool = nil;
         _lastSource = nil;
+        _lastOverlayTexture = nil;
         _lastVGARows = nil;
         _lastVGASpans = nil;
         _lastVGAReads = nil;
@@ -768,6 +771,7 @@ static NSData *vga_version_spans(const GArray *reads)
     }
     if (!source || !source.transfer.config.color) {
         _lastSource = nil;
+        _lastOverlayTexture = nil;
         return [self renderVGAWithWidth:w height:h params:params error:error];
     }
     unsigned scale = _d->pgraph.surface_scale_factor;
@@ -871,6 +875,17 @@ static NSData *vga_version_spans(const GArray *reads)
     const uint64_t overlayKey[] = {
         address, length, shape.width, shape.height, shape.pitch, overlayVersion,
     };
+    BOOL reuseOverlay = u.overlay_enable && _lastOverlayTexture &&
+        !memcmp(overlayKey, _lastOverlayKey, sizeof(overlayKey));
+    if (reuseOverlay) {
+        /* A matching version is insufficient while a VRAM writer is queued. */
+        NV2AMetalVRAMReadSpan span = { address, length };
+        BOOL ready = NO;
+        if (![_cache tryIdleCPUReadSpans:&span count:1 completed:&ready
+                                 error:error])
+            return NO;
+        reuseOverlay = ready;
+    }
     /* Completed targets are immutable. Only metadata such as DAC palette and
      * SCREEN_OFF needs republishing while the GPU source is unchanged. */
     NV2AMetalFramebuffer *frame = self.frame;
@@ -879,16 +894,7 @@ static NSData *vga_version_spans(const GArray *reads)
         sourceVersion == _lastSourceVersion && !source.needsUpload &&
         !memcmp(&u, &_lastUniforms, sizeof(u)) &&
         !memcmp(overlayKey, _lastOverlayKey, sizeof(overlayKey))) {
-        BOOL overlayReady = YES;
-        if (u.overlay_enable) {
-            /* A queued write or a GPU-owned alias still needs the normal
-             * ordered read, even if the current version happens to match. */
-            NV2AMetalVRAMReadSpan span = { address, length };
-            if (![_cache tryIdleCPUReadSpans:&span count:1
-                                   completed:&overlayReady error:error])
-                return NO;
-        }
-        if (overlayReady) {
+        if (!u.overlay_enable || reuseOverlay) {
             if (![_cache touchSurface:source
                                 frame:_d->pgraph.frame_time
                                 error:error])
@@ -925,12 +931,12 @@ static NSData *vga_version_spans(const GArray *reads)
         return NO;
     NV2AMetalTextureUploadResult *overlay = nil;
     id<MTLTexture> input = nil;
+    id<MTLTexture> overlayTexture = nil;
     NV2AMetalSurfaceConfig config = source.transfer.config;
     /* A PVIDEO writeback may require a new queue wait. Establish that
      * dependency before the primary surface opens the capture section. */
-    if (u.overlay_enable && ![_cache prepareGPUReadAtAddress:address
-                                                      length:length
-                                                       error:error])
+    if (u.overlay_enable && !reuseOverlay &&
+        ![_cache prepareGPUReadAtAddress:address length:length error:error])
         goto fail;
     source = [_cache prepareSurfaceAtAddress:source.address
                                       config:&config
@@ -938,7 +944,7 @@ static NSData *vga_version_spans(const GArray *reads)
                                        error:error];
     if (!source)
         goto fail;
-    if (u.overlay_enable) {
+    if (u.overlay_enable && !reuseOverlay) {
         overlay = [_upload encodeData:_cache.vram
                                offset:address
                               palette:nil
@@ -953,8 +959,9 @@ static NSData *vga_version_spans(const GArray *reads)
     input = [source.transfer textureForCommands:_cache.commands error:error];
     if (!input)
         goto fail;
+    overlayTexture = reuseOverlay ? _lastOverlayTexture : overlay.texture;
     if (![pipeline encodeSource:input
-                        overlay:overlay.texture
+                        overlay:overlayTexture
                          target:target
                        uniforms:&u
                        commands:_cache.commands
@@ -965,6 +972,7 @@ static NSData *vga_version_spans(const GArray *reads)
     _lastSourceGeneration = source.generation;
     _lastSourceVersion = sourceVersion;
     memcpy(_lastOverlayKey, overlayKey, sizeof(overlayKey));
+    _lastOverlayTexture = u.overlay_enable ? overlayTexture : nil;
     _lastUniforms = u;
     return YES;
 fail:
