@@ -290,13 +290,9 @@ static void fetch_sort_indices(uint32_t *indices, NSUInteger count,
     }
 }
 static BOOL fetch_bitmap_index_ranges(const uint32_t *indices, NSUInteger count,
+                                      uint32_t minimum, uint32_t maximum,
                                       NSMutableData *ranges)
 {
-    uint32_t minimum = indices[0], maximum = indices[0];
-    for (NSUInteger i = 1; i < count; i++) {
-        minimum = MIN(minimum, indices[i]);
-        maximum = MAX(maximum, indices[i]);
-    }
     NSUInteger words = ((NSUInteger)maximum - minimum) / 64 + 1;
     /* No larger than the uint32_t copy required by sorting a sparse domain. */
     if (words > count / 2)
@@ -339,17 +335,26 @@ static NSMutableData *fetch_index_ranges(const uint32_t *indices,
     if (!count)
         return ranges;
     NSMutableData *ordered = nil;
-    for (NSUInteger i = 1; i < count; i++) {
-        if (indices[i] < indices[i - 1]) {
-            if (fetch_bitmap_index_ranges(indices, count, ranges))
-                return ranges;
-            ordered = [NSMutableData dataWithBytes:indices length:count * 4];
-            if (!ordered)
-                return nil;
-            fetch_sort_indices(ordered.mutableBytes, count, 24);
-            indices = ordered.bytes;
-            break;
+    NSUInteger firstUnsorted = 1;
+    while (firstUnsorted < count &&
+           indices[firstUnsorted] >= indices[firstUnsorted - 1])
+        firstUnsorted++;
+    if (firstUnsorted < count) {
+        /* The sorted prefix already proves its extrema. Scan only the
+         * remaining suffix before choosing the bitmap or sort fallback. */
+        uint32_t minimum = indices[0], maximum = indices[firstUnsorted - 1];
+        for (NSUInteger i = firstUnsorted; i < count; i++) {
+            minimum = MIN(minimum, indices[i]);
+            maximum = MAX(maximum, indices[i]);
         }
+        if (fetch_bitmap_index_ranges(indices, count, minimum, maximum,
+                                      ranges))
+            return ranges;
+        ordered = [NSMutableData dataWithBytes:indices length:count * 4];
+        if (!ordered)
+            return nil;
+        fetch_sort_indices(ordered.mutableBytes, count, 24);
+        indices = ordered.bytes;
     }
     NSRange range = NSMakeRange(indices[0], 1);
     for (NSUInteger i = 1; i < count; i++) {
