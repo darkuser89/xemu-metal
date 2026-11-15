@@ -787,6 +787,8 @@ compact_polygon_fill_carrier(uint3 source, uint provoking, uint face,
         projection->points[i][0] = points[i].x;
         projection->points[i][1] = points[i].y;
     }
+    if (!valid)
+        return result;
     float2 lo = viewport, hi = 0;
     for (uint i = 0; i < count; i++) {
         lo = min(lo, points[i]);
@@ -842,8 +844,6 @@ compact_polygon_fill_carrier(uint3 source, uint provoking, uint face,
             corners[3] = origin + (axis * upper.x + normal * upper.y) * inverse;
         }
     }
-    if (!valid)
-        return result;
     for (uint i = 0; i < 4; i++) {
         float2 ndc = corners[i] / viewport * 2 - 1;
         result.clip[i][0] = ndc.x;
