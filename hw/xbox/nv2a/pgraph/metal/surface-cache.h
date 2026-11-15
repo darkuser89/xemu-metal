@@ -264,6 +264,9 @@ API_AVAILABLE(macos(26.0))
 - (BOOL)prepareGPUReadAtAddress:(NSUInteger)address
                          length:(NSUInteger)length
                           error:(NSError *_Nullable *_Nullable)error;
+/* A reused native texture has no VRAM source read. Retain its binding in the
+ * current producer section when safe, otherwise use the ordinary boundary. */
+- (BOOL)prepareCachedTextureBindingWithError:(NSError *_Nullable *_Nullable)error;
 - (BOOL)prepareGPUReadPattern:(NV2AMetalVRAMReadPattern)pattern
                         error:(NSError *_Nullable *_Nullable)error;
 /* Register disjoint patterns as one GPU read transaction. Count zero still

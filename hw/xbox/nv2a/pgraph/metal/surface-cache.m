@@ -3782,6 +3782,46 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
     return YES;
 }
 
+/* A cache hit records no VRAM source. It only needs a command section in
+ * which the already uploaded native texture can be retained for this draw. */
+- (BOOL)canQueueCachedTextureBinding
+{
+    return _commands.hasPendingRasterPass && !_rasterProducers &&
+           _commands.recordingAllowsProducerWork &&
+           !(_recording && _token.hasNonProducerSurfaceCapture) &&
+           !_overwriteTargets.count &&
+           _pendingWrites.length == _sealedWriteBytes &&
+           _pendingDownloads.count == _sealedDownloads &&
+           !(_sealedTokens.count && _commands.batchNeedsSubmit);
+}
+
+- (BOOL)prepareCachedTextureBindingWithError:(NSError **)error
+{
+    @synchronized(_stateLock) {
+        if (![self healthy:error])
+            return NO;
+        if ([self canQueueCachedTextureBinding]) {
+            if (![self validateRasterContinuationWithError:error])
+                return NO;
+            if (!_recording && ![self collectCompletedWithError:error])
+                return NO;
+            /* Completion callbacks may change the batch or cache state. */
+            if (![self healthy:error])
+                return NO;
+            if ([self canQueueCachedTextureBinding]) {
+                if (![self validateRasterContinuationWithError:error])
+                    return NO;
+                if (!_recording && ![self beginNativeRecordingWithError:error])
+                    return NO;
+                /* The caller retains the private texture; no VRAM resource
+                 * participates in this producer section. */
+                return YES;
+            }
+        }
+        return [self prepareGPUReadAtAddress:0 length:0 error:error];
+    }
+}
+
 - (BOOL)prepareGPUReadPatterns:(const NV2AMetalVRAMReadPattern *)patterns
                          count:(NSUInteger)count
                          error:(NSError **)error

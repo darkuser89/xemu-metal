@@ -1229,7 +1229,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
             return nil;
         }
     } else if (recordGPUUse) {
-        if (![_surfaces prepareGPUReadAtAddress:0 length:0 error:error])
+        if (![_surfaces prepareCachedTextureBindingWithError:error])
             return nil;
     } else if (!*collectedFeedback) {
         if (![_surfaces collectCompletedWithError:error])
