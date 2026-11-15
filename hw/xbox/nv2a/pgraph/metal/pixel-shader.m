@@ -389,6 +389,8 @@ static NSUInteger pixel_source_vertex_count(NV2AMetalPixelRasterClass raster,
     argumentsForBindings:(const NV2AMetalPixelBindings *)bindings
                 commands:(NV2AMetalCommands *)commands
                   serial:(uint64_t)serial;
+- (BOOL)hasEncodedBindingsForDraw:(NV2AMetalPixelDraw *)draw
+                          encoder:(id<MTL4RenderCommandEncoder>)encoder;
 - (BOOL)applyRasterStateForDraw:(NV2AMetalPixelDraw *)draw
                          encoder:(id<MTL4RenderCommandEncoder>)encoder;
 @end
@@ -485,12 +487,13 @@ static NSUInteger pixel_source_vertex_count(NV2AMetalPixelRasterClass raster,
         return pixel_error(error, @"Pixel draw belongs to another recording");
     if (!count)
         return YES;
-    id<MTL4ArgumentTable> arguments = [_shader argumentsForBindings:&_bindings
-                                                           commands:commands
-                                                             serial:_serial];
+    BOOL bound = [_shader hasEncodedBindingsForDraw:self encoder:encoder];
+    id<MTL4ArgumentTable> arguments = bound ? nil :
+        [_shader argumentsForBindings:&_bindings commands:commands serial:_serial];
     BOOL drawable = [_shader applyRasterStateForDraw:self encoder:encoder];
-    [encoder setArgumentTable:arguments
-                     atStages:MTLRenderStageVertex | MTLRenderStageFragment];
+    if (!bound)
+        [encoder setArgumentTable:arguments
+                         atStages:MTLRenderStageVertex | MTLRenderStageFragment];
     if (drawable)
         [encoder drawPrimitives:_primitive vertexStart:first vertexCount:count];
     return YES;
@@ -713,6 +716,16 @@ static BOOL blend_reads_destination(unsigned blend, unsigned surface_channels)
 {
     _encodingEncoder = nil;
     _encodedDraw = nil;
+}
+
+- (BOOL)hasEncodedBindingsForDraw:(NV2AMetalPixelDraw *)draw
+                          encoder:(id<MTL4RenderCommandEncoder>)encoder
+{
+    NV2AMetalPixelDraw *previous = encoder == _encodingEncoder ? _encodedDraw : nil;
+    return previous && previous->_commands == draw->_commands &&
+           previous->_serial == draw->_serial &&
+           !memcmp(&previous->_bindings, &draw->_bindings, sizeof(_bound)) &&
+           !memcmp(&_bound, &draw->_bindings, sizeof(_bound));
 }
 
 - (BOOL)applyRasterStateForDraw:(NV2AMetalPixelDraw *)draw
