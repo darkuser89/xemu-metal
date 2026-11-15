@@ -3775,10 +3775,14 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
                                downloads:(NSArray<NV2AMetalCachedSurface *> *)selected
                                    error:(NSError **)error
 {
+    /* A cache-hit binding requests a zero-length pattern solely to open its
+     * command section. No GPU command in that section reads guest VRAM. */
+    BOOL empty = !count || (count == 1 && !patterns[0].length);
     if (![self download:selected error:error] || ![self begin:error] ||
-        ![_commands addResource:_vram error:error])
+        (!empty && ![_commands addResource:_vram error:error]))
         return NO;
-    [self registerSurfaceReadPatterns:patterns count:count];
+    if (!empty)
+        [self registerSurfaceReadPatterns:patterns count:count];
     return YES;
 }
 
