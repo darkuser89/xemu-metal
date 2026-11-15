@@ -11,7 +11,7 @@ static inline BOOL nv2a_metal_texture_storage_byte_lanes(unsigned storage)
     return storage == NV2AMetalTextureStorageUnorm8 ||
            storage == NV2AMetalTextureStorageSnorm8 ||
            (storage >= NV2AMetalTextureStorageBGRA8 &&
-            storage <= NV2AMetalTextureStorageBGRA8ARGB) ||
+            storage <= NV2AMetalTextureStorageBGRA8GRAB) ||
            (storage >= NV2AMetalTextureStorageByteY8 &&
             storage <= NV2AMetalTextureStorageByteR8B8);
 }
@@ -41,6 +41,7 @@ static inline unsigned nv2a_metal_texture_storage_bytes(unsigned storage)
     case NV2AMetalTextureStorageBGRX8:
     case NV2AMetalTextureStorageBGRA8SwapRB:
     case NV2AMetalTextureStorageBGRA8ARGB:
+    case NV2AMetalTextureStorageBGRA8GRAB:
     case NV2AMetalTextureStorageSnorm8:
     case NV2AMetalTextureStorageFloatY16:
     case NV2AMetalTextureStorageFloatDepthY16:
@@ -78,6 +79,7 @@ static inline MTLPixelFormat nv2a_metal_texture_storage_format(unsigned storage)
     case NV2AMetalTextureStorageBGRX8:
     case NV2AMetalTextureStorageBGRA8SwapRB:
     case NV2AMetalTextureStorageBGRA8ARGB:
+    case NV2AMetalTextureStorageBGRA8GRAB:
         return MTLPixelFormatBGRA8Unorm;
     case NV2AMetalTextureStorageSnorm8:
         return MTLPixelFormatRGBA8Snorm;
@@ -111,6 +113,10 @@ nv2a_metal_texture_storage_swizzle(unsigned storage)
         return MTLTextureSwizzleChannelsMake(
             MTLTextureSwizzleAlpha, MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
             MTLTextureSwizzleBlue);
+    case NV2AMetalTextureStorageBGRA8GRAB:
+        return MTLTextureSwizzleChannelsMake(
+            MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
+            MTLTextureSwizzleAlpha, MTLTextureSwizzleBlue);
     case NV2AMetalTextureStorageByteY8:
         return MTLTextureSwizzleChannelsMake(
             MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed,

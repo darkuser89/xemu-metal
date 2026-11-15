@@ -30,6 +30,7 @@ enum {
     NV2AMetalTextureStorageBGRX8 = 21,
     NV2AMetalTextureStorageBGRA8SwapRB = 22,
     NV2AMetalTextureStorageBGRA8ARGB = 23,
+    NV2AMetalTextureStorageBGRA8GRAB = 24,
     NV2AMetalTextureStorageCount,
 };
 

@@ -519,6 +519,10 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
             return NV2AMetalTextureStorageBGRA8;
         if (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8)
             return NV2AMetalTextureStorageBGRX8;
+        if (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8)
+            return NV2AMetalTextureStorageBGRA8GRAB;
+        if (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8)
+            return NV2AMetalTextureStorageBGRA8ARGB;
     }
     return texture_storage(shape);
 }
@@ -609,6 +613,10 @@ static BOOL texture_layout(const NV2AMetalTextureShape *shape,
          (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 &&
           storage == NV2AMetalTextureStorageBGRX8) ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ||
+         (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 &&
+          storage == NV2AMetalTextureStorageBGRA8GRAB) ||
+         (shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 &&
+          storage == NV2AMetalTextureStorageBGRA8ARGB) ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5 ||
          shape->format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ||

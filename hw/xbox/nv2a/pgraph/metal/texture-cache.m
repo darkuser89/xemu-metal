@@ -374,6 +374,9 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
     if (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
         format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8)
         return NV2AMetalTextureStorageBGRA8ARGB;
+    if (format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 ||
+        format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8)
+        return NV2AMetalTextureStorageBGRA8GRAB;
     return NV2AMetalTextureStorageBGRA8;
 }
 
@@ -592,9 +595,9 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
     return content;
 }
 
-/* The first two SZ channel orders can retain scale-one source bytes with an
- * immutable read swizzle. Other cases reproduce the old download's logical
- * texel selection, including all eight stored alpha bits of A7 surfaces. */
+/* Scale-one channel orders retain source bytes with an immutable read
+ * swizzle. Scaled captures reproduce the old download's logical texel
+ * selection, including all eight stored alpha bits of A7 surfaces. */
 - (BOOL)canCaptureSwizzledChannelsSurface:(NV2AMetalCachedSurface *)surface
                                    format:(unsigned)format
 {
@@ -659,7 +662,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
         return nil;
     unsigned order = rtt_swizzled_channel_order(format);
     if (![self canCaptureSwizzledChannelsSurface:surface format:format] ||
-        (surface.transfer.config.scale == 1 && order != 3)) {
+        surface.transfer.config.scale == 1) {
         texture_cache_error(error, @"Invalid scaled channel surface capture");
         return nil;
     }
@@ -1162,8 +1165,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
                                                   format:c.shape.format
                                                    error:error];
             } else if (swizzledChannels &&
-                       (surface.transfer.config.scale > 1 ||
-                        rtt_swizzled_channel_order(c.shape.format) == 3)) {
+                       surface.transfer.config.scale > 1) {
                 if (![self prepareDownsampleChannelsCaptureWithError:error])
                     return nil;
                 content = [self captureDownsampledChannels:surface
