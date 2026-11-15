@@ -26,7 +26,13 @@ static float sample_coordinate(float c, uint address)
 static int sample_address(int c, uint size, uint address)
 {
     if (address == 1) {
-        return (c % int(size) + int(size)) % int(size);
+        int extent = int(size);
+        /* sample_level folds WRAP coordinates into [0, 1) first. Nearest
+         * reads and adjacent linear taps are then at most one texel outside
+         * the image; keep the general modulo for any other caller/value. */
+        if (c >= -1 && c <= extent)
+            return c < 0 ? c + extent : c >= extent ? c - extent : c;
+        return (c % extent + extent) % extent;
     }
     /* Mirroring coordinates first folds [0, 2] onto [0, 1]; texels at the
      * reflected seams then clamp, rather than wrap to the opposite edge. */
