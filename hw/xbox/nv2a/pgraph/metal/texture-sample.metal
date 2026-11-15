@@ -245,6 +245,17 @@ static bool sample_base_only(constant NV2AMetalSamplingUniforms &s)
            s.min_linear == s.mag_linear && s.anisotropy == 1;
 }
 
+static bool sample_base_only(constant NV2AMetalSamplingUniforms &s,
+                             uint mip_levels)
+{
+    /* Nearest-mip selection with one available level also chooses level 0.
+     * Equal min/mag filters and one tap make derivatives irrelevant. Keep
+     * linear mip mixing on the general path, even when its levels coincide. */
+    return sample_base_only(s) ||
+           (s.enabled == 1 && s.mip_filter == 1 && mip_levels == 1 &&
+            s.min_linear == s.mag_linear && s.anisotropy == 1);
+}
+
 static float4 nv2a_sample(texture2d<float> t, sampler smp, float2 c,
                           constant NV2AMetalSamplingUniforms &s,
                           uint unsigned_half_mask = 0)
@@ -252,7 +263,7 @@ static float4 nv2a_sample(texture2d<float> t, sampler smp, float2 c,
     if (!s.enabled) {
         return t.sample(smp, c);
     }
-    bool base_only = sample_base_only(s);
+    bool base_only = sample_base_only(s, t.get_num_mip_levels());
     float2 dx(0), dy(0);
     if (!base_only) {
         dx = dfdx(c);
@@ -268,7 +279,7 @@ static float4 nv2a_sample(texture3d<float> t, sampler smp, float3 c,
     if (!s.enabled) {
         return t.sample(smp, c);
     }
-    bool base_only = sample_base_only(s);
+    bool base_only = sample_base_only(s, t.get_num_mip_levels());
     float3 dx(0), dy(0);
     if (!base_only) {
         dx = dfdx(c);
@@ -286,7 +297,7 @@ static float4 nv2a_sample(texturecube<float> t, sampler smp, float3 c,
     }
     /* Compute direction derivatives before selecting the face. Projecting
      * those derivatives analytically avoids dfdx/dfdy across a face seam. */
-    bool base_only = sample_base_only(s);
+    bool base_only = sample_base_only(s, t.get_num_mip_levels());
     float3 dx(0), dy(0);
     if (!base_only) {
         dx = dfdx(c);
