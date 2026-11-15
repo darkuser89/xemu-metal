@@ -389,6 +389,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 @implementation NV2AMetalTextureCache {
     NV2AMetalTextureUpload *_upload;
     NV2AMetalTextureSampler *_sampler;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _capture;
     id<MTL4ArgumentTable> _arguments;
     id<MTLComputePipelineState> _downsampleCapture;
@@ -426,35 +427,25 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
     _entries = [[NV2AMetalLRUCache alloc] initWithCapacity:512];
     return self;
 }
+- (NV2AMetalShaderLibrary *)shaderModuleWithError:(NSError **)error
+{
+    if (!_module) {
+        _module = [NV2AMetalShaderLibrary
+            sharedWithDevice:_surfaces.commands.device
+                      source:metal_shader_source
+                       error:error];
+    }
+    return _module;
+}
 - (BOOL)prepareCaptureWithError:(NSError **)error
 {
     if (_capture)
         return YES;
-    id<MTLDevice> device = _surfaces.commands.device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
+    NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
+    if (!module)
         return NO;
-    }
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    ld.options.mathMode = MTLMathModeSafe;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!library) {
-        return NO;
-    }
-    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-    fn.library = library;
-    fn.name = @"nv2a_surface_texture";
-    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-    pd.computeFunctionDescriptor = fn;
     id<MTLComputePipelineState> capture =
-        [compiler newComputePipelineStateWithDescriptor:pd
-                                    compilerTaskOptions:nil
-                                                  error:error];
+        [module computeFunction:@"nv2a_surface_texture" error:error];
     if (!capture)
         return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
@@ -501,11 +492,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 {
     if (_downsampleCapture)
         return YES;
-    id<MTLDevice> device = _surfaces.commands.device;
-    NV2AMetalShaderLibrary *module =
-        [NV2AMetalShaderLibrary sharedWithDevice:device
-                                          source:metal_shader_source
-                                           error:error];
+    NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
     if (!module)
         return NO;
     id<MTLComputePipelineState> pipeline =
@@ -635,11 +622,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 {
     if (_downsampleChannelsCapture)
         return YES;
-    id<MTLDevice> device = _surfaces.commands.device;
-    NV2AMetalShaderLibrary *module =
-        [NV2AMetalShaderLibrary sharedWithDevice:device
-                                          source:metal_shader_source
-                                           error:error];
+    NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
     if (!module)
         return NO;
     id<MTLComputePipelineState> pipeline =

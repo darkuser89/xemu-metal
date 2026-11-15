@@ -4,6 +4,7 @@
  */
 
 #import "display.h"
+#import "shader-library.h"
 #include "texture-alias.h"
 #include "display-source.h"
 #include <stddef.h>
@@ -66,44 +67,59 @@ static BOOL display_error(NSError **error, NSString *message)
 {
     if (_pipeline)
         return YES;
-    MTL4CompilerDescriptor *compilerDescriptor = [MTL4CompilerDescriptor new];
-    compilerDescriptor.label = @"NV2A display compiler";
-    id<MTL4Compiler> compiler =
-        [_device newCompilerWithDescriptor:compilerDescriptor error:error];
-    if (!compiler) {
-        return NO;
-    }
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library) {
-        return NO;
-    }
-    MTL4LibraryFunctionDescriptor *vertex = [MTL4LibraryFunctionDescriptor new];
-    vertex.library = library;
-    vertex.name = @"nv2a_display_vertex";
-    MTL4LibraryFunctionDescriptor *fragment =
-        [MTL4LibraryFunctionDescriptor new];
-    fragment.library = library;
-    fragment.name = @"nv2a_display_fragment";
-    MTL4RenderPipelineDescriptor *pipelineDescriptor =
-        [MTL4RenderPipelineDescriptor new];
-    pipelineDescriptor.label = @"NV2A framebuffer gamma and scaling";
-    pipelineDescriptor.vertexFunctionDescriptor = vertex;
-    pipelineDescriptor.fragmentFunctionDescriptor = fragment;
-    pipelineDescriptor.colorAttachments[0].pixelFormat = _pixelFormat;
-    pipelineDescriptor.inputPrimitiveTopology =
-        MTLPrimitiveTopologyClassTriangle;
-    id<MTLRenderPipelineState> pipeline =
-        [compiler newRenderPipelineStateWithDescriptor:pipelineDescriptor
-                                   compilerTaskOptions:nil
-                                                 error:error];
-    if (!pipeline) {
-        return NO;
+    id<MTLRenderPipelineState> pipeline;
+    /* PNG captures create a new display for each image. Retain only the
+     * current device's immutable library and two supported target pipelines;
+     * each display still owns its mutable argument table. */
+    static NV2AMetalShaderLibrary *cachedModule;
+    static id<MTLRenderPipelineState> cachedBGRA, cachedRGBA;
+    @synchronized(NV2AMetalDisplay.class) {
+        BOOL sameDevice = cachedModule.library.device == _device;
+        pipeline = sameDevice ? (_pixelFormat == MTLPixelFormatBGRA8Unorm ?
+                                     cachedBGRA : cachedRGBA) :
+                                nil;
+        if (!pipeline) {
+            NV2AMetalShaderLibrary *module =
+                sameDevice ? cachedModule :
+                             [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                                                source:metal_shader_source
+                                                                 error:error];
+            if (!module)
+                return NO;
+            MTL4LibraryFunctionDescriptor *vertex =
+                [MTL4LibraryFunctionDescriptor new];
+            vertex.library = module.library;
+            vertex.name = @"nv2a_display_vertex";
+            MTL4LibraryFunctionDescriptor *fragment =
+                [MTL4LibraryFunctionDescriptor new];
+            fragment.library = module.library;
+            fragment.name = @"nv2a_display_fragment";
+            MTL4RenderPipelineDescriptor *descriptor =
+                [MTL4RenderPipelineDescriptor new];
+            descriptor.label = @"NV2A framebuffer gamma and scaling";
+            descriptor.vertexFunctionDescriptor = vertex;
+            descriptor.fragmentFunctionDescriptor = fragment;
+            descriptor.colorAttachments[0].pixelFormat = _pixelFormat;
+            descriptor.inputPrimitiveTopology =
+                MTLPrimitiveTopologyClassTriangle;
+            @synchronized(module.compiler) {
+                pipeline = [module.compiler
+                    newRenderPipelineStateWithDescriptor:descriptor
+                                     compilerTaskOptions:nil
+                                                   error:error];
+            }
+            if (!pipeline)
+                return NO;
+            if (!sameDevice) {
+                cachedBGRA = nil;
+                cachedRGBA = nil;
+                cachedModule = module;
+            }
+            if (_pixelFormat == MTLPixelFormatBGRA8Unorm)
+                cachedBGRA = pipeline;
+            else
+                cachedRGBA = pipeline;
+        }
     }
 
     MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
