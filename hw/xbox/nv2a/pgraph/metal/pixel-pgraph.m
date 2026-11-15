@@ -198,7 +198,7 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
                      textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
                        device:(id<MTLDevice>)device
                  frozenRaster:(NV2AMetalDrawState *)boundRaster
-                 reusingRaster:(NV2AMetalDrawState *)previousRaster
+                reusingRasters:(NSArray<NV2AMetalDrawState *> *)rasters
                         error:(NSError **)error;
 @end
 @implementation NV2AMetalPGRAPHPixelState {
@@ -251,14 +251,27 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
                       textures:textures
                         device:device
                   frozenRaster:nil
-                 reusingRaster:previousRaster
+                reusingRasters:previousRaster ? @[ previousRaster ] : nil
+                         error:error];
+}
+- (instancetype)initWithState:(PGRAPHState *)pg
+                     textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
+                       device:(id<MTLDevice>)device
+               reusingRasters:(NSArray<NV2AMetalDrawState *> *)rasters
+                        error:(NSError **)error
+{
+    return [self initWithState:pg
+                      textures:textures
+                        device:device
+                  frozenRaster:nil
+                reusingRasters:rasters
                          error:error];
 }
 - (instancetype)initWithState:(PGRAPHState *)pg
                      textures:(NV2AMetalPGRAPHTextureSnapshot *)textures
                        device:(id<MTLDevice>)device
                  frozenRaster:(NV2AMetalDrawState *)boundRaster
-                 reusingRaster:(NV2AMetalDrawState *)previousRaster
+                reusingRasters:(NSArray<NV2AMetalDrawState *> *)rasters
                         error:(NSError **)error
 {
     self = [super init];
@@ -410,10 +423,16 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
                      (NSUInteger)pg->surface_shape.clip_width * sx,
                      (NSUInteger)pg->surface_shape.clip_height * sy },
     };
-    if (previousRaster && previousRaster.device == device) {
-        NV2AMetalDrawConfig previous = previousRaster.config;
-        if (same_raster_config(&raster, &previous))
-            boundRaster = previousRaster;
+    if (!boundRaster) {
+        for (NV2AMetalDrawState *candidate in rasters) {
+            if (candidate.device != device)
+                continue;
+            NV2AMetalDrawConfig previous = candidate.config;
+            if (same_raster_config(&raster, &previous)) {
+                boundRaster = candidate;
+                break;
+            }
+        }
     }
     _raster = boundRaster ?:
                             [[NV2AMetalDrawState alloc] initWithDevice:device
@@ -434,7 +453,7 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
                                                 textures:_textures
                                                   device:device
                                             frozenRaster:_raster
-                                            reusingRaster:nil
+                                           reusingRasters:nil
                                                    error:error];
     if (state) {
         state->_offsetMask = _offsetMask;

@@ -297,7 +297,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     NV2AMetalPGRAPHVertexState *_vertexState, *_restoredVertexState;
     NV2AMetalPGRAPHVertexState *_programCaptureWitness;
     NV2AMetalPGRAPHPixelState *_pixelState;
-    NV2AMetalDrawState *_lastCapturedRaster;
+    NSMutableArray<NV2AMetalDrawState *> *_rasterStates;
     NV2AMetalDepthStencilCache *_depthStencilCache;
     NSData *_restoredBeginSnapshot;
     NV2AMetalSurfaceBindings _surfaceBindings;
@@ -385,6 +385,7 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
     _pending = [[NV2AMetalPendingJournal alloc] initWithLimit:NSUIntegerMax];
     _geometry = [[NV2AMetalGeometry alloc] initWithDevice:device error:error];
     _pixels = [[NV2AMetalLRUCache alloc] initWithCapacity:32];
+    _rasterStates = [NSMutableArray arrayWithCapacity:16];
     _pixelPipelineCaches = [NSMapTable strongToWeakObjectsMapTable];
     _depthStencilCache = [NV2AMetalDepthStencilCache sharedWithDevice:device
                                                                error:error];
@@ -408,10 +409,16 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         initWithState:&_d->pgraph
              textures:textures
                device:_surfaces.cache.commands.device
-        reusingRaster:_lastCapturedRaster
+       reusingRasters:_rasterStates
                 error:error];
-    if (state)
-        _lastCapturedRaster = state.raster;
+    if (state) {
+        NSUInteger index = [_rasterStates indexOfObjectIdenticalTo:state.raster];
+        if (index != NSNotFound)
+            [_rasterStates removeObjectAtIndex:index];
+        [_rasterStates insertObject:state.raster atIndex:0];
+        if (_rasterStates.count > 16)
+            [_rasterStates removeLastObject];
+    }
     return state;
 }
 - (NV2AMetalPixelShader *)pixelForColor:(MTLPixelFormat)color
@@ -2073,6 +2080,7 @@ fail:
     _restoredBeginSnapshot = nil;
     _resumeQuery = _resumeQuery || _active;
     [self resetSession];
+    [_rasterStates removeAllObjects];
 }
 - (BOOL)flushWithError:(NSError **)error
 {
@@ -2122,6 +2130,7 @@ fail:
     _d->pgraph.surface_color.buffer_dirty = colorDirty;
     _d->pgraph.surface_zeta.buffer_dirty = zetaDirty;
     [self resetSession];
+    [_rasterStates removeAllObjects];
     _restoredVertexState = nil;
     _restoredBeginSnapshot = nil;
     [_reports discard];
@@ -2146,7 +2155,7 @@ fail:
     [_textures close];
     [_fetch close];
     [_pixels removeAllObjects];
-    _lastCapturedRaster = nil;
+    [_rasterStates removeAllObjects];
     _depthStencilCache = nil;
     _closed = YES;
     _programCaptureWitness = nil;
@@ -2236,6 +2245,7 @@ fail:
         capture.primitive != _d->pgraph.primitive_mode)
         return pgraph_draw_error(error, @"Restored Begin primitive mismatch");
     _restoredBeginSnapshot = [data copy];
+    [_rasterStates removeAllObjects];
     _programCaptureWitness = nil;
     return YES;
 }

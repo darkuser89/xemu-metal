@@ -46,6 +46,14 @@ API_AVAILABLE(macos(26.0))
            device:(id<MTLDevice>)device
     reusingRaster:(nullable NV2AMetalDrawState *)raster
             error:(NSError *_Nullable *_Nullable)error;
+/* Reuse an exact, previously validated raster state from the caller's bounded
+ * cache. The caller owns and updates the cache after a successful capture. */
+- (nullable instancetype)
+    initWithState:(PGRAPHState *)state
+         textures:(nullable NV2AMetalPGRAPHTextureSnapshot *)textures
+           device:(id<MTLDevice>)device
+   reusingRasters:(nullable NSArray<NV2AMetalDrawState *> *)rasters
+            error:(NSError *_Nullable *_Nullable)error;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 /* glClear's persistent masks/dither/scissor changes, without shader/texture
