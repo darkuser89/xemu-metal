@@ -841,7 +841,7 @@ static NSData *vga_version_spans(const GArray *reads)
             GET_MASK(r[NV_PVIDEO_POINT_OUT], NV_PVIDEO_POINT_OUT_Y) * scale;
         unsigned sw = ow * scale, sh = oh * scale;
         u.overlay_rect[1] =
-            MAX((int64_t)out_height - 1 - ((int64_t)oy + sh), 0);
+            (int64_t)out_height - 1 - ((int64_t)oy + sh);
         u.overlay_rect[2] = sw;
         u.overlay_rect[3] = sh;
         u.overlay_scale[0] = sx;

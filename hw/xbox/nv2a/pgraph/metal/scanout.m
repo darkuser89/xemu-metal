@@ -137,7 +137,8 @@ static BOOL readable(id<MTLTexture> texture, id<MTLDevice> device)
             error, @"Scanout line stride exceeds finite coordinate range");
     if (u->overlay_enable) {
         for (unsigned i = 0; i < 4; i++)
-            if (!isfinite(u->overlay_rect[i]) || u->overlay_rect[i] < 0)
+            if (!isfinite(u->overlay_rect[i]) ||
+                (i >= 2 && u->overlay_rect[i] < 0))
                 return scanout_error(error, @"Invalid PVIDEO rectangle");
         for (unsigned i = 0; i < 3; i++)
             if (!isfinite(u->overlay_scale[i]) || u->overlay_scale[i] < 0 ||
@@ -150,7 +151,8 @@ static BOOL readable(id<MTLTexture> texture, id<MTLDevice> device)
         // Keep interpolated texel coordinates finite before repeat reduction.
         for (unsigned i = 0; i < 2; i++) {
             double extent =
-                (double)target.width + target.height + u->overlay_rect[i];
+                (double)target.width + target.height +
+                fabs((double)u->overlay_rect[i]);
             double coordinate =
                 fabs((double)u->overlay_input[i]) +
                 extent * u->overlay_scale[2] * u->overlay_scale[i];

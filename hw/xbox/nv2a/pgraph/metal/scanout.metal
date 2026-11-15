@@ -64,7 +64,10 @@ fragment float4 nv2a_scanout_fragment(ScanoutVertex in [[stage_in]],
                       u.output_size[1] - in.position.y - .5f);
         float2 origin(u.overlay_rect[0], u.overlay_rect[1]);
         float2 extent(u.overlay_rect[2], u.overlay_rect[3]);
-        if (all(screen >= origin) && all(screen <= origin + extent) &&
+        /* Pixel-center coordinates make the right edge exclusive. Y is
+         * reflected, so its lower edge is exclusive instead. */
+        if (screen.x >= origin.x && screen.x < origin.x + extent.x &&
+            screen.y > origin.y && screen.y <= origin.y + extent.y &&
             (!u.color_key_enable ||
              all(color.rgb ==
                  float3(u.color_key[0], u.color_key[1], u.color_key[2])))) {
