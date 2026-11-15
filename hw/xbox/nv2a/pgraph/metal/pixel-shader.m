@@ -488,14 +488,17 @@ static NSUInteger pixel_source_vertex_count(NV2AMetalPixelRasterClass raster,
     if (!count)
         return YES;
     BOOL bound = [_shader hasEncodedBindingsForDraw:self encoder:encoder];
-    id<MTL4ArgumentTable> arguments = bound ? nil :
-        [_shader argumentsForBindings:&_bindings commands:commands serial:_serial];
     BOOL drawable = [_shader applyRasterStateForDraw:self encoder:encoder];
-    if (!bound)
+    if (!drawable)
+        return YES;
+    if (!bound) {
+        id<MTL4ArgumentTable> arguments =
+            [_shader argumentsForBindings:&_bindings commands:commands
+                                   serial:_serial];
         [encoder setArgumentTable:arguments
                          atStages:MTLRenderStageVertex | MTLRenderStageFragment];
-    if (drawable)
-        [encoder drawPrimitives:_primitive vertexStart:first vertexCount:count];
+    }
+    [encoder drawPrimitives:_primitive vertexStart:first vertexCount:count];
     return YES;
 }
 @end

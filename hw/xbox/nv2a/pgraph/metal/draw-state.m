@@ -350,6 +350,17 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
                primitive:(MTLPrimitiveType)primitive
     ignorePolygonCulling:(BOOL)ignore
 {
+    if (!ignore && _cullsBothFaces && primitive >= MTLPrimitiveTypeTriangle)
+        return NO;
+    MTLScissorRect rect = { 0, 0, width, height };
+    if (_config.scissor_enabled) {
+        rect.x = draw_min(_config.scissor.x, width);
+        rect.y = draw_min(_config.scissor.y, height);
+        rect.width = draw_min(_config.scissor.width, width - rect.x);
+        rect.height = draw_min(_config.scissor.height, height - rect.y);
+    }
+    if (!rect.width || !rect.height)
+        return NO;
     NSUInteger viewportWidth = _config.viewport_width ?
                                    _config.viewport_width : width;
     NSUInteger viewportHeight = _config.viewport_width ?
@@ -367,19 +378,6 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
                         green:((argb >> 8) & 255) / 255.0f
                          blue:(argb & 255) / 255.0f
                         alpha:(argb >> 24) / 255.0f];
-    if (!ignore && _cullsBothFaces && primitive >= MTLPrimitiveTypeTriangle) {
-        return NO;
-    }
-    MTLScissorRect rect = { 0, 0, width, height };
-    if (_config.scissor_enabled) {
-        rect.x = draw_min(_config.scissor.x, width);
-        rect.y = draw_min(_config.scissor.y, height);
-        rect.width = draw_min(_config.scissor.width, width - rect.x);
-        rect.height = draw_min(_config.scissor.height, height - rect.y);
-    }
-    if (!rect.width || !rect.height) {
-        return NO;
-    }
     [encoder setScissorRect:rect];
     return YES;
 }
