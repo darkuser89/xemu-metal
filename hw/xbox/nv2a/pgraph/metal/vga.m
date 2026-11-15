@@ -1,6 +1,7 @@
 /* Native VGA graphics decode; source pixels remain GPU-readable.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "vga.h"
+#import "shader-library.h"
 #include "vga-source.h"
 _Static_assert(sizeof(NV2AMetalVGAUniforms) == 1096, "VGA CPU/MSL ABI");
 static BOOL vga_error(NSError **error, NSString *message)
@@ -14,6 +15,7 @@ static BOOL vga_error(NSError **error, NSString *message)
 }
 @implementation NV2AMetalVGA {
     id<MTLDevice> _device;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
     NV2AMetalVGATargetAllocator _targetAllocator;
@@ -43,28 +45,12 @@ static BOOL vga_error(NSError **error, NSString *message)
 {
     if (_pipeline)
         return YES;
-    id<MTLDevice> device = _device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler)
+    NV2AMetalShaderLibrary *module = [NV2AMetalShaderLibrary
+        sharedWithDevice:_device source:metal_shader_source error:error];
+    if (!module)
         return NO;
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    id<MTLLibrary> lib = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!lib)
-        return NO;
-    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-    fn.library = lib;
-    fn.name = @"nv2a_vga_graphics";
-    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-    pd.computeFunctionDescriptor = fn;
     id<MTLComputePipelineState> pipeline =
-        [compiler newComputePipelineStateWithDescriptor:pd
-                                    compilerTaskOptions:nil
-                                                  error:error];
+        [module computeFunction:@"nv2a_vga_graphics" error:error];
     if (!pipeline)
         return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
@@ -72,9 +58,10 @@ static BOOL vga_error(NSError **error, NSString *message)
     ad.maxTextureBindCount = 1;
     ad.initializeBindings = YES;
     id<MTL4ArgumentTable> arguments =
-        [device newArgumentTableWithDescriptor:ad error:error];
+        [_device newArgumentTableWithDescriptor:ad error:error];
     if (!arguments)
         return NO;
+    _module = module;
     _pipeline = pipeline;
     _arguments = arguments;
     return YES;

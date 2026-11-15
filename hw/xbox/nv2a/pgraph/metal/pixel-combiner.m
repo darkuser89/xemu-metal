@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only */
 
 #import "pixel-combiner.h"
+#import "shader-library.h"
 #include "pixel-combiner-source.h"
 #include <stdint.h>
 
@@ -91,6 +92,7 @@ BOOL nv2a_metal_combiner_validate(const NV2AMetalCombinerState *state,
 
 @implementation NV2AMetalPixelCombiner {
     id<MTLDevice> _device;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
 }
@@ -109,34 +111,12 @@ BOOL nv2a_metal_combiner_validate(const NV2AMetalCombinerState *state,
         return nil;
     }
     _device = device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
+    _module = [NV2AMetalShaderLibrary sharedWithDevice:device
+                                              source:metal_shader_source
+                                               error:error];
+    if (!_module)
         return nil;
-    }
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    libraryDescriptor.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library) {
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = library;
-    function.name = @"nv2a_pixel_combiner";
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                            compilerTaskOptions:nil
-                                                          error:error];
+    _pipeline = [_module computeFunction:@"nv2a_pixel_combiner" error:error];
     if (!_pipeline) {
         return nil;
     }

@@ -1,6 +1,7 @@
 /* Native byte blits from gl/blit.c.
  * SPDX-License-Identifier: LGPL-2.0-or-later */
 #import "blit.h"
+#import "shader-library.h"
 #include "blit-types.h"
 #include "blit-source.h"
 #include <unistd.h>
@@ -82,8 +83,7 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
 }
 @implementation NV2AMetalBlit {
     id<MTLDevice> _device;
-    id<MTL4Compiler> _compiler;
-    id<MTLLibrary> _library;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _parallel, _serial, _alpha;
     id<MTL4ArgumentTable> _arguments;
 }
@@ -108,30 +108,14 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
 - (id<MTLComputePipelineState>)pipelineForFunction:(NSString *)name
                                              error:(NSError **)error
 {
-    if (!_library) {
-        id<MTL4Compiler> compiler =
-            [_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                         error:error];
-        if (!compiler)
+    if (!_module) {
+        _module = [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                                   source:metal_shader_source
+                                                    error:error];
+        if (!_module)
             return nil;
-        MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-        ld.source = @(metal_shader_source);
-        ld.options = [MTLCompileOptions new];
-        ld.options.languageVersion = MTLLanguageVersion4_0;
-        id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-        if (!library)
-            return nil;
-        _compiler = compiler;
-        _library = library;
     }
-    MTL4LibraryFunctionDescriptor *fn = [MTL4LibraryFunctionDescriptor new];
-    fn.library = _library;
-    fn.name = name;
-    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
-    pd.computeFunctionDescriptor = fn;
-    return [_compiler newComputePipelineStateWithDescriptor:pd
-                                         compilerTaskOptions:nil
-                                                       error:error];
+    return [_module computeFunction:name error:error];
 }
 - (BOOL)encodeSource:(id<MTLBuffer>)source
          destination:(id<MTLBuffer>)dest
