@@ -161,6 +161,7 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
     NSData *_decodedTokens, *_decodedInstructions;
     NSUInteger _decodedSlots;
     id<MTLBuffer> _decodedBuffer;
+    id<MTLBuffer> _reusableOutput;
 }
 - (BOOL)matchesDecodedTokens:(const uint32_t *)tokens length:(NSUInteger)length
 {
@@ -294,9 +295,15 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
     parameters.common.program_length = (unsigned)slots;
     parameters.full_access = access == NV2AMetalStateFull;
     id<MTLDevice> device = _commands.device;
-    id<MTLBuffer> output =
-        [device newBufferWithLength:sizeof(NV2AMetalStateOutput)
-                            options:MTLResourceStorageModeShared];
+    /* Each call drains the private command queue before returning its copied
+     * result. Take the previous output out of the cache until this call has
+     * completed successfully, so a failed or timed-out GPU write cannot be
+     * reused by a later state program. */
+    id<MTLBuffer> output = _reusableOutput;
+    _reusableOutput = nil;
+    if (!output)
+        output = [device newBufferWithLength:sizeof(NV2AMetalStateOutput)
+                                     options:MTLResourceStorageModeShared];
     if (!output) {
         program_error(error, @"Could not allocate Metal state-program output");
         return nil;
@@ -374,6 +381,7 @@ _Static_assert(sizeof(NV2AMetalStateOutput) == 3856, "State output transport");
                         instructions:instructions];
         else if (!_decodedBuffer)
             _decodedBuffer = [self newDecodedProgramBuffer:memo];
+        _reusableOutput = output;
     }
     return result;
 }
