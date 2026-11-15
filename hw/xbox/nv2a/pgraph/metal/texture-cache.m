@@ -441,6 +441,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 {
     if (_capture)
         return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
     NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
     if (!module)
         return NO;
@@ -492,6 +493,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 {
     if (_downsampleCapture)
         return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
     NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
     if (!module)
         return NO;
@@ -622,6 +624,7 @@ static unsigned rtt_storage(NV2AMetalCachedSurface *surface, unsigned format)
 {
     if (_downsampleChannelsCapture)
         return YES;
+    id<MTLDevice> device = _surfaces.commands.device;
     NV2AMetalShaderLibrary *module = [self shaderModuleWithError:error];
     if (!module)
         return NO;
