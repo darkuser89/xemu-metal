@@ -62,6 +62,16 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
             !c->lineSmooth && !zPerspective);
 }
 
+/* With different front/back modes, each output pass already rejects the
+ * opposite face. A pass for a face disabled by NV2A culling has no raster
+ * effects, so it need not transport any vertices or coverage carriers. */
+static BOOL skip_culled_mixed_pass(const NV2AMetalGeometryRasterConfig *c,
+                                  unsigned pass)
+{
+    return c->front != c->back &&
+           (pass ? c->cullBack : c->cullFront);
+}
+
 @interface NV2AMetalGeometryResult ()
 @property(nonatomic, readwrite, strong, nullable) id<MTLBuffer>
     polygonProjections;
@@ -816,7 +826,7 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
             geometry_error(error, @"Compact polygon mode exceeds its GPU span");
             return nil;
         }
-        hasOutput |= groups != 0;
+        hasOutput |= groups != 0 && !skip_culled_mixed_pass(c, i);
     }
     id<MTLBuffer> facing = genuine && hasOutput ?
                                [self encodePolygonFacing:vertices
@@ -831,6 +841,8 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
         return nil;
     NSMutableArray<NV2AMetalGeometryResult *> *result = [NSMutableArray new];
     for (unsigned i = 0; i < modes; i++) {
+        if (skip_culled_mixed_pass(c, i))
+            continue;
         NV2AMetalGeometryRasterConfig pass = *c;
         pass.front = pass.back = i ? c->back : c->front;
         pass.cullFront = c->cullFront || (modes == 2 && i);
@@ -1142,7 +1154,7 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
                 return nil;
             }
             outputs[i] = primitives * perPrimitive[i];
-            hasOutput |= outputs[i] != 0;
+            hasOutput |= outputs[i] != 0 && !skip_culled_mixed_pass(c, i);
         }
         id<MTLBuffer> facing = !hasOutput ?
                                    nil :
@@ -1158,6 +1170,8 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
             return nil;
         NSMutableArray *results = [NSMutableArray new];
         for (unsigned i = 0; i < modes; i++) {
+            if (skip_culled_mixed_pass(c, i))
+                continue;
             enum NV2AMetalPolygonMode mode = i ? c->back : c->front;
             BOOL fill = mode == NV2AMetalPolygonFill;
             NV2AMetalGeometryResult *result = [[NV2AMetalGeometryResult alloc]
@@ -1213,6 +1227,8 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
         }
         NSMutableArray *results = [NSMutableArray new];
         for (unsigned i = 0; i < 2; i++) {
+            if (skip_culled_mixed_pass(c, i))
+                continue;
             NV2AMetalGeometryRasterConfig pass = *c;
             pass.front = pass.back = i ? c->back : c->front;
             pass.cullFront = c->cullFront || i;
@@ -1429,6 +1445,8 @@ static BOOL direct_polygon_mode(enum NV2AMetalPolygonMode mode,
     BOOL polygon = primitive >= NV2AMetalPrimitiveTriangles;
     unsigned modes = polygon && c->front != c->back ? 2 : 1;
     for (unsigned i = 0; i < modes; i++) {
+        if (polygon && skip_culled_mixed_pass(c, i))
+            continue;
         unsigned faceMask = 0;
         enum NV2AMetalPolygonMode mode =
             polygon ? (i ? c->back : c->front) : NV2AMetalPolygonFill;
