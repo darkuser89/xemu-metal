@@ -304,29 +304,34 @@ static BOOL stream_error(NSError **error, NSString *message)
         if (segment.buffer && ![commands addResource:segment.buffer
                                                error:error])
             return nil;
-    NSMutableArray<id<MTLBuffer>> *counts =
-        _indexed ? [NSMutableArray new] : nil;
-    NSMutableData *offsets =
+    /* uploadBytes retains each buffer in the recording. Keep only its GPU
+     * address for the later encoder, instead of two temporary containers. */
+    __attribute__((objc_precise_lifetime)) NSMutableData *countAddresses =
         _indexed ? [NSMutableData
-                       dataWithLength:_segments.count * sizeof(NSUInteger)] :
+                       dataWithLength:_segments.count * sizeof(MTLGPUAddress)] :
                    nil;
-    NSUInteger *countOffsets = offsets.mutableBytes;
+    MTLGPUAddress *countAddress = countAddresses.mutableBytes;
     if (_indexed) {
+        if (!countAddress) {
+            stream_error(error, @"Cannot allocate indexed vertex counts");
+            return nil;
+        }
         if (![self prepareGatherWithCommands:commands error:error])
             return nil;
         for (NSUInteger i = 0; i < _segments.count; i++) {
             NV2AMetalVertexSegment *segment = _segments[i];
             uint32_t count = (uint32_t)segment.count;
+            NSUInteger offset = 0;
             id<MTLBuffer> constants = [commands uploadBytes:&count
                                                      length:sizeof(count)
-                                                     offset:&countOffsets[i]
+                                                     offset:&offset
                                                       error:error];
             if (!constants ||
                 (segment.indexed &&
                  (![commands addResource:segment.indexed.indices error:error] ||
                   ![commands keepAlive:segment.indexed error:error])))
                 return nil;
-            [counts addObject:constants];
+            countAddress[i] = constants.gpuAddress + offset;
         }
     }
     id<MTL4ComputeCommandEncoder> encoder =
@@ -348,8 +353,7 @@ static BOOL stream_error(NSError **error, NSString *message)
                                    segment.first * sizeof(uint32_t)
                            atIndex:1];
             [_arguments setAddress:joined.gpuAddress + destination atIndex:2];
-            [_arguments setAddress:counts[i].gpuAddress + countOffsets[i]
-                           atIndex:3];
+            [_arguments setAddress:countAddress[i] atIndex:3];
             [encoder setArgumentTable:_arguments];
             [encoder setComputePipelineState:_gather];
             [encoder dispatchThreads:MTLSizeMake(segment.count, 1, 1)
