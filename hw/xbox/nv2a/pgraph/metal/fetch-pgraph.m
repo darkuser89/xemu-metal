@@ -303,6 +303,8 @@ static BOOL fetch_bitmap_index_ranges(const uint32_t *indices, NSUInteger count,
         return NO;
     __attribute__((objc_precise_lifetime)) NSMutableData *bitmap =
         [NSMutableData dataWithLength:words * sizeof(uint64_t)];
+    if (!bitmap)
+        return NO;
     uint64_t *bits = bitmap.mutableBytes;
     for (NSUInteger i = 0; i < count; i++) {
         NSUInteger offset = (NSUInteger)indices[i] - minimum;
@@ -332,6 +334,8 @@ static NSMutableData *fetch_index_ranges(const uint32_t *indices,
                                          NSUInteger count)
 {
     NSMutableData *ranges = [NSMutableData new];
+    if (!ranges)
+        return nil;
     if (!count)
         return ranges;
     NSMutableData *ordered = nil;
@@ -340,6 +344,8 @@ static NSMutableData *fetch_index_ranges(const uint32_t *indices,
             if (fetch_bitmap_index_ranges(indices, count, ranges))
                 return ranges;
             ordered = [NSMutableData dataWithBytes:indices length:count * 4];
+            if (!ordered)
+                return nil;
             fetch_sort_indices(ordered.mutableBytes, count, 24);
             indices = ordered.bytes;
             break;
@@ -356,6 +362,25 @@ static NSMutableData *fetch_index_ranges(const uint32_t *indices,
     }
     [ranges appendBytes:&range length:sizeof(range)];
     return ranges;
+}
+/* fetch_index_ranges represents each distinct suffix index exactly once.
+ * Its cardinality therefore proves whether readonly remapping can help. */
+static BOOL fetch_ranges_are_unique(NSData *ranges, NSUInteger count)
+{
+    if (!ranges || ranges.length % sizeof(NSRange))
+        return NO;
+    const NSRange *values = ranges.bytes;
+    NSUInteger total = 0, end = 0;
+    for (NSUInteger i = 0; i < ranges.length / sizeof(*values); i++) {
+        NSRange range = values[i];
+        if (!range.length || (i && range.location < end) ||
+            range.length > count - total ||
+            range.location > NSUIntegerMax - range.length)
+            return NO;
+        total += range.length;
+        end = NSMaxRange(range);
+    }
+    return total == count;
 }
 static int fetch_range_order(const void *a, const void *b)
 {
@@ -1149,6 +1174,19 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
     }
     return unique;
 }
+- (void)rememberUniqueReadonlyIndicesForInput:(NV2AMetalPendingInput *)input
+                                       prefix:(NSUInteger)prefix
+{
+    [self clearReadonlyIndexPlan];
+    _readonlyIndexCount = input.count;
+    _readonlyIndexLength = input.indices.length;
+    _readonlyIndexPrefix = prefix;
+    _readonlyIndexInput = input;
+    _readonlyIndexData = input.indices;
+    _readonlyIndexSequence =
+        [self readonlyIndexSequenceForInput:input prefix:prefix];
+    _readonlyIndexComputed = YES;
+}
 - (BOOL)prepareRange:(NSUInteger)address
               length:(NSUInteger)length
         readPatterns:(NSMutableData *)readPatterns
@@ -1867,6 +1905,7 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
     NSUInteger readCount = 0;
     uint32_t maximum = 0, current = 0;
     __attribute__((objc_precise_lifetime)) NSData *readRanges = nil;
+    BOOL exactIndexSuffixRanges = NO;
     NSUInteger currentBatch = 0;
     NSUInteger vertices = 0;
     NSUInteger singlePrefix = 0, captureFirst = 0;
@@ -1904,6 +1943,10 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
             currentBatch = _arrayRangesCurrentBatch;
         } else {
             NSMutableData *arrayRanges = [NSMutableData new];
+            if (!arrayRanges) {
+                fetch_pgraph_error(error, @"Cannot allocate NV2A array ranges");
+                goto fail;
+            }
             BOOL currentInSuffix = NO;
             for (unsigned i = 0; i < pg->draw_arrays_length; i++) {
                 uint32_t first = key[1 + i * 3], count = key[2 + i * 3],
@@ -1931,12 +1974,21 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
              * Never cache DMA mappings, page versions or reader ownership. */
             NSUInteger payload = keyBytes + arrayRanges.length;
             if (payload <= 64 * 1024) {
-                [self makeRoomForPlanPayload:payload kind:FetchPlanArrayRanges];
-                _arrayRangesKey = [NSData dataWithBytes:key length:keyBytes];
-                _arrayRanges = [arrayRanges copy];
-                _arrayRangesMaximum = maximum;
-                _arrayRangesCurrentBatch = currentBatch;
-                readRanges = _arrayRanges;
+                NSData *keySnapshot = [NSData dataWithBytes:key
+                                                     length:keyBytes];
+                NSData *rangeSnapshot = [arrayRanges copy];
+                if (keySnapshot && rangeSnapshot) {
+                    [self makeRoomForPlanPayload:payload
+                                            kind:FetchPlanArrayRanges];
+                    _arrayRangesKey = keySnapshot;
+                    _arrayRanges = rangeSnapshot;
+                    _arrayRangesMaximum = maximum;
+                    _arrayRangesCurrentBatch = currentBatch;
+                    readRanges = rangeSnapshot;
+                } else {
+                    _arrayRangesKey = _arrayRanges = nil;
+                    readRanges = arrayRanges;
+                }
             } else {
                 _arrayRangesKey = nil;
                 _arrayRanges = nil;
@@ -1965,6 +2017,8 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
         for (unsigned i = 0; i < 16 && !needsIndexRanges; i++)
             needsIndexRanges = pg->vertex_attributes[i].count &&
                                pg->vertex_attributes[i].stride;
+        exactIndexSuffixRanges = needsIndexRanges && input &&
+                                 singlePrefix < vertices;
         if (!needsIndexRanges) {
             /* Zero-stride lanes register their one element below. Inline
              * lanes read no VRAM. Still validate/map every enabled DMA lane;
@@ -1981,21 +2035,35 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
         } else {
             readRanges = fetch_index_ranges(indexValues + firstRead,
                                             vertices - firstRead);
+            if (!readRanges) {
+                fetch_pgraph_error(error, @"Cannot allocate NV2A index ranges");
+                goto fail;
+            }
             /* Recheck DMA limits, dirty pages and dependencies on every use.
              * Keep the weak identity fast path without pinning a full index
              * snapshot. Optional suffix bytes allow equal new descriptors to
              * reuse the plan within the same combined 64KiB payload budget. */
             if (input && readRanges.length <= 64 * 1024) {
-                _indexRanges = [readRanges copy];
-                _indexRangesInput = input;
-                _indexRangesPrefix = singlePrefix;
-                _indexRangesFirstRead = firstRead;
-                _indexRangesKey = keyBytes <= 64 * 1024 - _indexRanges.length ?
-                    [NSData dataWithBytes:indexValues + firstRead
-                                   length:keyBytes] : nil;
-                NSUInteger payload = _indexRanges.length + _indexRangesKey.length;
-                [self makeRoomForPlanPayload:payload kind:FetchPlanIndexRanges];
-                readRanges = _indexRanges;
+                NSData *rangeSnapshot = [readRanges copy];
+                if (rangeSnapshot) {
+                    _indexRanges = rangeSnapshot;
+                    _indexRangesInput = input;
+                    _indexRangesPrefix = singlePrefix;
+                    _indexRangesFirstRead = firstRead;
+                    _indexRangesKey =
+                        keyBytes <= 64 * 1024 - rangeSnapshot.length ?
+                            [NSData dataWithBytes:indexValues + firstRead
+                                           length:keyBytes] : nil;
+                    NSUInteger payload =
+                        rangeSnapshot.length + _indexRangesKey.length;
+                    [self makeRoomForPlanPayload:payload
+                                            kind:FetchPlanIndexRanges];
+                    readRanges = rangeSnapshot;
+                } else {
+                    _indexRangesInput = nil;
+                    _indexRanges = nil;
+                    _indexRangesKey = nil;
+                }
             } else {
                 _indexRangesInput = nil;
                 _indexRanges = nil;
@@ -2295,11 +2363,24 @@ static unsigned fetch_merge_read_lanes(FetchReadLane *lanes, unsigned count)
         NSUInteger indexOffset = 0;
         NSData *remap = nil, *uniqueIndices = nil;
         NSUInteger fetchCurrent = vertices - captureFirst - 1;
-        if (deduplicateReadonly && input && singlePrefix < vertices)
+        if (deduplicateReadonly && input && singlePrefix < vertices) {
+            BOOL knownPlan = _readonlyIndexComputed &&
+                ((_readonlyIndexInput == input &&
+                  _readonlyIndexData == input.indices &&
+                  _readonlyIndexCount == input.count &&
+                  _readonlyIndexLength == input.indices.length &&
+                  _readonlyIndexPrefix == singlePrefix) ||
+                 [self canReuseReadonlyIndexPlanForInput:input
+                                                prefix:singlePrefix]);
+            if (!knownPlan && exactIndexSuffixRanges &&
+                fetch_ranges_are_unique(readRanges, vertices - singlePrefix))
+                [self rememberUniqueReadonlyIndicesForInput:input
+                                                     prefix:singlePrefix];
             uniqueIndices = [self readonlyIndicesForInput:input
                                                    prefix:singlePrefix
                                                     remap:&remap
                                                   current:&fetchCurrent];
+        }
         NSUInteger fetchCount = uniqueIndices ? uniqueIndices.length / 4 :
                                                vertices - captureFirst;
         NSUInteger fetchPrefix = uniqueIndices ? 0 : singlePrefix - captureFirst;
