@@ -355,6 +355,16 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
                 return NO;
         return YES;
     }
+    /* An excluded rectangle covering every pixel center also leaves no
+     * samples, regardless of the other seven regions. Metal's fragment
+     * window test uses these same scaled, half-open coordinates. */
+    for (unsigned i = 0; i < 8; i++) {
+        const int *region = uniforms->clip_regions[i];
+        if (region[0] <= 0 && region[1] <= 0 && region[2] >= 0 &&
+            region[3] >= 0 && (NSUInteger)region[2] >= width &&
+            (NSUInteger)region[3] >= height)
+            return YES;
+    }
     return NO;
 }
 - (instancetype)initWithState:(NV2AState *)d
