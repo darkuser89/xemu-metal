@@ -32,11 +32,16 @@ kernel void nv2a_blit_parallel(device const uchar *source [[buffer(0)]],
         uint s = u.source_offset + p.y * u.source_pitch + x;
         uint d = u.destination_offset + p.y * u.destination_pitch + x;
         destination[d] = blended(source[s], destination[d], u.beta);
+        if (u.patch_alpha && p.x % 3 == 2)
+            destination[d + 1] = uchar(u.alpha_value);
     } else {
         if (x >= n)
             return;
-        destination[u.destination_offset + p.y * u.destination_pitch + x] =
-            source[u.source_offset + p.y * u.source_pitch + x];
+        uint s = u.source_offset + p.y * u.source_pitch + x;
+        uint d = u.destination_offset + p.y * u.destination_pitch + x;
+        uchar value = source[s];
+        destination[d] = u.patch_alpha && (x & 3u) == 3u ?
+                             uchar(u.alpha_value) : value;
     }
 }
 kernel void nv2a_blit_serial(device volatile uchar *source [[buffer(0)]],

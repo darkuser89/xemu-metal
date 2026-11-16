@@ -206,7 +206,9 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
     }
     unsigned rowBytes = MAX(c->rows ? c->row_bytes : 0, c->tail_bytes);
     BOOL patchAlpha = l.patch_alpha && rowBytes >= 4;
-    if (patchAlpha && !_alpha) {
+    /* Nonoverlapping parallel rows patch their own alpha bytes in the main
+     * dispatch. Aliased serial rows retain the final ordered alpha pass. */
+    if (patchAlpha && serial && !_alpha) {
         _alpha = [self pipelineForFunction:@"nv2a_blit_alpha" error:error];
         if (!_alpha)
             return NO;
@@ -263,7 +265,7 @@ BOOL nv2a_metal_blit_layout(const NV2AMetalBlitConfig *c,
             threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1,
                                               1)];
     }
-    if (patchAlpha) {
+    if (patchAlpha && serial) {
         [e barrierAfterEncoderStages:MTLStageDispatch
                  beforeEncoderStages:MTLStageDispatch
                    visibilityOptions:MTL4VisibilityOptionDevice];
