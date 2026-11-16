@@ -949,8 +949,6 @@ bool pgraph_metal4_validate_pending_capture(const uint8_t *bytes, size_t size)
         goto fail;
     /* GL clears compressed_attrs and rebinds both shaders before drawing
      * immediate Float4 buffers. The fetch decoder has already cleared it. */
-    for (NSUInteger i = 0; i < inputs.count; i++)
-        suffix |= inputs[i].count > plan.prefixCounts[i].unsignedIntegerValue;
     vertex = _active && (!suffix || (!rebind && !_vertexCaptureDirty)) ?
                  _vertexState :
                  [[NV2AMetalPGRAPHVertexState alloc]

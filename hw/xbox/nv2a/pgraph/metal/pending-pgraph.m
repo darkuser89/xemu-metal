@@ -69,9 +69,15 @@ static NSArray *reuse_inline_input(NSArray *previous, NV2AMetalInputKind kind,
                     count = pg->draw_arrays_count[i];
             if (first < 0 || count <= 0)
                 return input_error(error, @"Invalid pending DrawArrays range");
+            NV2AMetalPendingInput *old =
+                i < previous.count ? previous[i] : nil;
             NV2AMetalPendingInput *input =
-                [NV2AMetalPendingInput arraysFrom:(NSUInteger)first
-                                            count:(NSUInteger)count];
+                [old isKindOfClass:NV2AMetalPendingInput.class] &&
+                old.kind == NV2AMetalInputArrays &&
+                old.first == (NSUInteger)first &&
+                old.count == (NSUInteger)count ?
+                    old : [NV2AMetalPendingInput arraysFrom:(NSUInteger)first
+                                                     count:(NSUInteger)count];
             if (!input)
                 return input_error(error, @"Pending DrawArrays range overflow");
             [inputs addObject:input];

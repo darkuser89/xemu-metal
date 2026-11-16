@@ -240,13 +240,6 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
     _device = device;
     _config = *c;
     unsigned int control0 = c->control[0], control1 = c->control[1];
-    if ((c->setup_raster & NV_PGRAPH_SETUPRASTER_FRONTFACEMODE) >
-            NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE ||
-        ((c->setup_raster & NV_PGRAPH_SETUPRASTER_BACKFACEMODE) >> 2) >
-            NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE) {
-        draw_error(error, @"Invalid polygon mode");
-        return nil;
-    }
     _writeMask = MTLColorWriteMaskNone;
     if (control0 & NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE) {
         _writeMask |= MTLColorWriteMaskRed;
@@ -270,12 +263,6 @@ static uint64_t depth_stencil_key(const NV2AMetalDrawConfig *c)
     _sourceFactor = (c->blend & NV_PGRAPH_BLEND_SFACTOR) >> 4;
     _destinationFactor = (c->blend & NV_PGRAPH_BLEND_DFACTOR) >> 8;
     _equation = c->blend & NV_PGRAPH_BLEND_EQN;
-    if (_blendEnabled &&
-        (_sourceFactor == 11 || _destinationFactor == 11 ||
-         _equation >= sizeof(operations) / sizeof(*operations))) {
-        draw_error(error, @"Invalid NV2A blend factors/equation");
-        return nil;
-    }
     /* Min/max ignore factors; disabled blending ignores all blend words. */
     unsigned int effective = 0;
     if (_blendEnabled) {

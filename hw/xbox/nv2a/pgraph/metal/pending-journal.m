@@ -568,19 +568,19 @@ static BOOL same_prefix(NV2AMetalPendingInput *old, NV2AMetalPendingInput *next)
         NSUInteger required =
             plan.inputs[i].count - plan.prefixCounts[i].unsignedIntegerValue;
         id value = suffixes[i];
-        NSMutableArray *segments = [plan.previous[i] mutableCopy];
+        NSArray *segments = plan.previous[i];
         if (required) {
             if (![value isKindOfClass:NV2AMetalPendingSpan.class] ||
                 ((NV2AMetalPendingSpan *)value).count != required) {
                 journal_error(error, @"Transformed suffix count mismatch");
                 return nil;
             }
-            [segments addObject:value];
+            segments = [segments arrayByAddingObject:value];
         } else if (value != NSNull.null) {
             journal_error(error, @"Unexpected repeated vertex transformation");
             return nil;
         }
-        [streams addObject:[segments copy]];
+        [streams addObject:segments];
     }
     NSRange range = NSMakeRange(0, completed);
     NV2AMetalPendingUpdate *update = [[NV2AMetalPendingUpdate alloc]
