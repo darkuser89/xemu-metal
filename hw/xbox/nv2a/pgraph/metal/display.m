@@ -68,11 +68,13 @@ static BOOL display_error(NSError **error, NSString *message)
     if (_pipeline)
         return YES;
     id<MTLRenderPipelineState> pipeline;
-    /* PNG captures create a new display for each image. Retain only the
-     * current device's immutable library and two supported target pipelines;
-     * each display still owns its mutable argument table. */
+    id<MTLSamplerState> nearest, linear;
+    /* PNG captures create a new display for each image. Reuse the current
+     * device's immutable library, pipelines and samplers; each display still
+     * owns its mutable argument table. */
     static NV2AMetalShaderLibrary *cachedModule;
     static id<MTLRenderPipelineState> cachedBGRA, cachedRGBA;
+    static id<MTLSamplerState> cachedNearest, cachedLinear;
     @synchronized(NV2AMetalDisplay.class) {
         BOOL sameDevice = cachedModule.library.device == _device;
         pipeline = sameDevice ? (_pixelFormat == MTLPixelFormatBGRA8Unorm ?
@@ -113,6 +115,8 @@ static BOOL display_error(NSError **error, NSString *message)
             if (!sameDevice) {
                 cachedBGRA = nil;
                 cachedRGBA = nil;
+                cachedNearest = nil;
+                cachedLinear = nil;
                 cachedModule = module;
             }
             if (_pixelFormat == MTLPixelFormatBGRA8Unorm)
@@ -120,18 +124,29 @@ static BOOL display_error(NSError **error, NSString *message)
             else
                 cachedRGBA = pipeline;
         }
+        if (!cachedNearest || !cachedLinear) {
+            MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
+            sampler.supportArgumentBuffers = YES;
+            sampler.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            sampler.minFilter = MTLSamplerMinMagFilterNearest;
+            sampler.magFilter = MTLSamplerMinMagFilterNearest;
+            id<MTLSamplerState> newNearest =
+                [_device newSamplerStateWithDescriptor:sampler];
+            sampler.minFilter = MTLSamplerMinMagFilterLinear;
+            sampler.magFilter = MTLSamplerMinMagFilterLinear;
+            id<MTLSamplerState> newLinear =
+                [_device newSamplerStateWithDescriptor:sampler];
+            if (!newNearest || !newLinear)
+                return display_error(error,
+                                     @"Could not allocate Metal display samplers");
+            cachedNearest = newNearest;
+            cachedLinear = newLinear;
+        }
+        nearest = cachedNearest;
+        linear = cachedLinear;
     }
 
-    MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
-    sampler.supportArgumentBuffers = YES;
-    sampler.sAddressMode = MTLSamplerAddressModeClampToEdge;
-    sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    sampler.minFilter = MTLSamplerMinMagFilterNearest;
-    sampler.magFilter = MTLSamplerMinMagFilterNearest;
-    id<MTLSamplerState> nearest = [_device newSamplerStateWithDescriptor:sampler];
-    sampler.minFilter = MTLSamplerMinMagFilterLinear;
-    sampler.magFilter = MTLSamplerMinMagFilterLinear;
-    id<MTLSamplerState> linear = [_device newSamplerStateWithDescriptor:sampler];
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 1;
     arguments.maxTextureBindCount = 1;
@@ -139,7 +154,7 @@ static BOOL display_error(NSError **error, NSString *message)
     arguments.initializeBindings = YES;
     id<MTL4ArgumentTable> table =
         [_device newArgumentTableWithDescriptor:arguments error:error];
-    if (!nearest || !linear || !table)
+    if (!table)
         return display_error(error, @"Could not allocate Metal display bindings");
     _nearest = nearest;
     _linear = linear;
