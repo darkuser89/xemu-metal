@@ -492,27 +492,33 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
 - (BOOL)processWithError:(NSError **)error
 {
     BOOL collected = NO;
-    while (_reports.count) {
-        NV2AMetalPGRAPHReport *report = _reports[0];
+    BOOL success = YES;
+    NSUInteger completed = 0;
+    while (completed < _reports.count) {
+        NV2AMetalPGRAPHReport *report = _reports[completed];
         if (report.clear) {
             _result = 0;
-            [_reports removeObjectAtIndex:0];
+            completed++;
             continue;
         }
         for (NV2AMetalPGRAPHQuery *query in report.queries) {
             if (query.open) {
-                return YES;
+                goto done;
             }
         }
         /* The report owns the frozen query prefix. Later surface submissions
          * only matter if they overlap the CPU destination checked below. */
         if (!collected) {
-            if (![_cache collectCompletedWithError:error])
-                return NO;
+            if (![_cache collectCompletedWithError:error]) {
+                success = NO;
+                goto done;
+            }
             collected = YES;
         }
-        if (![self waitForQueries:report.queries error:error])
-            return NO;
+        if (![self waitForQueries:report.queries error:error]) {
+            success = NO;
+            goto done;
+        }
         DMAObject dma = nv_dma_load(_d, _d->pgraph.dma_report);
         NSUInteger base = dma.address & 0x07ffffff;
         NSUInteger offset = GET_MASK(report.parameter, NV097_GET_REPORT_OFFSET);
@@ -520,8 +526,9 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
             15 > dma.limit - offset || base > _cache.vram.length ||
             offset > _cache.vram.length - base ||
             16 > _cache.vram.length - base - offset) {
-            return report_error(error,
-                                @"NV2A report exceeds DMA or VRAM bounds");
+            success = report_error(error,
+                                   @"NV2A report exceeds DMA or VRAM bounds");
+            goto done;
         }
         NSUInteger destination = base + offset;
         /* Report destinations may alias a dirty render target. Preserve its
@@ -536,19 +543,23 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
                                                    length:16
                                                     write:YES
                                                     error:error])) {
-            return NO;
+            success = NO;
+            goto done;
         }
         unsigned scale = _d->pgraph.surface_scale_factor;
         if (!scale || scale > 16384) {
-            return report_error(error, @"Invalid report surface scale");
+            success = report_error(error, @"Invalid report surface scale");
+            goto done;
         }
         uint32_t result = _result;
         uint32_t divisor = scale * scale;
         for (NV2AMetalPGRAPHQuery *query in report.queries) {
             uint64_t total, previous;
             if (![self readCountsForQuery:query total:&total previous:&previous
-                                     error:error])
-                return NO;
+                                     error:error]) {
+                success = NO;
+                goto done;
+            }
             /* Preserve the existing GLuint-wrap and per-Begin scale policy.
              * Rounding each report's delta would lose fractional samples. */
             result += (uint32_t)total / divisor - (uint32_t)previous / divisor;
@@ -567,9 +578,14 @@ static NV2AMetalPGRAPHQuery *frozen_prefix(NV2AMetalPGRAPHQuery *query)
                                        DIRTY_MEMORY_VGA);
         memory_region_set_client_dirty(_d->vram, destination, 16,
                                        DIRTY_MEMORY_NV2A_TEX);
-        [_reports removeObjectAtIndex:0];
+        completed++;
     }
-    return YES;
+done:
+    /* Preserve the first failed/unready entry for retry, while retiring the
+     * processed FIFO prefix with one array shift. */
+    if (completed)
+        [_reports removeObjectsInRange:NSMakeRange(0, completed)];
+    return success;
 }
 
 static void append32(NSMutableData *data, uint32_t value)
