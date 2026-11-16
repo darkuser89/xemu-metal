@@ -7,6 +7,7 @@
  */
 #import "clear.h"
 #import "lru-cache.h"
+#import "shader-library.h"
 #include "clear-source.h"
 #include <math.h>
 #include "color-format.h"
@@ -92,8 +93,7 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
 
 @implementation NV2AMetalClear {
     id<MTLDevice> _device;
-    id<MTL4Compiler> _compiler;
-    id<MTLLibrary> _library;
+    NV2AMetalShaderLibrary *_module;
     id<MTL4ArgumentTable> _arguments;
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_bases;
     NV2AMetalLRUCache<NSNumber *, id<MTLRenderPipelineState>> *_pipelines;
@@ -119,20 +119,13 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
 
 - (BOOL)prepareShaderWithError:(NSError **)error
 {
-    if (_compiler)
+    if (_module)
         return YES;
-    id<MTL4Compiler> compiler =
-        [_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                     error:error];
-    if (!compiler)
-        return NO;
-    MTL4LibraryDescriptor *ld = [MTL4LibraryDescriptor new];
-    ld.source = @(metal_shader_source);
-    ld.options = [MTLCompileOptions new];
-    ld.options.languageVersion = MTLLanguageVersion4_0;
-    ld.options.mathMode = MTLMathModeSafe;
-    id<MTLLibrary> library = [compiler newLibraryWithDescriptor:ld error:error];
-    if (!library)
+    NV2AMetalShaderLibrary *module =
+        [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                         source:metal_shader_source
+                                          error:error];
+    if (!module)
         return NO;
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
     ad.maxBufferBindCount = 1;
@@ -165,8 +158,7 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
         for (unsigned s = 0; s < 2; s++)
             _states[z][s] = states[z][s];
     _arguments = arguments;
-    _library = library;
-    _compiler = compiler;
+    _module = module;
     return YES;
 }
 
@@ -186,10 +178,10 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
     id<MTLRenderPipelineState> base = _bases[base_key];
     if (!base) {
         MTL4LibraryFunctionDescriptor *v = [MTL4LibraryFunctionDescriptor new];
-        v.library = _library;
+        v.library = _module.library;
         v.name = @"nv2a_clear_vertex";
         MTL4LibraryFunctionDescriptor *f = [MTL4LibraryFunctionDescriptor new];
-        f.library = _library;
+        f.library = _module.library;
         f.name = format == MTLPixelFormatInvalid ? @"nv2a_clear_depth" :
                                                    @"nv2a_clear_color";
         MTL4RenderPipelineDescriptor *pd = [MTL4RenderPipelineDescriptor new];
@@ -200,9 +192,11 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
         pd.colorAttachments[0].pixelFormat = format;
         pd.colorAttachments[0].writeMask = MTLColorWriteMaskUnspecialized;
         pd.colorAttachments[0].blendingState = MTL4BlendStateDisabled;
-        base = [_compiler newRenderPipelineStateWithDescriptor:pd
-                                           compilerTaskOptions:nil
-                                                         error:error];
+        @synchronized(_module.compiler) {
+            base = [_module.compiler newRenderPipelineStateWithDescriptor:pd
+                                                      compilerTaskOptions:nil
+                                                                    error:error];
+        }
         if (!base) {
             return nil;
         }
@@ -214,10 +208,12 @@ BOOL nv2a_metal_clear_uses_load_actions(id<MTLTexture> color,
     pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     pd.colorAttachments[0].pixelFormat = format;
     pd.colorAttachments[0].writeMask = mask;
-    pipeline =
-        [_compiler newRenderPipelineStateBySpecializationWithDescriptor:pd
-                                                               pipeline:base
-                                                                  error:error];
+    @synchronized(_module.compiler) {
+        pipeline = [_module.compiler
+            newRenderPipelineStateBySpecializationWithDescriptor:pd
+                                                       pipeline:base
+                                                          error:error];
+    }
     if (pipeline) {
         _pipelines[key] = pipeline;
     }

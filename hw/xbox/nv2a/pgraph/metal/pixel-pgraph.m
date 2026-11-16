@@ -469,7 +469,8 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
                                              device:(id<MTLDevice>)device
                                               error:(NSError **)error
 {
-    NV2AMetalDrawConfig config = _raster.config;
+    NV2AMetalDrawConfig previous = _raster.config;
+    NV2AMetalDrawConfig config = previous;
     if (parameter & NV097_CLEAR_SURFACE_COLOR) {
         config.control[0] &= ~(NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE |
                                NV_PGRAPH_CONTROL_0_GREEN_WRITE_ENABLE |
@@ -492,6 +493,9 @@ static BOOL same_raster_config(const NV2AMetalDrawConfig *a,
     config.control[0] |= pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                          NV_PGRAPH_CONTROL_0_DITHERENABLE;
     config.scissor_enabled = NO;
+    if (_raster.device == device &&
+        same_raster_config(&config, &previous))
+        return self;
     return [[NV2AMetalPGRAPHPixelState alloc] initWithCapture:self
                                                        config:&config
                                                        device:device
