@@ -2,6 +2,7 @@
 
 #import "vertex-fixed.h"
 #import "lru-cache.h"
+#import "shader-library.h"
 #include "geometry-types.h"
 #include "vertex-fixed-source.h"
 #include <math.h>
@@ -138,8 +139,8 @@ typedef struct NV2AMetalFixedParameterSlot {
 
 @implementation NV2AMetalVertexFixed {
     id<MTLDevice> _device;
-    id<MTL4Compiler> _compiler;
-    id<MTLLibrary> _library;
+    NV2AMetalShaderLibrary *_module;
+    id<MTL4Compiler> _specializationCompiler;
     dispatch_queue_t _specializationQueue;
     NV2AMetalLRUCache<NSData *, NV2AMetalFixedVariant *> *_variants;
     NV2AMetalFixedVariant *_variant;
@@ -183,36 +184,22 @@ typedef struct NV2AMetalFixedParameterSlot {
 
 - (BOOL)prepareLibraryWithError:(NSError **)error
 {
-    if (_library)
+    if (_module)
         return YES;
-    id<MTL4Compiler> compiler =
-        [_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                     error:error];
-    if (!compiler)
-        return NO;
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    libraryDescriptor.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library)
-        return NO;
-    _compiler = compiler;
-    _library = library;
-    return YES;
+    _module = [NV2AMetalShaderLibrary sharedWithDevice:_device
+                                               source:metal_shader_source
+                                                error:error];
+    return _module != nil;
 }
 
 - (id<MTLComputePipelineState>)compilePipelineCompact:(BOOL)compact
                                            constants:(MTLFunctionConstantValues *)values
+                                            compiler:(id<MTL4Compiler>)compiler
                                                error:(NSError **)error
 {
     MTL4LibraryFunctionDescriptor *function =
         [MTL4LibraryFunctionDescriptor new];
-    function.library = _library;
+    function.library = _module.library;
     function.name = compact ? @"nv2a_vertex_fixed_raster" : @"nv2a_vertex_fixed";
     MTL4SpecializedFunctionDescriptor *specialized =
         [MTL4SpecializedFunctionDescriptor new];
@@ -221,9 +208,12 @@ typedef struct NV2AMetalFixedParameterSlot {
     MTL4ComputePipelineDescriptor *descriptor =
         [MTL4ComputePipelineDescriptor new];
     descriptor.computeFunctionDescriptor = specialized;
-    return [_compiler newComputePipelineStateWithDescriptor:descriptor
-                                        compilerTaskOptions:nil
-                                                      error:error];
+    @synchronized(compiler) {
+        return [compiler
+            newComputePipelineStateWithDescriptor:descriptor
+                              compilerTaskOptions:nil
+                                            error:error];
+    }
 }
 
 - (id<MTLComputePipelineState>)generalPipelineCompact:(BOOL)compact
@@ -234,6 +224,7 @@ typedef struct NV2AMetalFixedParameterSlot {
         return pipeline;
     pipeline = [self compilePipelineCompact:compact
                                   constants:[MTLFunctionConstantValues new]
+                                   compiler:_module.compiler
                                       error:error];
     if (compact)
         _rasterPipeline = pipeline;
@@ -246,16 +237,25 @@ typedef struct NV2AMetalFixedParameterSlot {
 - (NSArray<id<MTLComputePipelineState>> *)compileVariant:(NSData *)key
                                                  error:(NSError **)error
 {
+    if (!_specializationCompiler) {
+        _specializationCompiler = [_device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                error:error];
+        if (!_specializationCompiler)
+            return nil;
+    }
     const uint32_t *words = key.bytes;
     MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
     for (unsigned i = 0; i < NV2A_METAL_FIXED_CONSTANT_COUNT; i++)
         [values setConstantValue:words+i type:MTLDataTypeUInt atIndex:i];
     id<MTLComputePipelineState> full =
-        [self compilePipelineCompact:NO constants:values error:error];
+        [self compilePipelineCompact:NO constants:values
+                            compiler:_specializationCompiler error:error];
     if (!full)
         return nil;
     id<MTLComputePipelineState> compact =
-        [self compilePipelineCompact:YES constants:values error:error];
+        [self compilePipelineCompact:YES constants:values
+                            compiler:_specializationCompiler error:error];
     return compact ? @[full, compact] : nil;
 }
 - (id<MTLComputePipelineState>)pipelineForUniforms:
@@ -417,6 +417,40 @@ typedef struct NV2AMetalFixedParameterSlot {
             commands:(NV2AMetalCommands *)commands
                error:(NSError **)error
 {
+    return [self encodeAttributes:attributes first:first count:count
+                         uniforms:uniforms rasterize:rasterize
+                  compactRegisters:compact validatedUniforms:NO
+                          commands:commands error:error];
+}
+/* The epoch executor has already validated this exact local uniform copy
+ * before dispatching the fixed encoder. Other callers retain the
+ * full public validation path above. */
+- (nullable NV2AMetalFixedResult *)
+    encodeValidatedAttributes:(id<MTLBuffer>)attributes
+                        first:(NSUInteger)first
+                        count:(NSUInteger)count
+                     uniforms:(const NV2AMetalFixedUniforms *)uniforms
+                    rasterize:(BOOL)rasterize
+             compactRegisters:(BOOL)compact
+                     commands:(NV2AMetalCommands *)commands
+                        error:(NSError **)error
+{
+    return [self encodeAttributes:attributes first:first count:count
+                         uniforms:uniforms rasterize:rasterize
+                  compactRegisters:compact validatedUniforms:YES
+                          commands:commands error:error];
+}
+- (nullable NV2AMetalFixedResult *)
+    encodeAttributes:(id<MTLBuffer>)attributes
+               first:(NSUInteger)first
+               count:(NSUInteger)count
+            uniforms:(const NV2AMetalFixedUniforms *)uniforms
+           rasterize:(BOOL)rasterize
+    compactRegisters:(BOOL)compact
+   validatedUniforms:(BOOL)validated
+            commands:(NV2AMetalCommands *)commands
+               error:(NSError **)error
+{
     if ((compact != YES && compact != NO) ||
         (rasterize != YES && rasterize != NO) || !commands.commandBuffer ||
         commands.device != _device || attributes.device != _device ||
@@ -425,8 +459,9 @@ typedef struct NV2AMetalFixedParameterSlot {
         count > attributes.length / sizeof(NV2AMetalProgramInput) - first ||
         count > _device.maxBufferLength / sizeof(NV2AMetalVertex) ||
         count > _device.maxBufferLength / sizeof(NV2AMetalProgramOutput) ||
-        !(rasterize ? nv2a_metal_fixed_validate(uniforms, error) :
-                      nv2a_metal_fixed_validate_context(uniforms, error))) {
+        (!validated &&
+         !(rasterize ? nv2a_metal_fixed_validate(uniforms, error) :
+                       nv2a_metal_fixed_validate_context(uniforms, error)))) {
         fixed_error(error, @"Invalid Metal fixed-function input or recording");
         return nil;
     }

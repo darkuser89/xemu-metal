@@ -1,6 +1,7 @@
 #import "vertex-writable.h"
 #import "vertex-fetch.h"
 #import "lru-cache.h"
+#import "shader-library.h"
 #include <limits.h>
 #include <math.h>
 #include <stddef.h>
@@ -2046,6 +2047,7 @@ typedef struct NV2AMetalWritableParameterSlot {
 
 @implementation NV2AMetalWritableProgram {
     NV2AMetalCommands *_commands;
+    NV2AMetalShaderLibrary *_interpreterModule;
     id<MTL4Compiler> _specializationCompiler;
     dispatch_queue_t _specializationQueue;
     id<MTLComputePipelineState> _pipeline, _readonlyPipeline, _rasterPipeline,
@@ -2055,7 +2057,6 @@ typedef struct NV2AMetalWritableParameterSlot {
         _independentRasterPipeline, _independentRawPipeline;
     id<MTLComputePipelineState> _independentChainedPipeline,
         _independentChainedRasterPipeline, _independentChainedRawPipeline;
-    id<MTLLibrary> _interpreterLibrary;
     id<MTL4ArgumentTable> _arguments;
     NV2AMetalDecodedProgram *_decodedProgram;
     NV2AMetalProgramKey *_programLookupKey;
@@ -2190,38 +2191,16 @@ typedef struct NV2AMetalWritableParameterSlot {
     }
     if (*slot)
         return *slot;
-    if (!_interpreterLibrary) {
-        id<MTLDevice> device = _commands.device;
-        id<MTL4Compiler> compiler =
-            [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                        error:error];
-        if (!compiler)
+    if (!_interpreterModule) {
+        NV2AMetalShaderLibrary *module =
+            [NV2AMetalShaderLibrary sharedWithDevice:_commands.device
+                                             source:metal_shader_source
+                                              error:error];
+        if (!module)
             return nil;
-        MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-        libraryDescriptor.source = @(metal_shader_source);
-        libraryDescriptor.options = [MTLCompileOptions new];
-        libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-        libraryDescriptor.options.mathMode = MTLMathModeSafe;
-        libraryDescriptor.options.mathFloatingPointFunctions =
-            MTLMathFloatingPointFunctionsPrecise;
-        id<MTLLibrary> library =
-            [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-        if (!library)
-            return nil;
-        _interpreterLibrary = library;
-        _specializationCompiler = compiler;
+        _interpreterModule = module;
     }
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = _interpreterLibrary;
-    function.name = functionName;
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    *slot = [_specializationCompiler
-        newComputePipelineStateWithDescriptor:descriptor
-                          compilerTaskOptions:nil
-                                        error:error];
+    *slot = [_interpreterModule computeFunction:functionName error:error];
     return *slot;
 }
 /* Only decoded CPU-uploaded instructions become source constants. Input
@@ -2230,6 +2209,15 @@ typedef struct NV2AMetalWritableParameterSlot {
     compileReadonlyProgram:(NV2AMetalDecodedProgram *)program
                      error:(NSError **)error
 {
+    /* Long generated programs compile on the background queue. Keep their
+     * compiler separate from synchronous shared-module requests. */
+    if (!_specializationCompiler) {
+        _specializationCompiler = [_commands.device
+            newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                error:error];
+        if (!_specializationCompiler)
+            return nil;
+    }
     NSMutableString *source =
         [NSMutableString stringWithUTF8String:metal_shader_source];
     [source appendString:@"\nconstant NV2AMetalProgramInstruction "

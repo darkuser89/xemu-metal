@@ -11,6 +11,7 @@
  */
 
 #import "vertex-program.h"
+#import "shader-library.h"
 #include "geometry-types.h"
 #include "vertex-program-source.h"
 #include <math.h>
@@ -182,6 +183,7 @@ BOOL nv2a_metal_program_validate(const uint32_t *tokens, NSUInteger length,
 
 @implementation NV2AMetalVertexProgram {
     id<MTLDevice> _device;
+    NV2AMetalShaderLibrary *_module;
     id<MTLComputePipelineState> _pipeline;
     id<MTL4ArgumentTable> _arguments;
 }
@@ -200,34 +202,13 @@ BOOL nv2a_metal_program_validate(const uint32_t *tokens, NSUInteger length,
         return nil;
     }
     _device = device;
-    id<MTL4Compiler> compiler =
-        [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
-                                    error:error];
-    if (!compiler) {
+    _module = [NV2AMetalShaderLibrary sharedWithDevice:device
+                                               source:metal_shader_source
+                                                error:error];
+    if (!_module) {
         return nil;
     }
-    MTL4LibraryDescriptor *libraryDescriptor = [MTL4LibraryDescriptor new];
-    libraryDescriptor.source = @(metal_shader_source);
-    libraryDescriptor.options = [MTLCompileOptions new];
-    libraryDescriptor.options.languageVersion = MTLLanguageVersion4_0;
-    libraryDescriptor.options.mathMode = MTLMathModeSafe;
-    libraryDescriptor.options.mathFloatingPointFunctions =
-        MTLMathFloatingPointFunctionsPrecise;
-    id<MTLLibrary> library =
-        [compiler newLibraryWithDescriptor:libraryDescriptor error:error];
-    if (!library) {
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *function =
-        [MTL4LibraryFunctionDescriptor new];
-    function.library = library;
-    function.name = @"nv2a_vertex_program";
-    MTL4ComputePipelineDescriptor *descriptor =
-        [MTL4ComputePipelineDescriptor new];
-    descriptor.computeFunctionDescriptor = function;
-    _pipeline = [compiler newComputePipelineStateWithDescriptor:descriptor
-                                            compilerTaskOptions:nil
-                                                          error:error];
+    _pipeline = [_module computeFunction:@"nv2a_vertex_program" error:error];
     if (!_pipeline) {
         return nil;
     }
