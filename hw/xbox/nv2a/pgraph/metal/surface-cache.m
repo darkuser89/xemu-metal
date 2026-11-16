@@ -3772,12 +3772,13 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
 - (BOOL)prepareValidatedGPUReadPatterns:
             (const NV2AMetalVRAMReadPattern *)patterns
                                    count:(NSUInteger)count
+                                  bounds:(NSRange)bounds
                                downloads:(NSArray<NV2AMetalCachedSurface *> *)selected
                                    error:(NSError **)error
 {
-    /* A cache-hit binding requests a zero-length pattern solely to open its
-     * command section. No GPU command in that section reads guest VRAM. */
-    BOOL empty = !count || (count == 1 && !patterns[0].length);
+    /* Validation leaves bounds empty only when every pattern has zero length.
+     * Such bindings open a command section without reading guest VRAM. */
+    BOOL empty = !bounds.length;
     if (![self download:selected error:error] || ![self begin:error] ||
         (!empty && ![_commands addResource:_vram error:error]))
         return NO;
@@ -3842,7 +3843,8 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
         [self findDirtySurfacesForReadPatterns:patterns count:count
                                        bounds:bounds selected:&selected];
         return [self prepareValidatedGPUReadPatterns:patterns count:count
-                                            downloads:selected error:error];
+                                             bounds:bounds downloads:selected
+                                              error:error];
     }
 }
 
@@ -3964,6 +3966,7 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
             _rasterProducers = YES;
             return [self prepareValidatedGPUReadPatterns:patterns
                                                    count:count
+                                                  bounds:bounds
                                                downloads:nil
                                                    error:error];
         } @finally {
@@ -4105,6 +4108,7 @@ static NSData *snapshot_read_patterns(const NV2AMetalVRAMReadPattern *patterns,
         if (writer || dirty)
             return !allowSurfaceFallback ||
                    [self prepareValidatedGPUReadPatterns:spans count:count
+                                                  bounds:bounds
                                                downloads:selected error:error];
         if (![commands beginWithError:error])
             return NO;

@@ -532,7 +532,9 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
     } else {
         _zeta = nil;
     }
-    return selectOnly ||
+    /* Reprepare only when the second attachment may have submitted or
+     * replaced the first attachment's recording. */
+    return selectOnly || !_color || !_zeta ||
            [self prepareCurrentAttachments:error forRendering:forRendering];
 }
 
@@ -651,7 +653,8 @@ BOOL nv2a_metal_surface_bindings_decode(NSData *data,
         return pgraph_surface_error(error, @"Overlapping bound attachments");
     _color = prepared[0];
     _zeta = prepared[1];
-    return selectOnly ||
+    /* A single prepared attachment already belongs to the final recording. */
+    return selectOnly || !_color || !_zeta ||
            [self prepareCurrentAttachments:error forRendering:forRendering];
 }
 - (BOOL)releaseColor:(BOOL)color zeta:(BOOL)zeta error:(NSError **)error
