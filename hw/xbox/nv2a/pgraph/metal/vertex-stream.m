@@ -320,6 +320,8 @@ static BOOL stream_error(NSError **error, NSString *message)
             return nil;
         for (NSUInteger i = 0; i < _segments.count; i++) {
             NV2AMetalVertexSegment *segment = _segments[i];
+            if (!segment.indexed)
+                continue;
             uint32_t count = (uint32_t)segment.count;
             NSUInteger offset = 0;
             id<MTLBuffer> constants = [commands uploadBytes:&count
@@ -327,9 +329,8 @@ static BOOL stream_error(NSError **error, NSString *message)
                                                      offset:&offset
                                                       error:error];
             if (!constants ||
-                (segment.indexed &&
-                 (![commands addResource:segment.indexed.indices error:error] ||
-                  ![commands keepAlive:segment.indexed error:error])))
+                ![commands addResource:segment.indexed.indices error:error] ||
+                ![commands keepAlive:segment.indexed error:error])
                 return nil;
             countAddress[i] = constants.gpuAddress + offset;
         }

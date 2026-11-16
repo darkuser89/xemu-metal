@@ -2,6 +2,19 @@
  * GPL-3.0-only */
 #import "vertex-epoch.h"
 #include <limits.h>
+/* Only epoch capture may call this after checking the exact stack-local
+ * uniform value with the matching raster/context validator. */
+@interface NV2AMetalVertexFixed (ValidatedEpoch)
+- (nullable NV2AMetalFixedResult *)
+    encodeValidatedAttributes:(id<MTLBuffer>)attributes
+                        first:(NSUInteger)first
+                        count:(NSUInteger)count
+                     uniforms:(const NV2AMetalFixedUniforms *)uniforms
+                    rasterize:(BOOL)rasterize
+             compactRegisters:(BOOL)compact
+                     commands:(NV2AMetalCommands *)commands
+                        error:(NSError *_Nullable *_Nullable)error;
+@end
 static BOOL epoch_error(NSError **error, NSString *message)
 {
     if (error)
@@ -225,24 +238,25 @@ static BOOL epoch_error(NSError **error, NSString *message)
                    nil;
     }
     NV2AMetalFixedUniforms u = state.fixedUniforms;
-    if (!(state.rasterDiscard ? nv2a_metal_fixed_validate_context(&u, error) :
-                                nv2a_metal_fixed_validate(&u, error)))
+    BOOL rasterize = !state.rasterDiscard;
+    if (!(rasterize ? nv2a_metal_fixed_validate(&u, error) :
+                      nv2a_metal_fixed_validate_context(&u, error)))
         return nil;
-    BOOL discard = compact && state.rasterDiscard;
+    BOOL discard = compact && !rasterize;
     NV2AMetalFixedResult *r = nil;
     /* Fixed raw XF writes no context. Once inputs and uniforms are validated,
      * compact callers need only the count and unchanged constant metadata. */
     if (!discard) {
         if (![_commands beginWithError:error])
             return nil;
-        r = [_fixed encodeAttributes:attributes
-                               first:first
-                               count:count
-                            uniforms:&u
-                           rasterize:!state.rasterDiscard
-                    compactRegisters:compact
-                            commands:_commands
-                               error:error];
+        r = [_fixed encodeValidatedAttributes:attributes
+                                        first:first
+                                        count:count
+                                     uniforms:&u
+                                    rasterize:rasterize
+                             compactRegisters:compact
+                                     commands:_commands
+                                        error:error];
         if (!r) {
             [_commands cancel];
             return nil;
@@ -398,20 +412,21 @@ static BOOL epoch_error(NSError **error, NSString *message)
                          nil;
     }
     NV2AMetalFixedUniforms u = state.fixedUniforms;
-    if (!(state.rasterDiscard ? nv2a_metal_fixed_validate_context(&u, error) :
-                                nv2a_metal_fixed_validate(&u, error)))
+    BOOL rasterize = !state.rasterDiscard;
+    if (!(rasterize ? nv2a_metal_fixed_validate(&u, error) :
+                      nv2a_metal_fixed_validate_context(&u, error)))
         return nil;
-    BOOL discard = compact && state.rasterDiscard;
+    BOOL discard = compact && !rasterize;
     NV2AMetalFixedResult *r = discard ?
                                   nil :
-                                  [_fixed encodeAttributes:attributes
-                                                     first:first
-                                                     count:count
-                                                  uniforms:&u
-                                                 rasterize:!state.rasterDiscard
-                                          compactRegisters:compact
-                                                  commands:commands
-                                                     error:error];
+                                  [_fixed encodeValidatedAttributes:attributes
+                                                              first:first
+                                                              count:count
+                                                           uniforms:&u
+                                                          rasterize:rasterize
+                                                   compactRegisters:compact
+                                                           commands:commands
+                                                              error:error];
     if (!discard && !r)
         return nil;
     NV2AMetalEpochResult *result = [[NV2AMetalEpochResult alloc]

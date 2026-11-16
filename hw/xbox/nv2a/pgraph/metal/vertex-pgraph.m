@@ -15,6 +15,8 @@
 
 _Static_assert(NV2A_VERTEXSHADER_CONSTANTS == NV2A_METAL_VP_CONSTANTS,
                "Native/QEMU vertex constants");
+_Static_assert(NV2A_METAL_VP_CONSTANTS <= UINT8_MAX + 1,
+               "Constant row indices fit in the dirty-row list");
 _Static_assert(NV2A_MAX_TRANSFORM_PROGRAM_LENGTH == NV2A_METAL_VP_SLOTS &&
                    VSH_TOKEN_SIZE == 4,
                "Native/QEMU vertex program slots");
@@ -628,7 +630,8 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
         return nil;
     }
     const uint8_t *flags = written.bytes;
-    BOOL changed = NO;
+    uint8_t dirtyRows[NV2A_METAL_VP_CONSTANTS];
+    NSUInteger dirtyCount = 0;
     for (NSUInteger row = 0; row < rows; row++) {
         uint32_t flag;
         memcpy(&flag, flags + row * 4, 4);
@@ -643,25 +646,22 @@ static BOOL capture_common_valid(const NV2AMetalProgramUniforms *u)
                                     }];
             return nil;
         }
-        changed |= flag != 0;
+        if (flag)
+            dirtyRows[dirtyCount++] = (uint8_t)row;
     }
-    if (!changed)
+    if (!dirtyCount)
         return self;
     NV2AMetalPGRAPHVertexState *copy =
         [[NV2AMetalPGRAPHVertexState alloc] initWithCapture:self];
     if (!copy)
         return nil;
     const uint8_t *source = constants.bytes;
-    for (NSUInteger row = 0; row < rows; row++) {
-        uint32_t flag;
-        memcpy(&flag, flags + row * 4, 4);
-        if (flag) {
-            memcpy(copy->_programUniforms.constants[row], source + row * 16,
-                   16);
-            if (!_programmed)
-                memcpy(copy->_fixedUniforms.common.constants[row],
-                       source + row * 16, 16);
-        }
+    for (NSUInteger i = 0; i < dirtyCount; i++) {
+        NSUInteger row = dirtyRows[i];
+        memcpy(copy->_programUniforms.constants[row], source + row * 16, 16);
+        if (!_programmed)
+            memcpy(copy->_fixedUniforms.common.constants[row],
+                   source + row * 16, 16);
     }
     return copy;
 }

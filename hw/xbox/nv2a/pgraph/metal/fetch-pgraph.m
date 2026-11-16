@@ -141,18 +141,45 @@ static NSData *fetch_readonly_indices(NV2AMetalPendingInput *input,
         return nil;
     }
     const uint32_t *values = (const uint32_t *)input.indices.bytes + prefix;
-    /* Strict monotonicity proves there are no duplicates without allocating
-     * a hash table or remap. Compare rather than subtract uint32 indices. */
+    /* Strict monotonicity proves there are no duplicates. Equal adjacent
+     * values in a monotone sequence can be remapped without a hash table. */
     BOOL increasing = YES, decreasing = YES;
+    BOOL nondecreasing = YES, nonincreasing = YES;
     for (NSUInteger i = 1; i < count; i++) {
         increasing &= values[i] > values[i - 1];
         decreasing &= values[i] < values[i - 1];
-        if (!increasing && !decreasing)
+        nondecreasing &= values[i] >= values[i - 1];
+        nonincreasing &= values[i] <= values[i - 1];
+        if (!nondecreasing && !nonincreasing)
             break;
     }
     if (increasing || decreasing) {
         *computed = YES;
         return nil;
+    }
+    if (nondecreasing || nonincreasing) {
+        NSMutableData *unique = [NSMutableData dataWithLength:count * 4];
+        NSMutableData *mapping = [NSMutableData dataWithLength:count * 4];
+        if (!unique || !mapping)
+            return nil;
+        uint32_t *indices = unique.mutableBytes, *ordinals = mapping.mutableBytes;
+        indices[0] = values[0];
+        ordinals[0] = 0;
+        NSUInteger retained = 1;
+        for (NSUInteger i = 1; i < count; i++) {
+            if (values[i] != values[i - 1])
+                indices[retained++] = values[i];
+            ordinals[i] = (uint32_t)(retained - 1);
+        }
+        NSUInteger last = ordinals[count - 1];
+        unique.length = retained * 4;
+        NSData *uniqueSnapshot = [unique copy], *remapSnapshot = [mapping copy];
+        if (!uniqueSnapshot || !remapSnapshot)
+            return nil;
+        *current = last;
+        *remap = remapSnapshot;
+        *computed = YES;
+        return uniqueSnapshot;
     }
     NSUInteger capacity = 1;
     while (capacity < 2 * count)

@@ -130,11 +130,12 @@ unsigned nv2a_metal_attribute_size(unsigned format, unsigned count)
                             first:first count:count commands:commands])
         return NO;
     const NV2AMetalProgramInput *current = _pgraphCurrent.bytes;
-    for (unsigned i = 0; i < NV2A_METAL_VP_ATTRIBUTES; i++) {
-        if (!(_constantAttributes & (1u << i)))
-            continue;
+    unsigned constantAttributes = _constantAttributes;
+    while (constantAttributes) {
+        unsigned i = __builtin_ctz(constantAttributes);
         uniforms->attributes[i].count = 0;
         memcpy(uniforms->attributes[i].inline_value, current->attributes[i], 16);
+        constantAttributes &= constantAttributes - 1;
     }
     return YES;
 }
