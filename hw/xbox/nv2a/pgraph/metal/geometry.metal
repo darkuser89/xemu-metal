@@ -539,16 +539,15 @@ compact_line_carrier(uint2 source, uint provoking, uint face, float slope,
     result.face = face;
     result.slope = isfinite(slope) ? slope : 0.0f;
     float enter = 0, leave = 1;
-    bool valid = all(isfinite(a)) && all(isfinite(b));
-    if (valid) {
-        // Positive homogeneous rescaling preserves the clipped projective
-        // segment and keeps a short visible interval from rounding to t=1.
-        int shift_a, shift_b;
-        frexp(max(abs(a.w), max(abs(a.x), abs(a.y))), shift_a);
-        frexp(max(abs(b.w), max(abs(b.x), abs(b.y))), shift_b);
-        a.xyw = ldexp(a.xyw, -shift_a);
-        b.xyw = ldexp(b.xyw, -shift_b);
-    }
+    if (!all(isfinite(a)) || !all(isfinite(b)))
+        return result;
+    // Positive homogeneous rescaling preserves the clipped projective
+    // segment and keeps a short visible interval from rounding to t=1.
+    int shift_a, shift_b;
+    frexp(max(abs(a.w), max(abs(a.x), abs(a.y))), shift_a);
+    frexp(max(abs(b.w), max(abs(b.x), abs(b.y))), shift_b);
+    a.xyw = ldexp(a.xyw, -shift_a);
+    b.xyw = ldexp(b.xyw, -shift_b);
     /* Depth clamp leaves Z to the fragment stage. Clip the centreline in XY/W
      * before expanding its width, as with the original line primitive. */
     float4 fa(a.w + a.x, a.w - a.x, a.w + a.y, a.w - a.y);
@@ -556,7 +555,7 @@ compact_line_carrier(uint2 source, uint provoking, uint face, float slope,
     uint enter_planes = 0, leave_planes = 0;
     for (uint k = 0; k < 4; k++) {
         if (fa[k] < 0 && fb[k] < 0)
-            valid = false;
+            return result;
         else if (fa[k] < 0) {
             float t = fa[k] / (fa[k] - fb[k]);
             if (t > enter) {
@@ -575,6 +574,8 @@ compact_line_carrier(uint2 source, uint provoking, uint face, float slope,
             }
         }
     }
+    if (enter > leave)
+        return result;
     float4 ca = mix(a, b, enter), cb = mix(a, b, leave);
     // Keep generated endpoints exactly on their intersected clip planes.
     for (uint k = 0; k < 4; k++) {
@@ -583,11 +584,12 @@ compact_line_carrier(uint2 source, uint provoking, uint face, float slope,
         if (leave_planes & (1u << k))
             cb[k / 2] = k & 1 ? cb.w : -cb.w;
     }
-    valid &= enter <= leave && ca.w > 0 && cb.w > 0;
+    if (!(ca.w > 0 && cb.w > 0))
+        return result;
     float2 viewport(u.viewport[0], u.viewport[1]);
     float2 pa = float2(ca.x / ca.w + 1, 1 - ca.y / ca.w) * viewport * .5f;
     float2 pb = float2(cb.x / cb.w + 1, 1 - cb.y / cb.w) * viewport * .5f;
-    valid &= all(isfinite(pa)) && all(isfinite(pb)) && any(pa != pb);
+    bool valid = all(isfinite(pa)) && all(isfinite(pb)) && any(pa != pb);
     float padding = u.line_width * .5f + 2;
     float2 lo = max(min(pa, pb) - padding, float2(0));
     float2 hi = min(max(pa, pb) + padding, viewport);
@@ -783,12 +785,12 @@ compact_polygon_fill_carrier(uint3 source, uint provoking, uint face,
     bool valid = count && area != 0 &&
                  (!u.face_mask || (u.face_mask & (front ? 1u : 2u)));
     projection->count = valid ? count : 0;
+    if (!valid)
+        return result;
     for (uint i = 0; i < count; i++) {
         projection->points[i][0] = points[i].x;
         projection->points[i][1] = points[i].y;
     }
-    if (!valid)
-        return result;
     float2 lo = viewport, hi = 0;
     for (uint i = 0; i < count; i++) {
         lo = min(lo, points[i]);
@@ -809,14 +811,12 @@ compact_polygon_fill_carrier(uint3 source, uint provoking, uint face,
      * stay put. */
     float2 edge = 0;
     float longest = 0;
-    if (valid) {
-        for (uint i = 0; i < count; i++) {
-            float2 delta = points[(i + 1) % count] - points[i];
-            float squared = dot(delta, delta);
-            if (isfinite(squared) && squared > longest) {
-                edge = delta;
-                longest = squared;
-            }
+    for (uint i = 0; i < count; i++) {
+        float2 delta = points[(i + 1) % count] - points[i];
+        float squared = dot(delta, delta);
+        if (isfinite(squared) && squared > longest) {
+            edge = delta;
+            longest = squared;
         }
     }
     if (longest > 0) {

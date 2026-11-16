@@ -1105,6 +1105,12 @@ static BOOL skip_culled_mixed_pass(const NV2AMetalGeometryRasterConfig *c,
                        @"Invalid Metal native primitive input or recording");
         return nil;
     }
+    /* Both faces are rejected before rasterization in every polygon mode.
+     * Limit this shortcut to counts whose worst eight output vertices per
+     * source cannot overflow the later topology-specific vertex-ID checks. */
+    if (primitive >= NV2AMetalPrimitiveTriangles && c->cullFront &&
+        c->cullBack && count <= UINT32_MAX / 8u)
+        return @[];
     if (primitive >= NV2AMetalPrimitiveTriangles &&
         (((c->front == NV2AMetalPolygonLine || c->back == NV2AMetalPolygonLine) &&
           (c->lineWidth > 1 || c->lineSmooth || zPerspective)) ||
