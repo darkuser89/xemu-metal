@@ -28,8 +28,23 @@ static uint texture_u32(device const uchar *p)
     return texture_u16(p) | texture_u16(p + 2) << 16;
 }
 
+static uint texture_spread_2d(uint value)
+{
+    value = (value | value << 8) & 0x00ff00ffu;
+    value = (value | value << 4) & 0x0f0f0f0fu;
+    value = (value | value << 2) & 0x33333333u;
+    return (value | value << 1) & 0x55555555u;
+}
+
 static uint texture_morton(uint3 coordinate, uint3 size)
 {
+    /* Equal 2D dimensions alternate X and Y bits at every level. Both axes
+     * are at most 16384 texels, so the 16-bit spread covers every address. */
+    if (size.z == 1 && size.x == size.y) {
+        uint mask = size.x - 1;
+        return texture_spread_2d(coordinate.x & mask) |
+               texture_spread_2d(coordinate.y & mask) << 1;
+    }
     uint address = 0, out_bit = 1;
     for (uint bit = 1; bit < max(size.x, max(size.y, size.z)); bit <<= 1) {
         for (uint axis = 0; axis < 3; axis++) {
